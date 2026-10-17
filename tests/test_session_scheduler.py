@@ -810,6 +810,42 @@ async def test_ensure_image_cleanup_spawns_loop(tmp_path: Path, monkeypatch: Any
     await asyncio.wait_for(task, timeout=5)
 
 
+async def test_ensure_image_cleanup_restarts_cancelling_loop(tmp_path: Path) -> None:
+    """取消已交付但任务尚未收敛时，ensure 必须重启清理循环。
+
+    缺陷形态：判据只有 ``is None or done()``，取消在途（cancelling）两者都
+    不满足 → 跳过重启。runtime_enabled=True 而清理循环已经没了，此后再没有
+    磁盘巡检（webapi 回滚路径「取消后不 await 直接 ensure」正对窗口）。
+    """
+    scheduler_mod, _, scheduler, _, _ = _make_scheduler(tmp_path)
+    release = asyncio.Event()
+
+    async def stubborn() -> None:
+        # 吞掉取消继续睡：这才有「取消已交付、任务未收敛」的中间态
+        while not release.is_set():
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                continue
+
+    scheduler._should_run = lambda: True
+    scheduler._image_cleanup_task = asyncio.ensure_future(stubborn())
+    task = scheduler._image_cleanup_task
+    await asyncio.sleep(0)  # 先让任务真正跑起来，否则取消的是未启动的任务
+    task.cancel()
+    await asyncio.sleep(0)  # 取消已交付，任务未收敛
+    assert not task.done() and task.cancelling()
+
+    scheduler.ensure_image_cleanup()
+    restarted = scheduler._image_cleanup_task
+    assert restarted is not task, "取消在途的清理循环没有被重启"
+    # 收尾：放行后取消，两个任务都干净退出（stubborn 吞取消但不吞退出条件）
+    release.set()
+    task.cancel()
+    restarted.cancel()
+    await asyncio.gather(task, restarted, return_exceptions=True)
+
+
 def test_cleanup_image_sources_drops_expired_entries(tmp_path: Path) -> None:
     """过期图片事件条目出队；会话条目清空后整键回收。"""
     _, models, scheduler, _, _ = _make_scheduler(tmp_path)

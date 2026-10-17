@@ -238,12 +238,22 @@ class SelfInitiatedReplyPlugin(Star):
         """
 
         async def run() -> None:
-            if self._pending_normalize_config:
-                await self._normalize_config_off_loop()
+            # 配置规范化必须与 terminate / webapi POST /config / add-remove
+            # 共用 _config_lock：它是「序列化 Settings 整份读-改-写」，锁外跑
+            # 会把锁内刚落地的管理员改动按陈旧快照覆写（磁盘与宿主内存
+            # config 双清），而保存方拿到的是成功回执。锁序恒为
+            # _config_lock → _save_lock，与其余写方一致。
+            async with self._config_lock:
+                if self._pending_normalize_config:
+                    await self._normalize_config_off_loop()
             try:
-                # 本任务已在事件循环之外的目的地，to_thread 内执行，
-                # 既不阻塞循环也不失去"内容一致即跳过"的语义。
-                await asyncio.to_thread(self._save_storage_sync)
+                # 状态落盘只走持 _save_lock 的异步路径，**不**再持 _config_lock：
+                # save_storage_sync 的「比较再写」在锁外会把并发更新的较新
+                # state.json 按陈旧快照覆盖且无日志，故换用 save_storage；但
+                # 落盘可能长时间不返回（网络文件系统），而 terminate 的最终
+                # 落盘在 _config_lock 内等它，持锁会把一次慢写放大成 reload
+                # 挂死。state.json 的正确性边界是 _save_lock，不是配置锁。
+                await self._save_storage()
             except Exception as exc:
                 logger.warning("[%s] startup state save failed: %s", PLUGIN_ID, exc)
             try:

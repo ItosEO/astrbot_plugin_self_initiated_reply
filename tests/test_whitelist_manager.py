@@ -249,6 +249,27 @@ async def test_add_existing_returns_false(tmp_path: Path) -> None:
     assert ctx.persistence.save_calls == 1  # 幂等也走双写（配置内容不变）
 
 
+async def test_add_covered_by_bare_group_id_writes_nothing(tmp_path: Path) -> None:
+    """被裸群号通配符覆盖时 add 不得追加完整 UMO 条目。
+
+    缺陷形态：existed 用通配规则判定（裸群号覆盖完整 UMO），replace 却仍拿
+    ``old | {umo}`` 落盘：指令回显「已在白名单中」，磁盘却多长一个条目，
+    每群执行一次 add 就多一条，UI 计数与内存/磁盘三方不一致。
+    """
+    _, _, models = _load_modules()
+    umo = _umo_with_group()
+    group = _group_key(umo)
+    ctx = FakeCtx(models, whitelist={group})
+    manager = ctx.make_manager()
+
+    assert await manager.add(umo) is False
+    assert ctx.settings.whitelist == {group}
+    assert ctx.persistence.sync_calls == 0
+    assert ctx.persistence.save_calls == 0
+    # 会话状态仍确保创建（与原路径一致）
+    assert umo in ctx.ensured
+
+
 async def test_remove_success_removes_group_key_and_returns_true(tmp_path: Path) -> None:
     _, _, models = _load_modules()
     umo = _umo_with_group()

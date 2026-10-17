@@ -257,7 +257,16 @@ async function loadProviders() {
 			? result.providers.filter((item) => item && item.id)
 			: [];
 		providerListAvailable = true;
+		// 与 catch 分支同一套防护：render() 先 innerHTML="" 再写回旧值，新列表
+		// 不含当前值时写回即归零（实测 beforeRender="provider-a" →
+		// afterRender=""）。此时若配置响应被协调器扣住（编辑/保存在途）或
+		// GET /config 失败，表单里已选的 Provider 会被静默清空，下一次保存
+		// 就把 judge/vision 的 Provider ID 写成空串。故先取值再 render，
+		// render 之后交给 sync() 恢复（列表可用时回到列表态，不在列表时
+		// 落手动态——两种都是值的真实呈现）。
+		const preserved = providerControlList.map((control) => control.value());
 		renderAll();
+		providerControlList.forEach((control, index) => control.sync(preserved[index]));
 		if (els.providerListState) els.providerListState.textContent = "";
 		return { listAvailable: true };
 	} catch (error) {
@@ -387,10 +396,19 @@ if (els.decisionPromptInput) {
 if (els.enabledInput) {
 	els.enabledInput.addEventListener("change", () => {
 		const on = els.enabledInput.checked;
-		els.selfStatus.textContent = on ? "启用（未保存）" : "关闭（未保存）";
+		// 运行态（/selfreply off 置的 runtimeEnabled）与开关态是两个轴：
+		// applyConfigPayload 对暂停态显示「已暂停（/off）」并把状态灯按
+		// runtimeEnabled 置 off。这里若只看复选框，暂停期间拨动开关会把
+		// 文案写成「启用（未保存）」、状态灯重新脉冲，直到保存或刷新才自愈。
+		const runtimeOn = state.runtimeEnabled !== false;
+		els.selfStatus.textContent = on
+			? runtimeOn
+				? "启用（未保存）"
+				: "已暂停（未保存）"
+			: "关闭（未保存）";
 		// 状态类必须与文案同步：`.master.is-off` 停掉 stat-dot 脉冲、换背景，
-		// 只改文案会让开关在视觉上仍显示为启用，直到保存后才自愈。
-		setStatState(els.selfStat, on ? "is-on" : "is-off");
+		// 只改文案会让开关在视觉上仍显示为启用。
+		setStatState(els.selfStat, on && runtimeOn ? "is-on" : "is-off");
 		configIo.setDirty(true);
 	});
 }

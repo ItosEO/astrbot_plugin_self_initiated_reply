@@ -288,3 +288,38 @@ def test_unstringable_adapter_exception_still_classifies_and_records() -> None:
     )
     assert ledger.attempts[0].state is models.AttemptState.UNKNOWN
     assert ledger.has_submission is True, "异常逃出会让这次投递不记账"
+
+
+def test_direct_send_gate_exception_degrades_to_rejection() -> None:
+    """闸门回调抛异常时按闸门拒绝收敛，不得把 RESERVED attempt 留在账本里。
+
+    缺陷形态：``allow_direct`` 的调用在 ``reserve`` 之后、无保护：异常逃出
+    ``send()``，attempt 停在 RESERVED（只有 seal 才转 ABANDONED），内部计数
+    与账本同时失同步。生产回调纯算术不会抛，但这是契约洞——新回调引入
+    副作用（读设置、打日志）时就会踩上。
+    """
+    outbound = _load_gateway()
+    models = load_package(PACKAGE_NAME, "models")
+
+    class Message:
+        type = "tool_direct_result"
+
+        def get_plain_text(self):
+            return "工具消息"
+
+    async def sender(_message):  # pragma: no cover - 闸门拒绝时不该被调用
+        raise AssertionError("sender must not run when the gate rejects")
+
+    def exploding_gate() -> bool:
+        raise RuntimeError("gate blew up")
+
+    ledger = models.AttemptLedger()
+    gateway = outbound.OutboundGateway(
+        sender, max_direct_sends=2, ledger=ledger, allow_direct=exploding_gate
+    )
+    result = asyncio.run(gateway.send(Message(), kind="tool_direct"))
+
+    assert result.outcome.status is models.SendStatus.SUPPRESSED
+    assert result.outcome.code is models.SuppressCode.GATE_REJECTED
+    assert ledger.attempts[0].state is models.AttemptState.SUPPRESSED
+    assert ledger.has_submission is False

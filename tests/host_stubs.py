@@ -252,7 +252,10 @@ def base_runtime_capabilities(runtime: Any, **overrides: Any) -> Any:
     base = dict(
         import_error=None,
         tool_set=object,
-        build_config=object,
+        # 必须接受 **kwargs：runtime_adapter 的加载期探针用主动运行的键集合
+        # 实例化它（models.proactive_build_config_kwargs），桩比真实宿主更严
+        # 会让 validate() 假红。
+        build_config=type("BuildConfig", (), {"__init__": lambda self, **_kwargs: None}),
         build_main_agent=lambda **_k: None,
         get_session_conv=lambda *_a: None,
         run_agent=lambda *_a, **_k: (),
@@ -643,14 +646,21 @@ class FakeRequest:
 
     ``error`` 让用例模拟宿主的另一种出口：请求体读不出时 reader 抛错，而不是
     返回空对象（Quart 的 ``request.json()`` 对非法 JSON 就是这么做的）。
+    ``swallow_errors`` 模拟宿主的另一种出口：astrbot 的
+    ``PluginRequestProxy.json()`` 读不出 body 时返回 ``default`` 而不抛
+    （4.27 实测）。两者都要能造，否则「坏请求体与空对象可区分」这条契约
+    没有可测的宿主形态。
     """
 
     def __init__(self) -> None:
         self.payload: Any = {}
         self.error: BaseException | None = None
+        self.swallow_errors = False
 
     async def json(self, default: Any = None) -> Any:
         if self.error is not None:
+            if self.swallow_errors:
+                return default
             raise self.error
         return self.payload
 

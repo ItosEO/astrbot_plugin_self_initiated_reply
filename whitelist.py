@@ -201,6 +201,21 @@ class WhitelistManager:
         不可达路径改指令回显契约。
         """
         existed = session_whitelisted(umo, self.settings.whitelist)
+        if existed and umo not in self.settings.whitelist:
+            # 仅被同群号通配符覆盖（白名单里是裸群号、没有本 UMO 的精确条目）：
+            # 再追加完整 UMO 是冗余写入——回显说「已在白名单中」，磁盘却多长
+            # 一个条目，每群执行一次 add 就多一条，UI 计数与内存/磁盘不一致。
+            # 精确条目已存在时仍走完整双写：那次写是幂等的自愈（磁盘被外部
+            # 改动改坏时，add 把内存实况重新落盘）。
+            self._ensure_state(umo)
+            logger.info(
+                "[%s] whitelist add session=%s existed=%s total=%d",
+                PLUGIN_ID,
+                umo,
+                True,
+                len(self.settings.whitelist),
+            )
+            return False
         old_whitelist = set(self.settings.whitelist)
         # 快照必须取在 replace **之前**：replace 会 pop 掉被移出会话的映射。
         runtime_umos = self._snapshot_runtime_umos()

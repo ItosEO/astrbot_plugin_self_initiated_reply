@@ -266,11 +266,13 @@ def test_in_memory_image_index_enforces_session_and_global_byte_budgets() -> Non
         "s1", 1.0, [_PreparedImage(b"123"), _PreparedImage(b"456")]
     )
     assert len(accepted) == 1
-    assert _bytes_for(module, images, "s1") == 3
+    # 计费口径是索引实际驻留的 base64 负载（"MTIz" = 4 字节），不是解码后
+    # 的 3 字节：理由见 session_coordinator._prepared_memory_size。
+    assert _bytes_for(module, images, "s1") == 4
 
     accepted = coordinator.capture_images("s2", 2.0, [_PreparedImage(b"789")])
     assert len(accepted) == 1
-    assert _bytes_for(module, images) == 3
+    assert _bytes_for(module, images) == 4
     assert "s1" not in images
     assert "s2" in images
 
@@ -287,15 +289,17 @@ def test_image_budget_recomputes_global_bytes_after_session_eviction() -> None:
         gate=SimpleNamespace(advance=lambda _umo: 1),
         cancel_delay=lambda _umo, _force: None,
         notify_silence=lambda _umo: None,
-        max_image_memory_bytes=10,
-        max_session_image_memory_bytes=5,
+        max_image_memory_bytes=20,
+        max_session_image_memory_bytes=10,
     )
     coordinator.capture_images("s1", 1.0, [_PreparedImage(b"12345")])
     coordinator.capture_images("s2", 1.0, [_PreparedImage(b"67890")])
     accepted = coordinator.capture_images("s1", 2.0, [_PreparedImage(b"abc")])
 
     assert len(accepted) == 1
-    assert _bytes_for(module, images) == 8
+    # 负载按 base64 驻留量计费：12345/67890 各 8，abc 4；s1 追加后 12 > 10
+    # 触发会话内驱逐，最终 4 + 8 = 12。
+    assert _bytes_for(module, images) == 12
     assert "s2" in images
 
 
@@ -327,7 +331,7 @@ def test_zero_byte_placeholder_at_queue_head_does_not_stall_eviction() -> None:
 
     assert coordinator.capture_images("s1", 1.0, []) == []  # 空占位事件
     assert len(coordinator.capture_images("s1", 2.0, [_PreparedImage(b"123")])) == 1
-    # 3 已占用 + 3 新图 > 4：必须先弹出 0 字节占位，再驱逐 3 字节事件才能接纳。
+    # 4 已占用 + 4 新图 > 4：必须先弹出 0 字节占位，再驱逐 4 字节事件才能接纳。
     accepted = coordinator.capture_images("s1", 3.0, [_PreparedImage(b"abc")])
     assert len(accepted) == 1
 
@@ -340,7 +344,7 @@ def test_zero_byte_frozen_event_at_queue_head_does_not_stall_global_eviction() -
     assert coordinator.capture_images("s1", 1.0, []) == []
     assert len(coordinator.capture_images("s1", 2.0, [_PreparedImage(b"123")])) == 1
     assert len(coordinator.capture_images("s2", 3.0, [_PreparedImage(b"456")])) == 1
-    # 全局 6 已满：s2 追加 3 字节需要驱逐全局最旧，先弹 0 字节占位再继续。
+    # 全局 6 已满：s2 追加 4 字节需要驱逐全局最旧，先弹 0 字节占位再继续。
     accepted = coordinator.capture_images("s2", 4.0, [_PreparedImage(b"abc")])
     assert len(accepted) == 1
 
@@ -354,7 +358,9 @@ def test_deque_overflow_keeps_byte_counters_in_sync() -> None:
         assert len(accepted) == 1
 
     assert len(ctx.images["s1"]) == limit
-    assert coordinator._total_bytes == _bytes_for(module, ctx.images) == limit
+    # 每张 1 字节载荷的 base64 驻留量是 4 字符（"AA=="），计费口径见
+    # session_coordinator._prepared_memory_size。
+    assert coordinator._total_bytes == _bytes_for(module, ctx.images) == 4 * limit
 
 
 def test_reset_all_zeroes_image_byte_counters() -> None:
@@ -374,7 +380,7 @@ def test_clear_session_releases_image_byte_counters() -> None:
 
     coordinator.clear_session("s1")
 
-    assert coordinator._total_bytes == _bytes_for(module, ctx.images) == 2
+    assert coordinator._total_bytes == _bytes_for(module, ctx.images) == 4
 
 
 def test_restore_inplace_rebuilds_image_byte_counters() -> None:
@@ -385,7 +391,7 @@ def test_restore_inplace_rebuilds_image_byte_counters() -> None:
 
     coordinator.restore_inplace(snapshot)
 
-    assert coordinator._total_bytes == _bytes_for(module, ctx.images) == 3
+    assert coordinator._total_bytes == _bytes_for(module, ctx.images) == 4
 
 
 def test_drop_older_than_releases_image_byte_counters() -> None:
@@ -395,4 +401,5 @@ def test_drop_older_than_releases_image_byte_counters() -> None:
 
     coordinator.drop_older_than(50.0, umo="s1")
 
-    assert coordinator._total_bytes == _bytes_for(module, ctx.images) == 4
+    # 4567 的 base64 驻留 8 字符，123 的 4：丢弃旧事件后剩 8。
+    assert coordinator._total_bytes == _bytes_for(module, ctx.images) == 8

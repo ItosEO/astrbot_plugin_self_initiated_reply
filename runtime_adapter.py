@@ -21,7 +21,7 @@ from typing import Any, NamedTuple
 
 from astrbot.api import logger
 
-from .models import PLUGIN_ID
+from .models import PLUGIN_ID, proactive_build_config_kwargs
 from .utils import redact_exc_text
 
 
@@ -240,6 +240,21 @@ class AstrBotRuntimeAdapter:
             self._validate_callable(
                 problems, "_get_session_conv", caps.get_session_conv, frozenset()
             )
+            if caps.build_config is None:
+                problems.append("当前 AstrBot 缺少 MainAgentBuildConfig")
+            else:
+                # 签名探测不够：build config 的**键**兼容性只有实例化能验。
+                # 缺这一探针时，宿主改一个键名就让插件加载成功、每次主动生成
+                # 在运行期 TypeError（一条回复产不出），而 compat_check 与测试
+                # 全绿——桩的 build config 都是 **kwargs。
+                try:
+                    caps.build_config(**proactive_build_config_kwargs())
+                except TypeError as exc:
+                    problems.append(
+                        f"当前 AstrBot 的 MainAgentBuildConfig 不接受主动运行的配置参数：{exc}"
+                    )
+                except Exception as exc:
+                    problems.append(f"当前 AstrBot 的 MainAgentBuildConfig 不可实例化：{exc}")
         self._validate_callable(problems, "call_event_hook", caps.call_event_hook, frozenset())
         if caps.event_result_cls is None:
             problems.append("当前 AstrBot 缺少事件结果类（MessageEventResult）")
@@ -521,12 +536,25 @@ class AstrBotRuntimeAdapter:
                 )
                 return False
             return True
-        violations = sorted({name for name in remaining if name and name in drop})
+        violations = sorted({name for name in remaining if name in drop})
         if violations:
             logger.warning(
                 "[%s] tool boundary fail-closed: denied tools remain: %s",
                 PLUGIN_ID,
                 ", ".join(violations),
+            )
+            return False
+        # denylist 模式下读不出名字的工具同样必须 fail closed：它与 allowlist
+        # 分支的「<unnamed>」违规对称——名字读不到就无从判断它是否在 drop 里，
+        # 而放行它正是 inherit 模式要防的（宿主把 tools 换成名字不可读的容器时，
+        # 整个危险工具集会静默穿过这道最后的防线）。
+        unnamed = sum(1 for name in remaining if not name)
+        if unnamed:
+            logger.warning(
+                "[%s] tool boundary fail-closed: %d tool(s) without a readable name "
+                "in denylist mode; aborting proactive run",
+                PLUGIN_ID,
+                unnamed,
             )
             return False
         return True

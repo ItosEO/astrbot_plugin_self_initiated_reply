@@ -81,12 +81,13 @@ async function serveStatic(request, response) {
 
 async function installBridge(page, options = {}) {
   await page.addInitScript(
-    ({ config, providersFail, saveMode, theme, dim, bold, refreshConfigPending, themePending, cleanupRemoved, cleanupFail, readyFails }) => {
+  ({ config, providers, providersFail, saveMode, theme, dim, bold, refreshConfigPending, themePending, cleanupRemoved, cleanupFail, readyFails }) => {
       const state = {
         saveMode,
         saveAttempts: 0,
         config,
         configCalls: 0,
+        providers,
         providersFail,
         refreshConfigPending,
         themePending,
@@ -108,7 +109,9 @@ async function installBridge(page, options = {}) {
           if (state.readyFails) throw new Error("bridge used after handshake failure");
           if (endpoint === "providers") {
             if (state.providersFail) throw new Error("provider list unavailable");
-            return { ok: true, providers: [{ id: "provider-a", label: "Provider A" }] };
+            // state.providers 让用例在刷新间更换列表内容：真实宿主里 Provider
+            // 会增减，而 render() 对「当前值不在新列表里」有归零路径。
+            return { ok: true, providers: state.providers || [{ id: "provider-a", label: "Provider A" }] };
           }
           if (endpoint === "config") {
             state.configCalls += 1;
@@ -183,6 +186,7 @@ async function installBridge(page, options = {}) {
     },
     {
       config: configPayload(options.config),
+      providers: options.providers,
       providersFail: Boolean(options.providersFail),
       saveMode: options.saveMode || "success",
       theme: options.theme || "light",
@@ -490,6 +494,44 @@ test("a provider list failure keeps the provider already chosen in the form", as
   expect(errors).toEqual([]);
 });
 
+test("a shrunk provider list keeps the provider already chosen in the form", async ({ page }) => {
+  // 成功分支同样会先 innerHTML="" 再写回旧值：刷新后列表里已没有当初选的
+  // Provider 时，select.value 写回即归零。catch 分支有「先取值再 sync」的防护，
+  // 成功分支原先没有——配置响应被协调器扣住（编辑/保存在途）或 GET /config
+  // 失败时，表单里已选的值被静默清空，下一次保存就把空串提交回服务端。
+  await installBridge(page, {
+    config: { judge_provider_id: "provider-a", vision_provider_id: "provider-b" },
+    refreshConfigPending: true,
+  });
+  const errors = await openPage(page);
+  await expect(page.locator("#judgeProviderSelect")).toHaveValue("provider-a");
+
+  // 刷新：Provider 列表缩小（不再含 provider-a），config 响应挂起。
+  await page.locator("#messageDelayInput").fill("75");
+  await page.evaluate(() => {
+    window.__bridgeState.providers = [{ id: "provider-z", label: "Provider Z" }];
+  });
+  await page.locator("#refreshBtn").click();
+  await page.locator("#refreshBtn").click();
+  await expect(page.locator("#providerListState")).toHaveText("");
+
+  // 值不在列表里：控件落手动态，值写进输入框（此刻它是唯一展示与提交来源）。
+  await expect(page.locator("#judgeProviderInput")).toHaveValue("provider-a");
+  await expect(page.locator("#visionProviderInput")).toHaveValue("provider-b");
+
+  await page.locator("#saveTopBtn").click();
+  const body = await page.evaluate(() => {
+    const posts = window.__bridgeCalls.filter(
+      (call) => call.method === "POST" && call.endpoint === "config",
+    );
+    return posts[posts.length - 1]?.body || null;
+  });
+  expect(body).not.toBeNull();
+  expect(body.judge_provider_id).toBe("provider-a");
+  expect(body.vision_provider_id).toBe("provider-b");
+  expect(errors).toEqual([]);
+});
+
 test("a rejected bridge handshake falls back to fetch instead of using the bridge", async ({
   page,
 }) => {
@@ -727,6 +769,28 @@ test("switching the master switch moves both the status text and the state class
   await page.locator("label.master-switch").click();
   await expect(page.locator("#selfStatus")).toHaveText("启用（未保存）");
   await expect(page.locator("#selfStat")).toHaveClass(/is-on/);
+  expect(errors).toEqual([]);
+});
+
+test("the master switch readout stays paused while the runtime is off", async ({ page }) => {
+  // /selfreply off 只翻 runtime_enabled（enabled 仍是 true）：此时拨动总开关，
+  // 文案与状态类必须仍按运行态显示「已暂停」。只按复选框显示时，暂停期间
+  // 拨动开关会把状态灯重新点亮、文案写成「启用（未保存）」，直到保存或刷新
+  // 才自愈——视觉上插件是开着的，实际仍暂停。
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await installBridge(page, { config: { enabled: true, runtime_enabled: false } });
+  const errors = await openPage(page);
+  await expect(page.locator("#selfStat")).toHaveClass(/is-off/);
+  await expect(page.locator("#selfStatus")).toHaveText("已暂停（/off）");
+
+  // 关掉再打开：运行态仍是暂停，读报不得回染成「启用」。
+  await page.locator("label.master-switch").click();
+  await expect(page.locator("#selfStatus")).toHaveText("关闭（未保存）");
+  await expect(page.locator("#selfStat")).toHaveClass(/is-off/);
+
+  await page.locator("label.master-switch").click();
+  await expect(page.locator("#selfStatus")).toHaveText("已暂停（未保存）");
+  await expect(page.locator("#selfStat")).toHaveClass(/is-off/);
   expect(errors).toEqual([]);
 });
 

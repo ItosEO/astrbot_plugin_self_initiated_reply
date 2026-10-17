@@ -331,8 +331,11 @@ class AstrBotBridge:
             return []
         if not isinstance(history, list):
             return []
+        # limit<=0 时 ``history[-limit:]`` 会退回全量（-0 就是 0）或只丢最旧
+        # 一条：两个调用点都有规格下限夹取，这里兜住直传（含未来的新调用点）。
+        window = history[-limit:] if limit > 0 else []
         records: list[MessageRecord] = []
-        for item in history[-limit:]:
+        for item in window:
             if not isinstance(item, dict):
                 continue
             role = str(item.get("role") or "")

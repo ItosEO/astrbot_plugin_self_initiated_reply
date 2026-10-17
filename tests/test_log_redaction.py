@@ -463,3 +463,112 @@ def test_webapi_status_failure_log_drops_url_credentials() -> None:
     assert lines, "未捕获 status 失败日志，用例已失去覆盖对象"
     for secret in SECRETS:
         assert secret not in lines[-1], f"status 失败日志泄漏凭证 {secret}：{lines}"
+
+
+def test_redact_exc_text_covers_ipv6_and_bracket_urls() -> None:
+    """URL 里出现 ``]``/``)`` 时 query 凭证不得幸存。
+
+    缺陷形态：绝对 URL 模式原字符类排除 ``]`` 与 ``)``，IPv6 字面量主机
+    （http://[::1]:11434/v1/chat?api_key=...）或路径含 ``)`` 的 URL 会被
+    截断，redact_url 只收到 ``http://[::1`` 这种残缺片段（urlparse 直接
+    ValueError），其后的端口、路径与整个 query 原样进日志与 GET /status
+    的 reason。右界只该是空白/引号/尖括号。
+    """
+    utils_mod = _load_utils()
+    for text in (
+        "Client error '401' for url 'http://[::1]:11434/v1/chat?api_key=SECRET_TOKEN'",
+        "Client error '401' for url 'https://[2001:db8::1]:8443/v1/chat?api_key=SECRET_TOKEN'",
+        "Client error '401' for url 'https://h/a)b?token=SECRET_TOKEN'",
+        "Client error '401' for url 'https://h/a]b?token=SECRET_TOKEN'",
+        "redis://[::1]:6379/0?password=SECRET_TOKEN",
+    ):
+        redacted = utils_mod.redact_exc_text(RuntimeError(text))
+        assert "SECRET_TOKEN" not in redacted, f"IPv6/括号 URL 泄漏凭证：{redacted}"
+        assert "?<redacted>" in redacted, f"脱敏标记缺失：{redacted}"
+
+
+def test_redact_relative_url_honours_length_budget() -> None:
+    """相对路径形态同样受 LOG_URL_MAX_CHARS 约束：它也进 reason 出网。
+
+    缺陷形态：_redact_relative_url 只截 query 不截长度，urllib3 的
+    MaxRetryError 带几百字符 path 时，reason 的 URL 部分可以无限长。
+    """
+    utils_mod = _load_utils()
+    limit = utils_mod.LOG_URL_MAX_CHARS
+    text = (
+        "HTTPSConnectionPool(host='api.example.com', port=443): Max retries exceeded "
+        "with url: /" + "v1/chat/" * 60 + "?api_key=SECRET_TOKEN (Caused by "
+        "NewConnectionError('connection failed'))"
+    )
+    redacted = utils_mod.redact_exc_text(RuntimeError(text))
+    url_part = redacted.split("with url: ", 1)[1].split(" (Caused", 1)[0]
+    assert len(url_part) <= limit, f"相对 URL 超出 {limit} 字符预算：{len(url_part)}"
+    assert "SECRET_TOKEN" not in redacted
+    assert url_part.startswith("/v1/chat/"), f"路径诊断性被吃掉：{url_part}"
+
+
+def test_redact_url_fallback_scrubs_userinfo_and_query() -> None:
+    """urlparse 分解失败或没有 netloc 时不得原样放行。
+
+    缺陷形态：两个早退分支直接 ``return text[:LOG_URL_MAX_CHARS]``，而匹配到
+    的整段本就是可疑 URL——分解失败（畸形 IPv6）或 netloc 为空都不让它的
+    userinfo 与 query 变安全。实测泄漏：``http://user:pass@[::1/v1?api_key=...``
+    与 ``https:///api#token=...`` 的凭证原样进出。
+    """
+    utils_mod = _load_utils()
+    redact = utils_mod.redact_url
+    for value in (
+        "http://user:pass@[::1/v1",
+        "http://user:pass@[::1/v1?api_key=SECRET_TOKEN",
+        "https:///api#token=SECRET_TOKEN",
+        "a://#token=SECRET_TOKEN",
+    ):
+        out = redact(value)
+        assert "SECRET_TOKEN" not in out, f"兜底分支泄漏凭证：{out}"
+        assert "user:pass" not in out, f"兜底分支泄漏 userinfo：{out}"
+        assert len(out) <= utils_mod.LOG_URL_MAX_CHARS
+
+    #  pinned 的非 URL 形状仍原样（无 @、无 ?/#、无 &key= 就不该被改）
+    assert redact("http://[::1") == "http://[::1"
+    assert redact("C:/tmp/local.jpg") == "C:/tmp/local.jpg"
+    assert redact("/var/data/img.png") == "/var/data/img.png"
+
+
+def test_redact_url_scrubs_key_runs_in_netloc_and_path() -> None:
+    """``&key=`` / ``;key=`` 运行落在 netloc 或 path 时同样要截掉。
+
+    缺陷形态：只去 @userinfo、原样复制 path。urlparse 不把无 ``?`` 的
+    ``&api_key=`` 归进 query，于是 ``https://h/v1/chat&api_key=sk-...`` 整段
+    幸存；更糟的是后面再带一个 ``?`` 时输出以 ``?<redacted>`` 结尾，读起来
+    像"query 已脱敏"，凭证却摆在它前面。
+    """
+    utils_mod = _load_utils()
+    redact = utils_mod.redact_url
+    for value in (
+        "https://host/v1/chat&api_key=SECRET_TOKEN",
+        "https://host/a&api_key=SECRET_TOKEN?b=1",
+        "http://example.com:8080&token=SECRET_TOKEN",
+    ):
+        out = redact(value)
+        assert "SECRET_TOKEN" not in out, f"key 运行泄漏凭证：{out}"
+        assert out.endswith("?<redacted>"), f"脱敏标记缺失：{out}"
+
+    # 正常 URL 不受影响
+    assert redact("https://img.example.com/a.jpg") == "https://img.example.com/a.jpg"
+
+
+def test_redact_exc_text_covers_schemeless_host_port_query() -> None:
+    """不带 scheme 的 ``host:port/path?query`` 也要脱敏。
+
+    缺陷形态：相对路径模式的 lookbehind 拒掉黏在单词字符后的起点，而本机
+    端点（``127.0.0.1:11434/v1/chat?api_key=...``）正是这种写法——provider
+    指向本地 Ollama 时异常文本里全是它。
+    """
+    utils_mod = _load_utils()
+    for text in (
+        "Connection to 127.0.0.1:11434/v1/chat?api_key=SECRET_TOKEN failed",
+        "endpoint example.com:8080/v1/chat?api_key=SECRET_TOKEN failed",
+    ):
+        redacted = utils_mod.redact_exc_text(RuntimeError(text))
+        assert "SECRET_TOKEN" not in redacted, f"scheme-less 端点泄漏凭证：{redacted}"
+        assert "?<redacted>" in redacted, f"脱敏标记缺失：{redacted}"

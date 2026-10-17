@@ -511,7 +511,12 @@ class SessionScheduler:
     def ensure_image_cleanup(self) -> None:
         if not self._should_run():
             return
-        if self._image_cleanup_task is None or self._image_cleanup_task.done():
+        # ``cancelling()`` 也要重启：取消已交付但任务尚未收敛时它既不是 None
+        # 也不是 done，旧判据会跳过重启——于是 runtime_enabled=True 而清理
+        # 循环已经没了（webapi 回滚路径上「取消后不 await 直接 ensure」恰好
+        # 命中这个窗口）。
+        task = self._image_cleanup_task
+        if task is None or task.done() or task.cancelling():
             self._image_cleanup_task = self._spawn(self._image_cleanup_loop())
 
     async def _image_cleanup_loop(self) -> None:
@@ -549,7 +554,9 @@ class SessionScheduler:
     def ensure_patrol(self) -> None:
         if not self.settings.enabled_patrol_trigger or not self._should_run():
             return
-        if self._patrol_task is None or self._patrol_task.done():
+        # 同 ensure_image_cleanup：取消在途（尚未 done）也要能重启。
+        task = self._patrol_task
+        if task is None or task.done() or task.cancelling():
             self._patrol_task = self._spawn(self._patrol_loop())
 
     async def _patrol_loop(self) -> None:

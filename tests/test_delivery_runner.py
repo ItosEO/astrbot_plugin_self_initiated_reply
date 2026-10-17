@@ -617,6 +617,72 @@ async def test_deliver_stopping_suppression_outranks_generation_change(tmp_path:
     assert stale == "插件正在停止，放弃回复。"
 
 
+async def test_send_via_event_stopping_outranks_generation_change(tmp_path: Path) -> None:
+    """复核点 2/2 内部：停止判定必须先于代次复核（_send_via_event 级）。
+
+    缺陷形态：deliver_reply 的 SUPPRESSED 文案按成因分流依赖 outcome.code，
+    而 _send_via_event 原顺序先查 is_current。装饰 hook 是一次 await，插件
+    重载会在同一窗口既置 _stopping 又推进代次，返回 GENERATION_CHANGED，
+    运营者看到「会话已更新」而非「插件正在停止」。既有
+    test_deliver_stopping_suppression_outranks_generation_change 的发送器是
+    替身，只钉到 deliver_reply 级；本条驱动真实 _send_via_event。
+
+    变异锚定：把 _send_via_event 里两个复核块的顺序换回先代次，本用例红。
+    """
+    _, models, delivery, last_events = _make_runner(tmp_path)
+    event = FakeEvent(umo="s1")
+    last_events["s1"] = event
+    hook_started = asyncio.Event()
+    release_hook = asyncio.Event()
+    stopping = False
+    gate = _CountingGate(true_times=1)
+
+    async def hook(_event: object, event_type: object) -> None:
+        nonlocal stopping
+        if getattr(event_type, "name", "") == "OnDecoratingResultEvent":
+            hook_started.set()
+            await release_hook.wait()
+            # 同一 await 窗口内重载做的两件事：置停止 + 推进代次
+            stopping = True
+            gate.remaining = 0
+
+    delivery._call_hook = hook
+    delivery._is_stopping = lambda: stopping
+    delivery._gate = gate
+    send_task = asyncio.create_task(delivery.send_reply("s1", "reply", expected_generation=7))
+    await hook_started.wait()
+    release_hook.set()
+    result = await send_task
+
+    assert result.status is models.SendStatus.SUPPRESSED
+    assert result.code is models.SuppressCode.STOPPING
+
+
+async def test_deliver_stopping_with_direct_sends_reports_completion(tmp_path: Path) -> None:
+    """停止早退不得无视工具直发：账本会为直发记一次消耗配额的主动尝试。
+
+    缺陷形态：deliver_reply 见 _stopping 直接回 STOPPING_REPLY_TEXT，而
+    direct_send_count>0 时 session_pipeline._record_ledger 照记
+    「工具主动发送 xN」并消耗冷却与日配额——回执说「放弃回复」仿佛什么都
+    没发生，与落盘状态互相矛盾。
+    """
+    _, models, runner, _ = _make_runner(tmp_path)
+    runner._is_stopping = lambda: True
+
+    result = await runner.deliver_reply(
+        "s1",
+        _state(models),
+        "",
+        2,
+        ledger=models.AttemptLedger(),
+        expected_generation=None,
+        force=False,
+        trigger="patrol",
+    )
+
+    assert result == "工具主动回复已完成；插件正在停止，放弃回复。"
+
+
 # ============================================================================
 # 发送前门卫
 # ============================================================================

@@ -408,11 +408,36 @@ def test_run_agent_property_and_run_passthrough() -> None:
 
 
 def test_new_build_config_missing_type_raises() -> None:
-    """validate 不检查 build_config：缺失时由 new_build_config 显式抛错。"""
+    """build_config 缺失：validate 报问题，运行期出口显式抛错（双保险）。"""
     runtime = _load_adapter()
     adapter = _adapter(runtime, build_config=None)
+    assert any("缺少 MainAgentBuildConfig" in item for item in adapter.validate(soft=True))
     with pytest.raises(RuntimeError, match="MainAgentBuildConfig"):
         adapter.new_build_config(tool_schema_mode="full")
+
+
+def test_validate_probes_build_config_kwargs() -> None:
+    """加载期必须试实例化 MainAgentBuildConfig：键不兼容要在加载期红。
+
+    缺陷形态：探针只核验 build/run 的签名，build config 的**键**集合只有
+    实例化能验。宿主改一个键名时插件加载成功、每次主动生成在运行期
+    TypeError（一条回复产不出），而 compat_check 与测试全绿——桩的 build
+    config 都是 **kwargs，故障只在真实宿主可见。
+    """
+    runtime = _load_adapter()
+
+    class StrictBuildConfig:
+        def __init__(self, *, tool_call_timeout, tool_schema_mode):
+            self.values = {
+                "tool_call_timeout": tool_call_timeout,
+                "tool_schema_mode": tool_schema_mode,
+            }
+
+    adapter = _adapter(runtime, build_config=StrictBuildConfig)
+    problems = adapter.validate(soft=True)
+    assert any("MainAgentBuildConfig" in item for item in problems), (
+        f"build config 键不兼容未在加载期暴露：{problems}"
+    )
 
 
 # ============================================================================
@@ -555,11 +580,24 @@ def test_filter_final_tools_skip_nameless_and_fail_closed() -> None:
     assert adapter.filter_final_tools(req, keep=frozenset({"safe"})) is True
     assert [tool.name for tool in tool_set.tools] == ["safe"]
 
-    # 空名工具在黑名单模式下被跳过（不移除也不阻断）
+    # 空名工具在白名单（keep）模式下按 <unnamed> 违规 fail closed
+    anon_set = _ToolSet([_Tool(""), _Tool("danger")])
+    anon_req = SimpleNamespace(func_tool=anon_set)
+    assert adapter.filter_final_tools(anon_req, keep=frozenset()) is False
+
+    # denylist（drop）模式同理：名字读不到就无从判断它是否在 drop 里，
+    # 「无法强制」按契约 §3 终止运行。旧实现在这里放行（`if name and ...`
+    # 让空名工具对核验隐形），宿主把 tools 换成名字不可读的容器时，整个
+    # 危险工具集会静默穿过 inherit 模式这道最后的防线。
     nameless_set = _ToolSet([_Tool(""), _Tool("danger")])
     req2 = SimpleNamespace(func_tool=nameless_set)
-    assert adapter.filter_final_tools(req2, drop=frozenset({"danger"})) is True
-    assert [tool.name for tool in nameless_set.tools] == [""]
+    drop = frozenset({"danger"})
+    assert adapter.filter_final_tools(req2, drop=drop) is False
+    # 名字可读的 drop 命中仍正常移除后放行
+    named_set = _ToolSet([_Tool("ok"), _Tool("danger")])
+    named_req = SimpleNamespace(func_tool=named_set)
+    assert adapter.filter_final_tools(named_req, drop=drop) is True
+    assert [tool.name for tool in named_set.tools] == ["ok"]
 
     # remove_tool 抛错 → False（fail closed）
     boom_set = _ToolSet([_Tool("x")], remove_boom=True)

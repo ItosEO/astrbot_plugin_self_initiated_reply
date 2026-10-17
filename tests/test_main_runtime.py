@@ -1084,6 +1084,86 @@ def test_state_save_cancellation_replays_cancel_not_write_failure(tmp_path: Path
     with_plugin(tmp_path, scenario)
 
 
+def test_state_save_double_cancel_keeps_lock_until_write_lands(tmp_path: Path) -> None:
+    """取消中的落盘不得提前放开 ``_save_lock``，否则陈旧快照覆盖更新的写入。
+
+    缺陷形态：``except CancelledError`` 里裸 ``await write_task``，第二次
+    cancel()（terminate 的 ``_cancel_background_tasks`` 调两次；
+    ``_wait_background_tasks`` 对超过 ``TERMINATE_TASK_TIMEOUT_SEC`` 的任务
+    再调一次）会落到写盘任务上，CancelledError 从 except 块穿出 → 提前放开
+    ``_save_lock`` 而写盘线程还在跑。它随后 ``os.replace`` 的陈旧快照会覆盖
+    这期间更新的落盘（terminate 的最终落盘、乃至新实例刚写出的 state.json），
+    且非 critical 任务不受 ``_spared_critical_tasks``/``_abandon_disk_writes``
+    保护——两道光闸唯一没覆盖的写方。
+
+    变异锚定：把 except 块里的 shield 循环换回裸 ``await write_task``，本用例
+    第一条断言即红。
+    """
+    import sys
+    import threading
+
+    from .host_stubs import MAIN_PACKAGE_NAME, load_main
+    from .host_stubs import until as _until
+
+    load_main()
+    plugin_state = sys.modules[f"{MAIN_PACKAGE_NAME}.plugin_state"]
+    original_write = plugin_state.write_json_atomic
+    armed = threading.Event()
+    started = threading.Event()
+    release = threading.Event()
+    release_write = threading.Event()
+    armed_calls = 0
+
+    def stub_write(path: Any, payload: Any, **kwargs: Any) -> bool:
+        nonlocal armed_calls
+        if not armed.is_set():
+            # 构造期启动落盘照常走真实实现：本用例只驱动 scenario 里那一次写。
+            return original_write(path, payload, **kwargs)
+        armed_calls += 1
+        if armed_calls == 1:
+            started.set()
+            release.wait(5.0)  # 等取消送达再放行
+            release_write.wait(5.0)  # 写盘本身压到后续新落盘之后
+        return original_write(path, payload, **kwargs)
+
+    async def scenario(plugin, _main):
+        plugin_state.write_json_atomic = stub_write
+        try:
+            await _until(lambda: plugin._storage_path.exists())
+            state = plugin._state_for(UMO)
+            state.last_active_at += 1.0
+            state.last_proactive_text = "STALE"
+            armed.set()
+            task = asyncio.create_task(plugin._save_storage())
+            await _until(lambda: started.is_set())
+            task.cancel()
+            await asyncio.sleep(0)  # 让第一次取消到达 except 块
+            task.cancel()  # 第二次取消：旧实现会打穿 except 块并放锁
+            release.set()
+            await asyncio.sleep(0.05)
+            # 写盘线程已放行但被 release_write 压住，尚未落地：此刻锁必须仍被
+            # 那次取消中的落盘持有——放锁就等于允许陈旧快照晚于新写入落地。
+            assert plugin._save_lock.locked(), (
+                "取消中的落盘提前放开了 _save_lock，其写盘线程会在锁外覆盖新写入"
+            )
+            release_write.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            # 取消中的写已落地后，一次新落盘必须是磁盘上的最后内容。
+            state.last_proactive_text = "FRESH"
+            await plugin._save_storage()
+            on_disk = read_json_with_retry(plugin._storage_path)
+            key = plugin_state.whitelist_storage_key(UMO)
+            assert on_disk["sessions"][key]["last_proactive_text"] == "FRESH"
+        finally:
+            armed.set()
+            release.set()
+            release_write.set()
+            plugin_state.write_json_atomic = original_write
+
+    with_plugin(tmp_path, scenario)
+
+
 def test_terminate_clears_tasks_and_saves(tmp_path: Path) -> None:
     async def scenario(plugin, main):
         plugin._gate.advance(UMO)
@@ -1250,6 +1330,108 @@ def test_ask_decision_model_provider_failure_returns_clear_reason(tmp_path: Path
         result = await plugin._decision.ask_decision_model(UMO, state, trigger="message_delay")
         assert result["should_reply"] is False
         assert result["reason"] == "判断模型解析失败"
+
+    with_plugin(tmp_path, scenario)
+
+
+def test_manual_check_preserves_event_arriving_during_release_wait(tmp_path: Path) -> None:
+    """``/selfreply check`` 不得销毁释放等待期间到达的用户消息事件。
+
+    缺陷形态：``invalidate(force_cancel=True)`` 清空事件缓存，有界释放等待
+    只在真有在途检查时消耗时间——这期间到达的新消息记下自己的事件并排好延迟
+    检查，随后 ``record_event`` 无条件覆写成指令事件，``finally`` 再当"自己的"
+    清掉。那条消息的延迟检查被 guard 以「没有可用的最近消息事件」丢弃，巡检
+    也因事件缓存为空跳过该会话：一条管理员指令静默废掉一次主动回复评估。
+    """
+
+    async def scenario(plugin, main):
+        command = make_event(umo=UMO, message_str="/selfreply check", is_admin=True)
+        user_msg = make_event(umo=UMO, message_str="在吗", is_admin=False)
+        # 先给会话一条真实消息事件：guard 的「有可用事件」否则直接早退，
+        # 在途检查根本到不了 decide，本用例要造的窗口就不存在。
+        await plugin.on_message(make_event(umo=UMO, message_str="在吗", is_admin=False))
+
+        # 制造一次在途检查，让释放等待真实消耗时间
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_decide(umo, state, *, trigger):
+            if not entered.is_set():
+                entered.set()
+                await release.wait()
+            return {"should_reply": False, "reason": "安静", "elapsed_sec": 0.0}
+
+        original_decide = plugin._decision.ask_decision_model
+        plugin._decision.ask_decision_model = slow_decide
+        plugin.settings.decision_model_enabled = True
+        in_flight = asyncio.create_task(
+            plugin._pipeline.check_session(UMO, trigger="patrol", force=False)
+        )
+        await entered.wait()
+
+        async def manual() -> str:
+            return await plugin._command_text(command, "check")
+
+        manual_task = asyncio.create_task(manual())
+        await asyncio.sleep(0.05)
+        # 释放等待窗口内到达的用户消息：记录自己的事件并排好延迟检查
+        await plugin.on_message(user_msg)
+        assert plugin._last_events.get(UMO) is user_msg
+        release.set()
+        await in_flight
+        await manual_task
+        plugin._decision.ask_decision_model = original_decide
+
+        # 用户消息的事件必须存活：它的延迟检查才不会被 guard 丢弃
+        assert plugin._last_events.get(UMO) is user_msg, (
+            "手动检查覆写并清掉了释放等待期间到达的用户消息事件"
+        )
+        assert UMO in plugin._delay_tasks, "用户消息的延迟检查被手动检查牵连"
+
+    with_plugin(tmp_path, scenario)
+
+
+def test_status_daily_count_only_counts_today(tmp_path: Path) -> None:
+    """``/selfreply status`` 的「今日已回复」只数今天，昨天的用量不得冒充。
+
+    缺陷形态：``read_session_state`` 刻意不刷新日期（只读路径不改状态），
+    跨天后 state.daily_count 属于昨天。配额闸门看到的是刷新后的 0，状态行
+    却显示昨天的计数——运营者读到「配额已用尽」而插件实际还能回，恰好相反。
+    """
+
+    async def scenario(plugin, main):
+        state = plugin._state_for(UMO)
+        state.daily_key = "2000-01-01"
+        state.daily_count = 5
+        event = make_event(umo=UMO)
+
+        text = await plugin._command_text(event, "status")
+
+        assert "今日已回复: 0" in text, f"昨天的用量被当成今天的显示：{text}"
+        # 闸门一侧的判定确实已刷新为 0（只读路径没有改状态）
+        assert state.daily_key == "2000-01-01"
+
+    with_plugin(tmp_path, scenario)
+
+
+def test_refresh_admin_ids_rejects_malformed_admins_id(tmp_path: Path) -> None:
+    """``cmd_config.json`` 的 admins_id 形状不对时按空集处理。
+
+    缺陷形态：标量/字典被直接迭代——``"12345"`` 会逐字符拆出 1/2/3/4/5 五个
+    假管理员 ID，等于给任意单位数账号发管理员权限。
+    """
+
+    async def scenario(plugin, main):
+        path = plugin._data_root / "cmd_config.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"admins_id": "12345"}', encoding="utf-8")
+        # 绕过时间窗缓存：直接改 mtime 并清缓存字段
+        plugin._admin_probe_ts = 0.0
+        plugin._admin_file_mtime = None
+
+        ids = plugin._refresh_admin_ids()
+
+        assert ids == set(), f"标量 admins_id 被逐字符拆成假管理员：{ids}"
 
     with_plugin(tmp_path, scenario)
 
@@ -1968,6 +2150,62 @@ def test_startup_still_writes_when_disk_shape_differs(tmp_path: Path) -> None:
         await until(lambda: "cooldown_sec" in read_json_with_retry(config_path))
 
     with_plugin(tmp_path, second_load)
+
+
+def test_startup_config_write_serializes_with_admin_writes(tmp_path: Path) -> None:
+    """启动规范化落盘必须与其余写方共用 _config_lock。
+
+    缺陷形态：``_startup_disk_writes`` 的配置规范化是「序列化 Settings 整份
+    读-改-写」却不持锁。``to_config_dict()`` 与 ``write_json_atomic`` 之间的
+    窗口里，任何锁内写操作（/selfreply add、POST /config、on/off）落地的改动
+    都会被启动写盘按旧快照覆写：保存方拿到成功回执，重启后改动消失，且全程
+    无日志。本用例把写盘堵在序列化之后，让窗口确定性地可观测。
+    """
+    import sys
+    import threading
+
+    from .host_stubs import MAIN_PACKAGE_NAME, load_main, until, with_plugin
+
+    load_main()  # 确保 MAIN_PACKAGE_NAME 的 storage 模块已加载（本用例可能首个跑）
+    storage = sys.modules[f"{MAIN_PACKAGE_NAME}.storage"]
+    original_write = storage.write_json_atomic
+    entered = threading.Event()
+    release = threading.Event()
+    blocked = False
+
+    def blocking_write(path: Any, data: Any, **kwargs: Any) -> bool:
+        nonlocal blocked
+        if not blocked and str(path).endswith("_config.json"):
+            blocked = True
+            entered.set()
+            release.wait(5.0)
+        return original_write(path, data, **kwargs)
+
+    storage.write_json_atomic = blocking_write
+
+    async def scenario(plugin, _main):
+        await until(entered.is_set, timeout=5.0)
+        # 在途期间执行一次管理员写操作（与启动写盘同一把 _config_lock）
+        add_task = asyncio.create_task(plugin._add_whitelist_session("fake:group:999"))
+        await asyncio.sleep(0.2)
+        release.set()
+        assert await add_task is True
+        startup = [
+            task
+            for task in list(plugin._background_tasks)
+            if not task.done() and task is not plugin._scheduler.image_cleanup_task
+        ]
+        if startup:
+            await asyncio.wait(startup, timeout=5.0)
+        on_disk = read_json_with_retry(plugin._config_path)
+        assert "fake:group:999" in on_disk["whitelist_sessions"], (
+            "启动规范化落盘覆写了在途的管理员改动（未持 _config_lock）"
+        )
+
+    try:
+        with_plugin(tmp_path, scenario)
+    finally:
+        storage.write_json_atomic = original_write
 
 
 def test_messages_during_running_check_coalesce_to_one_follow_up(tmp_path: Path) -> None:

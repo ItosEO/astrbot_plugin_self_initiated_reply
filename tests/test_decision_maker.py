@@ -711,6 +711,22 @@ async def test_in_quiet_hours_crosses_midnight(tmp_path: Path) -> None:
     assert maker.in_quiet_hours() is True
 
 
+async def test_parse_quiet_hour_accepts_midnight_end(tmp_path: Path) -> None:
+    """结束时刻 24:00 必须被接受：它是「到午夜」的自然写法。
+
+    缺陷形态：上界校验写死 eh > 23，"22:00-24:00" 被整条丢弃且只警告一次，
+    免打扰配置静默失效；唯一替代 23:59 还留一分钟空洞。开始时刻仍不许
+    24:00（1440 分钟起点的时段无意义）。
+    """
+    _, _, maker, _, _ = _make_decision(tmp_path, minutes_now=23 * 60)
+    maker.settings.quiet_hours = ["22:00-24:00"]
+    assert maker.parse_quiet_hour("22:00-24:00") == (22 * 60, 24 * 60)
+    assert maker.in_quiet_hours() is True
+    assert maker.parse_quiet_hour("00:00-24:00") == (0, 24 * 60)
+    assert maker.parse_quiet_hour("24:00-02:00") is None
+    assert maker.parse_quiet_hour("22:00-24:01") is None
+
+
 async def test_parse_quiet_hour_invalid_warns_once(tmp_path: Path) -> None:
     _, _, maker, _, _ = _make_decision(tmp_path)
     assert maker.parse_quiet_hour("not-a-time") is None

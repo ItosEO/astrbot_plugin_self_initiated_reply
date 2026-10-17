@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-import base64
 from collections import deque
 from collections.abc import Callable
 from typing import Any
@@ -29,16 +28,17 @@ from .session_gate import SessionGate
 
 
 def _prepared_memory_size(image: Any) -> int:
+    # 计费口径＝索引实际驻留的字节：prepared_source 是 data URL 时，内存里
+    # 持有的是 base64 字符串本身（比解码后大 4/3）。按解码长度计费会让
+    # MAX_IMAGE_MEMORY_BYTES 名不副实（最坏超支三分之一）；文件路径形态的
+    # 源在磁盘上，不占这份预算。base64 头部的零头忽略不计。
     source = str(getattr(image, "prepared_source", "") or "")
     if not source.startswith("data:"):
         return 0
     _header, separator, encoded = source.partition(",")
     if not separator:
         return len(source.encode("utf-8"))
-    try:
-        return len(base64.b64decode(encoded, validate=True))
-    except (ValueError, TypeError):
-        return len(encoded.encode("utf-8"))
+    return len(encoded.encode("utf-8"))
 
 
 def _event_bytes(images: list[Any]) -> int:

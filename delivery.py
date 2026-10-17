@@ -235,6 +235,11 @@ class DeliveryRunner:
                 ledger_id,
                 umo,
             )
+            # 工具已直发过时，账本仍会记一次消耗冷却与日配额主动尝试
+            # （见 session_pipeline._record_ledger）：回执必须与落盘状态一致，
+            # 不能只说「放弃回复」仿佛什么都没发生。
+            if direct_send_count:
+                return f"工具主动回复已完成；{STOPPING_REPLY_TEXT}"
             return STOPPING_REPLY_TEXT
         gate = "" if self._gate.is_current(umo, expected_generation) else STALE_TASK_MESSAGE
         if not gate:
@@ -388,20 +393,10 @@ class DeliveryRunner:
                 .set_result_content_type(self._runtime().result_llm_type)
             )
             await self._call_hook(last_event, self._runtime().event_type.OnDecoratingResultEvent)
-            # 复核点 2/2（真实窗口）：装饰钩子是 await，期间新消息可推进代次。
-            if not self._gate.is_current(umo, expected_generation):
-                self._clear_result(last_event)
-                logger.info(
-                    "[%s] suppress stale reply after decorating hook ledger_id=%s session=%s",
-                    PLUGIN_ID,
-                    ledger_id,
-                    umo,
-                )
-                return SendOutcome(
-                    SendStatus.SUPPRESSED,
-                    "generation changed after decorating",
-                    SuppressCode.GENERATION_CHANGED,
-                )
+            # 复核点 2/2（真实窗口）：装饰钩子是 await，期间插件重载会同时置
+            # _stopping 并推进代次。停止必须先于代次判定：反过来会把「因停止
+            # 而抑制」误报成「会话已更新」，把排障方向指错（deliver_reply 的
+            # SUPPRESSED 文案按成因分流，DECISIONS.md 同）。
             if self._is_stopping():
                 self._clear_result(last_event)
                 logger.info(
@@ -415,6 +410,19 @@ class DeliveryRunner:
                     SendStatus.SUPPRESSED,
                     "plugin is stopping",
                     SuppressCode.STOPPING,
+                )
+            if not self._gate.is_current(umo, expected_generation):
+                self._clear_result(last_event)
+                logger.info(
+                    "[%s] suppress stale reply after decorating hook ledger_id=%s session=%s",
+                    PLUGIN_ID,
+                    ledger_id,
+                    umo,
+                )
+                return SendOutcome(
+                    SendStatus.SUPPRESSED,
+                    "generation changed after decorating",
+                    SuppressCode.GENERATION_CHANGED,
                 )
             result = last_event.get_result()
             if result is None or not result.chain:

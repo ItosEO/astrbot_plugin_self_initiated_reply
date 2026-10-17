@@ -34,7 +34,7 @@ from .models import (
     ReadHistoryCallback,
     SessionState,
     Settings,
-    as_int,
+    proactive_build_config_kwargs,
 )
 from .outbound import OutboundGateway
 from .utils import (
@@ -42,6 +42,7 @@ from .utils import (
     cap_context_text,
     clean_reply,
     consume_task_result,
+    maybe_await,
     redact_exc_text,
     response_text,
 )
@@ -72,7 +73,13 @@ _ENVELOPE_TAG = "recent_chat"
 # 属性段刻意要求以空白开头：这是 HTML 标签语法的硬前提，既能吃掉
 # ``<recent_chat foo="bar">`` 与 ``<recent_chat/>``，又不会把 ``<recent_chatty>``
 # 这类同名前缀的不同标签误判成信封标签。
-_ENVELOPE_TAG_RE = re.compile(rf"<\s*/?\s*{_ENVELOPE_TAG}(?:\s[^<>]*)?/?\s*>", re.IGNORECASE)
+# 引号属性值里允许尖括号：``</recent_chat foo="<">`` 若匹配不到就会原样穿过
+# 中和，而它本身是结构完整的闭合标签——模型据此把其后内容划到信封之外，
+# 正是本函数要堵的逃逸（tests/test_generation_runner.py 钉住）。
+_ENVELOPE_TAG_RE = re.compile(
+    rf"<\s*/?\s*{_ENVELOPE_TAG}(?:\s+(?:[^<>\"']|\"[^\"]*\"|'[^']*')*)?/?\s*>",
+    re.IGNORECASE,
+)
 
 
 def neutralize_envelope_tags(text: str) -> str:
@@ -231,7 +238,9 @@ class GenerationRunner:
         request_stop = getattr(agent_runner, "request_stop", None)
         if callable(request_stop):
             try:
-                request_stop()
+                # 结果可能可等待（宿主改成协程时）：不 await 会留下一个从未运行的
+                # 协程对象，优雅停止请求静默失效，此后每次超时都退化到取消+隔离。
+                await maybe_await(request_stop())
             except Exception:
                 # 优雅停止是尽力而为：失败不能阻断下方的宽限等待与兜底 cancel()。
                 pass
@@ -511,19 +520,15 @@ class GenerationRunner:
             # 调用方取消（force cancel / terminate）时，shield 保住的 run_task
             # 不会自动停止：必须显式收敛，否则成为孤儿任务，其工具直发还会
             # 绕过预算与代次闸门。
-            await self._graceful_stop(
-                run_task,
-                build_result.agent_runner,
-                cancel_first=True,
-                on_quarantine=mark_quarantined,
-            )
-            # 取消落在生成中途时，回复已被生成但既不会提交也不会记账。此处必须
-            # 留一行 INFO：CancelledError 是 BaseException，``generate`` 的
-            # ``except Exception`` 接不到，scheduler 的 delayed_check 又静默
-            # 吞掉，于是整条链路无痕。运营者看到的是「最近裁决: 接话」+ 什么都没
-            # 发生 + 今日已回复 0，无从判断是没生成、被丢还是没发。
-            # 直发计数一并打出：工具可能已经提交过消息，那时"before submission"
-            # 是假的，只写原因会让排障者以为一条都没发出去。
+            #
+            # 留痕先于收敛：取消落在生成中途时，回复已被生成但既不会提交也不会
+            # 记账。``_graceful_stop`` 自己可能被二次取消再抛（terminate 宽限
+            # 窗口耗尽时正是如此），那这条 INFO 就永远打不出来。CancelledError
+            # 是 BaseException，``generate`` 的 ``except Exception`` 接不到、
+            # scheduler 的 delayed_check 又静默吞掉，整条链路无痕。运营者看到的
+            # 是「最近裁决: 接话」+ 什么都没发生 + 今日已回复 0，无从判断是没
+            # 生成、被丢还是没发。直发计数一并打出：工具可能已经提交过消息，
+            # 那时"before submission"是假的，只写原因会让排障者以为一条都没发。
             logger.info(
                 "[%s] reply discarded during generation session=%s ledger_id=%s "
                 "reason=cancelled direct_sends=%d",
@@ -531,6 +536,12 @@ class GenerationRunner:
                 run.umo,
                 run.ledger.ledger_id,
                 run.ledger.direct_send_count,
+            )
+            await self._graceful_stop(
+                run_task,
+                build_result.agent_runner,
+                cancel_first=True,
+                on_quarantine=mark_quarantined,
             )
             raise
         except TimeoutError:
@@ -615,7 +626,14 @@ class GenerationRunner:
             logger.debug("[%s] load conversation failed session=%s error=%s", PLUGIN_ID, umo, exc)
             return
         try:
-            req.contexts = json.loads(conversation.history)
+            parsed = json.loads(conversation.history)
+            if not isinstance(parsed, list):
+                # 合法 JSON 但形状不对（"null" / 字符串 / 对象）：原样赋给
+                # req.contexts 会把垃圾交给宿主消息装配（字符串按字符迭代、
+                # None 可能直接炸），且那条「数据损坏」告警被跳过——降级路径
+                # 还在，痕迹没了。按同一类损坏处理。
+                raise ValueError(f"history is {type(parsed).__name__}, expected a list")
+            req.contexts = parsed
         except (TypeError, ValueError) as exc:
             # JSONDecodeError 是 ValueError 子类；history 为 None/非 str 时是
             # TypeError，同属数据损坏。
@@ -728,31 +746,8 @@ class GenerationRunner:
             # 会话级配置是可选能力：get_config(umo) 在旧宿主不存在或返回对象
             # 不是 Mapping 时降级为宿主默认行为。
             pass
-        return self._runtime().new_build_config(
-            # 夹取必须能防抛：provider_settings 是宿主配置里可手改的外部输入，
-            # "60s" 之类的非数字串若在 try 之外 int() 抛出，会让所有主动生成
-            # 整体失败，本方法承诺的"拿不到会话配置就退化到宿主默认"随之失效。
-            tool_call_timeout=as_int(
-                provider_settings.get("tool_call_timeout") or 60, 60, minimum=1, maximum=86400
-            ),
-            # 强制 full：skills_like 会进入 raw/light 双工具集路径，策略清理只覆盖
-            # light 集，边界不可见；主动回复工具集很小，full 无额外成本。
-            tool_schema_mode="full",
-            provider_wake_prefix="",
-            streaming_response=False,
-            sanitize_context_by_modalities=bool(
-                provider_settings.get("sanitize_context_by_modalities", False)
-            ),
-            kb_agentic_mode=False,
-            file_extract_enabled=False,
-            llm_safety_mode=bool(provider_settings.get("llm_safety_mode", True)),
-            safety_mode_strategy=str(
-                provider_settings.get("safety_mode_strategy", "system_prompt") or "system_prompt"
-            ),
-            computer_use_runtime="none",
-            add_cron_tools=False,
-            provider_settings=provider_settings,
-        )
+        # 键集合与加载期探针单源（models.proactive_build_config_kwargs）。
+        return self._runtime().new_build_config(**proactive_build_config_kwargs(provider_settings))
 
     async def build_context_text(self, umo: str, state: SessionState) -> str:
         context_text = await build_history_text(

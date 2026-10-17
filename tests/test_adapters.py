@@ -677,3 +677,34 @@ async def test_read_history_non_list_history(bridge) -> None:
 
     ctx = SimpleNamespace(conversation_manager=Manager())
     assert await bridge(ctx).read_astrbot_history("umo1", limit=5) == []
+
+
+async def test_read_history_non_positive_limit_returns_nothing(bridge) -> None:
+    """limit<=0 必须返回空，不能悄悄退回全量历史。
+
+    缺陷形态：``history[-limit:]`` 在 ``limit=0`` 时是 ``history[0:]``（全量）、
+    ``limit=-1`` 时只丢最旧一条。两个生产调用点都有规格下限夹取，这里兜住
+    直传（含未来新调用点）——「要 0 条却拿回全部」会把整个会话历史塞进提示词。
+    """
+    from types import SimpleNamespace
+
+    history = json.dumps(
+        [
+            {"role": "user", "content": "one"},
+            {"role": "user", "content": "two"},
+            {"role": "user", "content": "three"},
+        ]
+    )
+    Conversation = type("Conversation", (), {"history": history})
+
+    class Manager:
+        async def get_curr_conversation_id(self, umo):
+            return "cid1"
+
+        async def get_conversation(self, umo, cid):
+            return Conversation()
+
+    ctx = SimpleNamespace(conversation_manager=Manager())
+    assert await bridge(ctx).read_astrbot_history("umo1", limit=0) == []
+    assert await bridge(ctx).read_astrbot_history("umo1", limit=-1) == []
+    assert len(await bridge(ctx).read_astrbot_history("umo1", limit=2)) == 2

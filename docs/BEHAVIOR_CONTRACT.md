@@ -44,6 +44,9 @@
 
 - 主动运行默认空 allowlist：build 与 hook 之后注入的工具一律移除；工具集无法
   枚举或清理时**终止本次运行**（fail closed），绝不带病运行。
+- 工具**名字读不到**同样终止本次运行：allowlist 模式下按 `<unnamed>` 违规拦截，
+  denylist 模式下无从判断它是否在拒绝集合内——两种模式都不放行（与 allowlist
+  分支的 `<unnamed>` 违规对称）。
 - `proactive_inherit_tools` 继承宿主工具链，但宿主级危险能力（cron、浏览器/
   电脑使用、文件提取、知识库 agentic）在任何模式下永远拒绝；denylist 无法
   强制时同样终止运行。

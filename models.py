@@ -39,6 +39,14 @@ MAX_PROVIDER_ID_LEN = MAX_STRING_LIST_ITEM_LEN
 # 与前端 pages/主动回复设置/config-form.mjs 的 WHITELIST_ILLEGAL_RE 同字符集。
 # 控制字符 + 引号 + 反斜杠：过长文案截进 logger.warning 时不能伪造日志行。
 STRING_LIST_ILLEGAL_RE = re.compile(r"[\x00-\x1f\"'\\]")
+# 列表条目 trim 用的字符集 = 设置页 String.prototype.trim() 的那一套（JS
+# WhiteSpace + LineTerminator）。Python 的裸 str.strip() 还会剥 U+0085（NEL）
+# 等 JS 不剥的字符：页面校验放行的条目会被后端静默改写，保存再加载后内容
+# 与用户输入不一致（差分模糊测试实测的唯一分歧源）。
+_JS_TRIM_CHARS = (
+    "\t\n\v\f\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007"
+    "\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+)
 MAX_BOT_ALIASES = 64
 MAX_IGNORED_SENDER_IDS = 1000
 MAX_QUIET_HOURS = 24
@@ -250,6 +258,44 @@ def as_int(value: Any, default: int, minimum: int = 0, maximum: int = 100000) ->
     except (TypeError, ValueError, OverflowError):
         return default
     return max(minimum, min(maximum, parsed))
+
+
+def proactive_build_config_kwargs(
+    provider_settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """主动运行传给宿主 ``MainAgentBuildConfig`` 的键集合（唯一来源）。
+
+    ``generation.main_agent_build_config`` 与 ``runtime_adapter`` 的加载期探针
+    共用：探针用同一表达式试实例化，宿主不接受某个键时**加载期**即红。缺少它
+    时契约只核验 build/run 的签名，插件装得上、每次主动生成都在运行期
+    TypeError（一条回复都产不出，且只在真实宿主上可见）。
+    """
+    settings = provider_settings or {}
+    return {
+        # 夹取必须能防抛：provider_settings 是宿主配置里可手改的外部输入，
+        # "60s" 之类的非数字串若在 try 之外 int() 抛出，会让所有主动生成
+        # 整体失败，"拿不到会话配置就退化到宿主默认"的承诺随之失效。
+        "tool_call_timeout": as_int(
+            settings.get("tool_call_timeout") or 60, 60, minimum=1, maximum=86400
+        ),
+        # 强制 full：skills_like 会进入 raw/light 双工具集路径，策略清理只覆盖
+        # light 集，边界不可见；主动回复工具集很小，full 无额外成本。
+        "tool_schema_mode": "full",
+        "provider_wake_prefix": "",
+        "streaming_response": False,
+        "sanitize_context_by_modalities": bool(
+            settings.get("sanitize_context_by_modalities", False)
+        ),
+        "kb_agentic_mode": False,
+        "file_extract_enabled": False,
+        "llm_safety_mode": bool(settings.get("llm_safety_mode", True)),
+        "safety_mode_strategy": str(
+            settings.get("safety_mode_strategy", "system_prompt") or "system_prompt"
+        ),
+        "computer_use_runtime": "none",
+        "add_cron_tools": False,
+        "provider_settings": settings,
+    }
 
 
 def as_float(value: Any, default: float, minimum: float, maximum: float) -> float:
@@ -989,17 +1035,39 @@ def panel_config_specs() -> tuple[ConfigSpec, ...]:
     return tuple(spec for spec in CONFIG_SPECS if "panel" in spec.surfaces)
 
 
-def _list_items(raw: Any) -> list[Any]:
+# 设置页 textarea 的分隔符（pages/主动回复设置/config-form.mjs 的
+# parseWhitelist 同一表达式）：页面把「a,b」当两条展示与保存，后端 api 模式
+# 必须同口径切分，否则一个会话被拆成两个、计数与磁盘三方不一致。
+_LIST_SEPARATOR_PATTERN = re.compile(r"[\n,，]+")
+
+
+def _list_items(raw: Any, *, split_items: bool = False) -> list[Any]:
     if isinstance(raw, (list, tuple, set, frozenset)):
-        return list(raw)
+        items = list(raw)
+        if not split_items:
+            return items
+        expanded: list[Any] = []
+        for item in items:
+            if isinstance(item, str):
+                expanded.extend(_LIST_SEPARATOR_PATTERN.split(item))
+            else:
+                expanded.append(item)
+        return expanded
     if isinstance(raw, str):
-        return re.split(r"[\n,，]+", raw)
+        return _LIST_SEPARATOR_PATTERN.split(raw)
     raise ValueError("配置列表类型无效")
 
 
 def _normalize_list_item(spec: ConfigSpec, raw: Any, mode: str) -> tuple[str | None, int, int]:
     """Normalize one list item and return ``(value, dropped, adjusted)``."""
-    text = str(raw).strip()
+    if not isinstance(raw, str):
+        # 非字符串条目一律不当成活条目：str(None) 会变成 "None" 持久化进
+        # 白名单/别名，而集合比较通过、UI 无感知。api 模式拒收（400），
+        # disk 模式对不可信落盘数据保持宽松：丢弃。
+        if mode == "api":
+            raise ValueError(f"{spec.key} 条目必须是字符串")
+        return None, 1, 0
+    text = raw.strip(_JS_TRIM_CHARS)
     if not text:
         # 空条目一律丢弃：白名单与别名列表都无意义。
         return None, 1, 0
@@ -1033,7 +1101,7 @@ def normalize_string_list(
     items: list[str] = []
     dropped = 0
     adjusted = 0
-    for item in _list_items(raw):
+    for item in _list_items(raw, split_items=mode == "api"):
         text, item_dropped, item_adjusted = _normalize_list_item(spec, item, mode)
         dropped += item_dropped
         adjusted += item_adjusted

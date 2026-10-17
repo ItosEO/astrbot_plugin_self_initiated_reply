@@ -14,7 +14,12 @@ from ..models import PLUGIN_ID, Settings
 from ..session_coordinator import SessionCoordinator
 from ..session_gate import SessionGate
 from ..utils import redact_exc_text
-from ._support import VISION_MAX_CONCURRENT, ImageInfo, format_image_context
+from ._support import (
+    MAX_FREEZE_BUDGET_SEC,
+    VISION_MAX_CONCURRENT,
+    ImageInfo,
+    format_image_context,
+)
 from .parser import ImageParser
 from .recorder_bridge import MessageRecorderBridge
 
@@ -104,11 +109,15 @@ class VisionService:
             parser = self.get_image_parser()
             if parser is None:
                 return
-            prepared = await asyncio.wait_for(
-                parser.prepare_batch(images),
-                # 冻结预算取单图超时的 2 倍（5-30s 夹取）：批量可比单图慢，但不得拖住消息主链。
-                timeout=max(5.0, min(30.0, float(self._settings.vision_timeout_sec) * 2)),
-            )
+            # 冻结预算按批次形状推导：prepare_batch 以 VISION_MAX_CONCURRENT
+            # 并发跑，N 张图需要 ceil(N/并发) 波，每波至多一个单图超时。固定
+            # 「单图超时 ×2」在 vision_max_images>2 时会整批误杀（已落盘的图
+            # 一并丢弃），且 min(30, ...) 的上限让调大单图超时也救不回来。
+            concurrency = max(1, VISION_MAX_CONCURRENT)
+            waves = max(1, -(-len(images) // concurrency))
+            per_image = float(self._settings.vision_timeout_sec)
+            budget = max(5.0, min(MAX_FREEZE_BUDGET_SEC, waves * per_image + 5.0))
+            prepared = await asyncio.wait_for(parser.prepare_batch(images), timeout=budget)
             if self._is_stopping() or not self._gate.is_current(umo, generation):
                 return
             cached_images = [image for image, ok in zip(images, prepared, strict=True) if ok]
@@ -130,6 +139,11 @@ class VisionService:
                 umo,
             )
         except TimeoutError:
+            # 整批超时不等于先完成的图也该丢：已冻结（prepared_source 落地）
+            # 的图照常进索引，闸门与成功路径同一套判定。
+            cached_images = [image for image in images if image.prepared_source]
+            if cached_images and not self._is_stopping() and self._gate.is_current(umo, generation):
+                self._coordinator.capture_images(umo, active_at, cached_images)
             logger.warning("[%s] image capture timed out for umo=%s", PLUGIN_ID, umo)
         except Exception as exc:
             logger.warning(

@@ -99,7 +99,16 @@ class OutboundGateway:
                 )
                 self._ledger.finish_before_submit(attempt, outcome.status)
                 return OutboundResult(outcome)
-            if self._allow_direct is not None and not self._allow_direct():
+            try:
+                gate_ok = self._allow_direct is None or bool(self._allow_direct())
+            except Exception:
+                # 闸门回调抛异常不该把 RESERVED 状态的 attempt 留在账本里
+                # （只有 seal 才会把它转 ABANDONED，中途无痕迹）：按闸门拒绝
+                # 收敛，与「闸门说不行」同一条记账路径。本模块不持 logger
+                # （无宿主依赖），异常文本不进 detail——调用方从
+                # SUPPRESSED/GATE_REJECTED 能看到这次直发没有发生。
+                gate_ok = False
+            if not gate_ok:
                 outcome = SendOutcome(
                     SendStatus.SUPPRESSED,
                     "direct send gate rejected",

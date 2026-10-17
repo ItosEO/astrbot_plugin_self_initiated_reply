@@ -76,8 +76,16 @@ def refresh_admin_ids(plugin: SelfInitiatedReplyPlugin) -> set[str]:
                 return plugin._admin_ids
             data = json.loads(path.read_text(encoding="utf-8-sig"))
             admins = data.get("admins_id", []) if isinstance(data, dict) else []
+            if not isinstance(admins, (list, tuple, set)):
+                # 形状不对（标量/字典）时按空集处理：直接迭代标量会逐字符拆出
+                # 一串假管理员 ID（"12345" → 1/2/3/4/5），等于给任意单位数
+                # 账号发管理员权限。
+                admins = []
             plugin._admin_ids = {str(item).strip() for item in admins if str(item).strip()}
             plugin._admin_file_mtime = mtime
+        # 文件不在：沿用上次集合（探测失败不变更缓存，见 ADMIN_REFRESH_WINDOW_SEC
+        # 的注释）；文件被删与瞬时读取失败在本层不可区分，清空会把所有管理员
+        # 暂时锁外面。
     except Exception as exc:
         logger.debug("[%s] load admins failed path=%s error=%s", PLUGIN_ID, path, exc)
     return plugin._admin_ids
@@ -229,7 +237,22 @@ async def save_storage(plugin: SelfInitiatedReplyPlugin) -> None:
             # 等 shield 保护的那次写完只为决定要不要留失败日志；取消必须
             # 原样重放，改写成 OSError 会把「被取消」上报成「写盘失败」，
             # 调用方会落到 except Exception 分支，取消路径的回滚语义丢失。
-            if not await write_task and not abandoned():
+            #
+            # 等待必须继续经 shield：裸 ``await write_task`` 时第二次 cancel()
+            # （terminate 对 _cancel_background_tasks 调两次；_wait_background
+            # _tasks 对超过 TERMINATE_TASK_TIMEOUT_SEC 的任务再调一次）会落到
+            # 写盘任务上，CancelledError 从本块穿出 → **提前放开 _save_lock**，
+            # 而写盘线程还在跑。它随后 os.replace 的陈旧快照会覆盖这期间更新的
+            # 一次落盘（terminate 的最终落盘、乃至新实例刚写出的 state.json），
+            # 且非 critical 任务不受 _spared_critical_tasks/_abandon_disk_writes
+            # 保护——正是这两道闸门唯一没覆盖的写方。
+            while True:
+                try:
+                    success = await asyncio.shield(write_task)
+                    break
+                except asyncio.CancelledError:
+                    continue
+            if not success and not abandoned():
                 logger.warning(
                     "[%s] state save failed while cancelled: %s", PLUGIN_ID, plugin._storage_path
                 )

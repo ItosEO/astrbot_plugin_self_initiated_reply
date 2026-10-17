@@ -192,8 +192,12 @@ class DecisionMaker:
             self._warn_invalid_quiet_hour(raw)
             return None
         sh, sm, eh, em = (int(part) for part in match.groups())
-        # 免打扰时段的时/分合法上界（HH:MM 解析后的边界校验）。
-        if sh > 23 or eh > 23 or sm > 59 or em > 59:
+        # 免打扰时段的时/分合法上界（HH:MM 解析后的边界校验）。结束时刻允许
+        # 24:00（=1440 分钟）：它是「到午夜」的自然写法，拒收会让整条免打扰
+        # 配置静默失效（只警告一次），而唯一替代 23:59 会留一分钟空洞。
+        # 开始时刻仍不许 24:00（1440 分钟起点的时段无意义）；24:00 之后的
+        # 分秒（24:01）同样拒收——结束时刻只能恰好落在午夜。
+        if sh > 23 or eh > 24 or sm > 59 or em > 59 or (eh == 24 and em > 0):
             self._warn_invalid_quiet_hour(raw)
             return None
         return sh * 60 + sm, eh * 60 + em

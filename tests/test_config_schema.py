@@ -102,6 +102,60 @@ def test_set_normalization_deduplicates_before_capacity() -> None:
     assert first == set(sorted(unique)[:limit])
 
 
+def test_api_mode_rejects_non_string_list_items() -> None:
+    """api 模式拒收非字符串条目：str(None) 会变成活条目 "None"。
+
+    缺陷形态：_normalize_list_item 用 str(raw) 兜底，[1, null, true] 被规范成
+    ["1", "None", "True"] 持久化进白名单/别名，而集合比较通过、UI 无感知。
+    disk 模式对不可信落盘数据保持宽松（丢弃），由 from_config 使用。
+    """
+    models = _models()
+    spec = models.CONFIG_SPEC_BY_KEY["whitelist_sessions"]
+    for raw in (None, True, 1, {"a": 1}, ["b"]):
+        try:
+            models.normalize_string_list(spec, [raw], mode="api")
+        except ValueError as exc:
+            assert "条目必须是字符串" in str(exc)
+        else:
+            raise AssertionError(f"api mode accepted non-string item: {raw!r}")
+    assert models.normalize_string_list(spec, [None, "ok", 2], mode="disk") == {"ok"}
+
+
+def test_api_mode_splits_commas_like_the_page() -> None:
+    """api 模式与设置页 textarea 同一套分隔符，["a,b"] 必须拆成两条。
+
+    缺陷形态：页面按 [\\n,，]+ 切分展示与保存，后端原样存成一条；下一轮
+    加载页面把它拆成两条，一个会话被无声劈成两个（裸 id 还是群通配符），
+    计数与磁盘长期不一致。
+    """
+    models = _models()
+    spec = models.CONFIG_SPEC_BY_KEY["whitelist_sessions"]
+    # set 容器：api 模式返回排序 list（JSON 友好），disk 模式返回 set
+    assert models.normalize_string_list(spec, ["a,b", "c\nd，e"], mode="api") == [
+        "a",
+        "b",
+        "c",
+        "d",
+        "e",
+    ]
+    # disk 模式不切分：手改落盘文件里的逗号条目原样载入，下一轮保存才规范化
+    assert models.normalize_string_list(spec, ["a,b"], mode="disk") == {"a,b"}
+
+
+def test_list_trim_matches_the_page_trim() -> None:
+    """条目 trim 必须与设置页 String.prototype.trim() 同字符集。
+
+    缺陷形态：裸 str.strip() 连 U+0085（NEL）一起剥，而 JS trim 不剥；
+    页面校验放行的 ``\\x85abc\\x85`` 被后端静默改写成 ``abc``，保存再加载后
+    内容与用户输入不一致（差分模糊测试实测的唯一分歧源）。
+    """
+    models = _models()
+    spec = models.CONFIG_SPEC_BY_KEY["whitelist_sessions"]
+    assert models.normalize_string_list(spec, ["\x85abc\x85"], mode="api") == ["\x85abc\x85"]
+    # JS trim 会剥的字符照剥
+    assert models.normalize_string_list(spec, ["\u00a0abc\u2028"], mode="api") == ["abc"]
+
+
 def test_malformed_formal_list_uses_legacy_fallback() -> None:
     """正式 list 键损坏时仍沿用既有 legacy migration 语义。"""
     models = _models()

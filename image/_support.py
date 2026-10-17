@@ -39,6 +39,12 @@ ALLOWED_IMAGE_PORTS = frozenset({80, 443})
 # 2 是实测够用的保守值；所有批方法共用此默认。
 VISION_MAX_CONCURRENT = 2
 
+# 后台冻结批次的总预算上限（vision_runtime._freeze_images 的 wait_for 取值
+# 上界）：冻结不占消息主链，但也不无限期占着一个被追踪的后台任务。同时是
+# parser 配额清理的在途宽限期：冻结开始到 capture_images 提交之间的文件既不在
+# 受保护快照里、mtime 又早于清理起点，宽限住整个预算窗口才不会误删。
+MAX_FREEZE_BUDGET_SEC = 120.0
+
 _JPEG_PREFIX = b"\xff\xd8\xff"
 _PNG_PREFIX = b"\x89PNG\r\n\x1a\n"
 _GIF_PREFIXES = (b"GIF87a", b"GIF89a")

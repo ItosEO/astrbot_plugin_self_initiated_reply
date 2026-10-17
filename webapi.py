@@ -317,14 +317,25 @@ def _strict_float(value: Any, field: str) -> float:
     return parsed
 
 
+# 宿主 PluginRequestProxy.json() 读不出 body 时返回 default 而不抛（实测
+# astrbot 4.27）：把 default 设成唯一哨兵，才能把「坏请求体」与「真·空对象」
+# 区分开——后者是合法的无字段保存，前者必须报错。
+_BODY_UNREADABLE = object()
+
+
 async def _request_json() -> Any:
     json_reader = getattr(request, "json", None)
     if callable(json_reader):
-        picked = first_bindable_args(json_reader, [((), {"default": {}}), ((), {})])
+        picked = first_bindable_args(json_reader, [((), {"default": _BODY_UNREADABLE}), ((), {})])
         if picked is None:
             raise RuntimeError("当前 AstrBot Web API 不支持 JSON 请求读取")
         args, kwargs = picked
-        return await json_reader(*args, **kwargs)
+        data = await json_reader(*args, **kwargs)
+        if data is _BODY_UNREADABLE:
+            # 宿主 reader 吞掉了读取异常：按坏请求体处理，两个调用方的
+            # except 分支都已覆盖该文案。
+            raise ValueError("请求体不是合法 JSON")
+        return data
     get_json = getattr(request, "get_json", None)
     if callable(get_json):
         return await get_json(silent=True)

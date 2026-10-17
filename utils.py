@@ -57,36 +57,49 @@ LOG_URL_MAX_CHARS = 80
 MODEL_JSON_TRUE_WORDS = frozenset({"true", "yes", "1", "是"})
 MODEL_JSON_FALSE_WORDS = frozenset({"false", "no", "0", "否"})
 _REDACTED_QUERY_MARK = "?<redacted>"
+# 凭证运行的最小形态：``&key=`` / ``;key=`` 起头的一段。query 之外的位置
+# （netloc、path）出现它同样是凭证——urlparse 不会把它归进 query，而原实现
+# 原样复制 netloc 与 path，``https://h/v1/chat&api_key=sk-...`` 之类因此
+# 整段幸存（实测占泄漏输入的最大一类）。
+_AUTHORITY_KEY_RUN = re.compile(r"[&;][^\s/]*=")
 # 判断模型 reason 的对外呈现长度上限：超长截断，只进日志/前端展示。
 DECISION_REASON_MAX_CHARS = 200
 # UMO（unified message object）为 platform:message_type:session_id 三段式。
 _UMO_PARTS = 3
 
-# 异常文本里的 URL 形态：scheme:// 开头，吃到引号/空白/括号为止。
+# 异常文本里的 URL 形态：scheme:// 开头，吃到引号/空白/尖括号为止。
 # 只认这一种形态（实证泄漏全部来自它），不做全文 secret 扫描。
-_EXCEPTION_URL_PATTERN = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s'\"<>)\]]+")
+# 字符类刻意不收 `)` 与 `]`：IPv6 字面量主机的 `]`（http://[::1]:11434/...?
+# api_key=...）或路径里的 `)` 会截断匹配，query 凭证原样幸存；而把两者放进
+# 类内只可能多吞一个紧随其后的散文括号，与既有的 `,`/`.` 同罪。
+_EXCEPTION_URL_PATTERN = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s'\"<>]+")
 
 # 同上的**相对路径**形态：urllib3 的 MaxRetryError 把请求 URL 拆成
 # "... Max retries exceeded with url: /v1/chat?api_key=sk-...&x=1 (Caused by ...)"，
 # 没有 scheme://，上面的模式匹配不到，而它照样把 query 凭证带进 reason 并经
 # GET /status 出网。只认「以 / 开头且带 query」的片段，且前一个字符不能是
 # 单词字符或斜杠——否则会切进绝对 URL 的 path 部分重复脱敏，也会误伤
-# ``https://`` 的那两个斜杠。
-_EXCEPTION_RELATIVE_URL_PATTERN = re.compile(r"(?<![\w/])/[^\s'\"<>()\[\]]*\?[^\s'\"<>()\[\]]+")
+# ``https://`` 的那两个斜杠。右界同绝对形态：不收括号，路径里的 `)` 不该
+# 成为 query 的泄密口（真实右界是空白）。可选的 ``host:port`` 前缀收
+# ``127.0.0.1:11434/v1/chat?api_key=...`` 这种不带 scheme 的本机端点写法。
+_EXCEPTION_RELATIVE_URL_PATTERN = re.compile(
+    r"(?<![\w/])(?:[\w.\-]+:\d+)?/[^\s'\"<>]*\?[^\s'\"<>]+"
+)
 
 
 def _redact_relative_url(text: str) -> str:
     """相对路径 URL：保留路径，query 与 fragment 一律抹掉。
 
     与 ``redact_url`` 分开是因为后者要求 scheme+netloc，路径形态会被它原样
-    放行（只截断），凭证因此漏出去。
+    放行（只截断），凭证因此漏出去。截断预算与 ``redact_url`` 同一口径：
+    这段文本同样经 ``redact_exc_text`` 进 reason 并由 GET /status 出网。
     """
     cut = len(text)
     for mark in ("?", "#"):
         index = text.find(mark)
         if index != -1:
             cut = min(cut, index)
-    return text[:cut] + _REDACTED_QUERY_MARK
+    return text[:cut][: LOG_URL_MAX_CHARS - len(_REDACTED_QUERY_MARK)] + _REDACTED_QUERY_MARK
 
 
 def safe_exc_text(exc: BaseException) -> str:
@@ -102,6 +115,36 @@ def safe_exc_text(exc: BaseException) -> str:
         return type(exc).__name__
 
 
+def _redact_url_fallback(text: str) -> str:
+    """urlparse 分解不了（畸形 IPv6 等）或没有 netloc 时的脱敏兜底。
+
+    与 happy path 同一口径：去 userinfo、去 query/fragment、去 ``&key=`` 运行、
+    截断到 ``LOG_URL_MAX_CHARS``。全部按字符串边界做，不依赖 urlparse——
+    分解失败恰恰是最需要脱敏的形状（残缺 IPv6 主机带着 userinfo 与 query）。
+    """
+    scheme_end = text.find("://")
+    authority_start = scheme_end + 3 if scheme_end != -1 else 0
+    authority_end = len(text)
+    for mark in ("/", "?", "#"):
+        index = text.find(mark, authority_start)
+        if index != -1:
+            authority_end = min(authority_end, index)
+    at = text.rfind("@", authority_start, authority_end)
+    if at != -1:
+        text = text[:authority_start] + text[at + 1 :]
+        authority_end -= at + 1 - authority_start
+    cut = len(text)
+    for mark in ("?", "#"):
+        index = text.find(mark)
+        if index != -1:
+            cut = min(cut, index)
+    key_run = _AUTHORITY_KEY_RUN.search(text[:cut])
+    if key_run:
+        cut = min(cut, key_run.start())
+    suffix = _REDACTED_QUERY_MARK if cut < len(text) else ""
+    return text[:cut][: LOG_URL_MAX_CHARS - len(suffix)] + suffix
+
+
 def redact_url(value: str) -> str:
     """去掉 userinfo 与 query/fragment 后再截断，避免凭证进日志或对外文本。"""
     text = str(value or "").strip()
@@ -110,15 +153,22 @@ def redact_url(value: str) -> str:
     try:
         parsed = urlparse(text)
     except ValueError:
-        return text[:LOG_URL_MAX_CHARS]
+        # 原样返回等于把 userinfo 与 query 一起放行：分解失败不改变这段文本
+        # 可疑的事实，改走同口径的边界兜底。
+        return _redact_url_fallback(text)
     if not parsed.scheme or not parsed.netloc:
-        return text[:LOG_URL_MAX_CHARS]
+        return _redact_url_fallback(text)
     # netloc 含 user:password@ 形态的 userinfo，必须去掉；从 netloc 尾部截取
     # 而非拼 hostname+port：后者要处理 IPv6 方括号，且 ``parsed.port`` 对
     # 越界/非数字端口抛 ValueError，本函数跑在异常处理路径上。
     netloc = parsed.netloc.rsplit("@", 1)[-1]
-    suffix = _REDACTED_QUERY_MARK if (parsed.query or parsed.fragment) else ""
     clean = f"{parsed.scheme}://{netloc}{parsed.path}"
+    # ``&key=`` / ``;key=`` 运行可能落在 netloc 或 path（urlparse 不把它们归进
+    # query）：出现即视为凭证段整体截掉，宁可多截也不留 key。
+    key_run = _AUTHORITY_KEY_RUN.search(clean)
+    if key_run:
+        clean = clean[: key_run.start()]
+    suffix = _REDACTED_QUERY_MARK if (parsed.query or parsed.fragment or key_run) else ""
     return clean[: LOG_URL_MAX_CHARS - len(suffix)] + suffix
 
 

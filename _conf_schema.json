@@ -253,7 +253,7 @@
   "quiet_hours": {
     "type": "list",
     "description": "免打扰时段",
-    "hint": "格式如 00:30-08:30。可填写多段。",
+    "hint": "格式如 00:30-08:30。可填写多段；结束时刻可写 24:00 表示到午夜。",
     "default": []
   },
   "enabled_message_trigger": {

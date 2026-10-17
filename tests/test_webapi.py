@@ -41,6 +41,7 @@ def _bootstrap():
         # 级联出成片与失败原因无关的假红。
         web.request.payload = {}
         web.request.error = None
+        web.request.swallow_errors = False
 
 
 # ============================================================================
@@ -570,6 +571,69 @@ def test_request_json_fallbacks(tmp_path) -> None:
             assert result["ok"] is False
         finally:
             webapi.request = original
+
+    with_plugin(tmp_path, scenario)
+
+
+def test_post_config_unreadable_body_differs_from_empty_object(tmp_path) -> None:
+    """宿主 reader 吞掉坏 body 返回 default 时，POST /config 必须报错。
+
+    缺陷形态：astrbot 的 PluginRequestProxy.json() 读不出 body 时返回
+    default 而不抛（与 Quart 的 request.json() 相反）。default 写成 {} 时
+    「坏请求体」与「无字段保存」无法区分，垃圾 body 会拿到 ok:true 的全量
+    配置响应。哨兵 default 让两者可区分。
+    """
+    web = sys.modules["astrbot.api.web"]
+    web.request.payload = {}
+    web.request.error = ValueError("body unreadable")
+    web.request.swallow_errors = True  # 宿主 PluginRequestProxy 的行为
+
+    async def scenario(plugin, main):
+        result = await webapi_module(main)._api_post_config(plugin)
+        assert result == {"ok": False, "error": "请求体不是合法 JSON"}
+
+    with_plugin(tmp_path, scenario)
+
+
+def test_post_config_non_string_list_items_rejected(tmp_path) -> None:
+    """list 条目必须是字符串：[1, null, true] 不得变成 ["1","None","True"]。
+
+    缺陷形态：str(raw) 兜底把非字符串条目字符串化成活条目，持久化进白名单
+    后集合比较通过、UI 无感知，磁盘却长了垃圾条目。
+    """
+
+    async def scenario(plugin, main):
+        web = sys.modules["astrbot.api.web"]
+        web.request.payload = {"whitelist_sessions": [1, None, True]}
+
+        result = await webapi_module(main)._api_post_config(plugin)
+
+        assert result["ok"] is False
+        assert "条目必须是字符串" in result["error"]
+        # 拒绝即整体不变：白名单保持加载时的值，不落任何垃圾条目
+        assert plugin.settings.whitelist == {"fake:group:123"}
+
+    with_plugin(tmp_path, scenario)
+
+
+def test_post_config_splits_commas_like_the_page(tmp_path) -> None:
+    """api 模式按页面同一套分隔符切分：["a,b"] 存成两条而非一条。
+
+    缺陷形态：页面按 [\\n,，]+ 切分展示与保存，后端原样存一条；下一轮加载
+    页面把它拆成两条，一个会话被无声劈成两个（裸 id 还是群通配符）。
+    """
+
+    async def scenario(plugin, main):
+        utils = sys.modules[f"{PACKAGE}.utils"]
+        web = sys.modules["astrbot.api.web"]
+        web.request.payload = {"whitelist_sessions": ["qq:GroupMessage:1,qq:GroupMessage:2"]}
+
+        result = await webapi_module(main)._api_post_config(plugin)
+
+        assert result["ok"] is True
+        assert plugin.settings.whitelist == {"qq:GroupMessage:1", "qq:GroupMessage:2"}
+        assert len(result["config"]["whitelist_sessions"]) == 2
+        assert utils.session_whitelisted("qq:GroupMessage:1", plugin.settings.whitelist)
 
     with_plugin(tmp_path, scenario)
 

@@ -3660,3 +3660,162 @@ def test_fetch_slow_dns_times_out(monkeypatch) -> None:
     result, elapsed = asyncio.run(scenario())
     assert result is None
     assert elapsed < 2.5
+
+
+# ============================================================================
+# 冻结预算、在途文件宽限与缓存目录解析
+# ============================================================================
+
+
+def _freeze_service(vr, *, settings, parser, coordinator):
+    service = vr.VisionService(
+        settings=settings,
+        bridge=None,
+        context=None,
+        source_cache_dir=Path("/tmp"),
+        data_root=Path("/tmp"),
+        coordinator=coordinator,
+        gate=SimpleNamespace(is_current=lambda *args: True),
+        is_stopping=lambda: False,
+        track_background_task=lambda coro: coro.close(),
+    )
+    service.get_image_parser = lambda *args: parser
+    return service
+
+
+@pytest.mark.asyncio
+async def test_freeze_budget_scales_with_batch_waves() -> None:
+    """冻结预算按批次波数推导：固定「单图超时 ×2」会整批误杀。
+
+    缺陷形态：预算原为 max(5, min(30, 单图超时×2))。一批 N 张图以并发 2 跑，
+    需要 ceil(N/2) 波、每波一个单图超时；5 张各 1.9s（单图超时 2s 之内）需要
+    5.7s，旧预算 5s 整批超时，已落盘的图一并丢弃。且 min(30, ...) 的上限让
+    调大单图超时也救不回来。
+    """
+    _, image, _ = _load_modules()
+    vr = load_package(PACKAGE_NAME, "image.vision_runtime")
+    images = [image.ImageInfo(url=f"http://example.com/{index}.png") for index in range(5)]
+    captured: list[list] = []
+
+    async def slow_prepare_batch(batch, *, max_concurrent=2):
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def one(info):
+            async with semaphore:
+                await asyncio.sleep(1.9)
+                info.prepared_source = "data:image/png;base64,AAAA"
+                return True
+
+        return await asyncio.gather(*(one(info) for info in batch))
+
+    coordinator = SimpleNamespace(
+        capture_images=lambda _umo, _at, batch: captured.append(list(batch)) or list(batch)
+    )
+    service = _freeze_service(
+        vr,
+        settings=SimpleNamespace(vision_timeout_sec=2),
+        parser=SimpleNamespace(prepare_batch=slow_prepare_batch),
+        coordinator=coordinator,
+    )
+
+    await service._freeze_images("u1", generation=1, active_at=1.0, images=images)
+
+    assert len(captured) == 1, "整批被旧预算误杀（已落盘的图一并丢弃）"
+    assert len(captured[0]) == 5
+
+
+@pytest.mark.asyncio
+async def test_freeze_timeout_keeps_already_frozen_images() -> None:
+    """整批超时不等于先完成的图也该丢：已冻结的图照常进索引。
+
+    缺陷形态：TimeoutError 分支只打一条 WARNING 就返回，prepare_batch 里已
+    落盘的图（prepared_source 已固化、源 URL 可能已过期）被一并丢弃，下一轮
+    再也冻结不了。
+    """
+    _, image, _ = _load_modules()
+    vr = load_package(PACKAGE_NAME, "image.vision_runtime")
+    frozen = image.ImageInfo(url="http://example.com/a.png")
+    pending = image.ImageInfo(url="http://example.com/b.png")
+    captured: list[list] = []
+
+    async def prepare_batch(batch, **_kwargs):
+        # 复刻 wait_for 超时后的现场：先完成的图已固化，其余没有
+        batch[0].prepared_source = "data:image/png;base64,AAAA"
+        raise TimeoutError()
+
+    coordinator = SimpleNamespace(
+        capture_images=lambda _umo, _at, batch: captured.append(list(batch)) or list(batch)
+    )
+    service = _freeze_service(
+        vr,
+        settings=SimpleNamespace(vision_timeout_sec=2),
+        parser=SimpleNamespace(prepare_batch=prepare_batch),
+        coordinator=coordinator,
+    )
+
+    await service._freeze_images("u1", generation=1, active_at=1.0, images=[frozen, pending])
+
+    assert len(captured) == 1
+    assert captured[0] == [frozen]
+
+
+def test_quota_cleanup_spares_in_flight_frozen_files(tmp_path: Path) -> None:
+    """配额清理必须宽待在途冻结的文件：它们还没进受保护快照。
+
+    缺陷形态：_remove_over_quota_cache_files 只保护 mtime 晚于清理起点的
+    文件，而冻结开始到 capture_images 提交之间的文件 mtime 早于起点、又不在
+    索引快照里——超配额时按 mtime 升序删除会把它当最旧的删掉，prepared_source
+    已固化，该图从此静默消失。
+
+    构造要点：在途文件必须是**最旧的可驱逐条目**（另一条更旧但已在索引里、
+    受保护），否则升序删除先删它就把配额补足了，宽限窗口是否在都测不出来。
+    """
+    _, image, _ = _load_modules()
+    cache = tmp_path / "image_cache"
+    image.ImageParser(object(), source_cache_dir=cache)
+    now = time.time()
+    in_flight = cache / "ab" / "inflight.png"
+    committed = cache / "cd" / "committed.png"
+    for path in (in_flight, committed):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x" * 64)
+    # 在途：清理起点前 10s 写入（冻结预算窗口内），尚未 capture_images
+    os.utime(in_flight, (now - 10, now - 10))
+    # 已提交：更旧，但在索引里 → 受保护，删不得
+    os.utime(committed, (now - 100000, now - 100000))
+
+    removed = image.ImageParser.cleanup_source_cache(
+        cache,
+        protected_sources={str(committed)},
+        max_age_sec=10**9,
+        max_total_bytes=64,
+        now=now,
+    )
+
+    assert removed == 0, "在途冻结的文件被配额清理误删（宽限窗口未生效）"
+    assert in_flight.is_file()
+    assert committed.is_file()
+
+
+def test_relative_source_cache_dir_resolves_to_absolute(tmp_path: Path, monkeypatch) -> None:
+    """相对缓存目录必须固化为绝对路径：否则每张冻结图永久读不回。
+
+    缺陷形态：__init__ 原样保存传入目录，_file_to_data_url 又只读绝对路径；
+    宿主给相对插件数据目录时 prepare 回报 True、文件也落了盘，parse 却永远
+    拿不到图（识图静默失效）。
+    """
+    _, image, _ = _load_modules()
+    monkeypatch.chdir(tmp_path)
+    parser = image.ImageParser(object(), source_cache_dir=Path("image_cache"))
+
+    async def fake_fetch(_url):
+        return PNG_DATA_URL
+
+    parser._fetch_image_data_url = fake_fetch
+    info = image.ImageInfo(url="https://multimedia.nt.qq.com.cn/expired.png")
+
+    assert asyncio.run(parser.prepare(info)) is True
+    prepared = Path(info.prepared_source)
+    assert prepared.is_absolute(), f"prepared_source 仍是相对路径：{prepared}"
+    assert prepared.is_file()
+    assert asyncio.run(parser._resolve_image_url(info)) is not None

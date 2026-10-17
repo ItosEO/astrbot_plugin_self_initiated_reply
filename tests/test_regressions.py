@@ -493,6 +493,13 @@ def test_after_send_cancellation_records_delivered_attempt(tmp_path: Path) -> No
             await original_save()
 
         plugin._save_storage = counting_save
+        # 启动落盘（_startup_disk_writes）与账本落盘共用 _save_storage：先把
+        # 启动那一次等出来并清零，否则计的是两次保存，掩盖「账本只落一次」
+        # 的断言对象。
+        from .host_stubs import until
+
+        await until(lambda: save_calls, timeout=5.0)
+        save_calls.clear()
         original_finalize = plugin._pipeline._finalize_ledger
         captured_ledger: dict[str, Any] = {}
 

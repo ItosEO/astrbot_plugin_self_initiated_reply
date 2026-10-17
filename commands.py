@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from astrbot.api.event import AstrMessageEvent
 
-from .models import CheckTrigger, SessionState, Settings, fmt_ts, now_ts
+from .models import CheckTrigger, SessionState, Settings, fmt_ts, now_ts, today_key
 from .plugin_state import append_recent_user_message, apply_enabled_topology, read_session_state
 from .utils import (
     clean_chat_text,
@@ -189,7 +189,10 @@ def status_text(
             f"忽略发送者: {', '.join(sorted(settings.ignored_sender_ids)) or '-'}",
             f"冷却: {settings.cooldown_sec}s，今日上限: "
             f"{settings.max_daily_replies_per_session or '不限'}",
-            f"今日已回复: {state.daily_count}",
+            # daily_key 不是今天时计数属于昨天：read_session_state 刻意不刷新
+            # 日期（只读路径不改状态），直接显示会让运营者把昨天的用量当成
+            # 今天的——而配额闸门看到的是刷新后的 0，两者恰好相反。
+            f"今日已回复: {state.daily_count if state.daily_key == today_key() else 0}",
             f"上次主动回复: {fmt_ts(state.last_proactive_at)}",
             recent_decision_line(last_decision),
             "回复生成: AstrBot 正常 LLM 管线模式",
@@ -293,7 +296,13 @@ async def dispatch_command_action(
         # pipeline 会撞上「已有判断任务在运行」净效果是旧检查被静默掐掉、新的
         # 也没执行，用户必须重发一次。故有界等待其释放。
         await _await_previous_check_release(plugin, umo)
-        plugin._coordinator.record_event(umo, event, now_ts())
+        # 有界等待只在实际有在途检查时才消耗时间，而这期间到达的新用户消息
+        # 已经记下自己的事件并排好延迟检查。无条件覆写会把那条消息的事件换成
+        # 指令事件，finally 再当"自己的"清掉——它的延迟检查随后被 guard 以
+        # 「没有可用的最近消息事件」丢弃，巡检也因事件缓存为空跳过该会话。
+        # 已有更新的事件时保留它，手动检查照常跑（判定用的是 recent 文本）。
+        if not plugin._last_events.get(umo):
+            plugin._coordinator.record_event(umo, event, now_ts())
         text = clean_chat_text(arg or strip_command_prefix(event_text(event)))
         if text:
             append_recent_user_message(

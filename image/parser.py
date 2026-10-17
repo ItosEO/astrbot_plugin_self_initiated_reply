@@ -41,6 +41,7 @@ from ._support import (
     ALLOWED_IMAGE_PORTS,
     HTTP_SCHEMES,
     MAX_DESCRIPTION_CHARS,
+    MAX_FREEZE_BUDGET_SEC,
     MIME_EXTENSIONS,
     URL_SCHEMES,
     VISION_MAX_CONCURRENT,
@@ -162,11 +163,15 @@ def _remove_over_quota_cache_files(
             break
         if resolved in protected:
             continue
-        if mtime > not_before:
-            # 清理起点之后写入的文件不在 protected 快照里——受保护源集合是调用方
-            # 在 await to_thread 之前算的，这期间刚冻结的图还没进集合。超配额时
-            # 按 mtime 升序会一路跳过受保护的老文件，最终删掉这个最新的活文件；
-            # 而 prepared_source 已固化，parse 不会重新冻结，该图从此静默消失。
+        # 清理起点之后写入的文件不在 protected 快照里——受保护源集合是调用方
+        # 在 await to_thread 之前算的，这期间刚冻结的图还没进集合。超配额时
+        # 按 mtime 升序会一路跳过受保护的老文件，最终删掉这个最新的活文件；
+        # 而 prepared_source 已固化，parse 不会重新冻结，该图从此静默消失。
+        # 宽限整个冻结预算窗口（MAX_FREEZE_BUDGET_SEC）：mtime 落在
+        # [not_before - 预算, not_before] 的文件可能正被在途冻结持有、
+        # 尚未 capture_images，删了同样静默消失。代价至多是一轮清理的配额
+        # 超支一个批次的字节。
+        if mtime > not_before - MAX_FREEZE_BUDGET_SEC:
             continue
         try:
             path.unlink()
@@ -494,6 +499,10 @@ class ImageParser:
                 self._source_cache_dir.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
                 logger.warning("[%s] image cache directory unavailable: %s", PLUGIN_ID, exc)
+            # 固化为绝对路径：_file_to_data_url 只接受绝对路径，相对缓存目录
+            # 会让每张冻结图永久读不回（prepare 仍回报 True、文件已落盘），
+            # 而宿主给相对插件数据目录路径是完全可能的。
+            self._source_cache_dir = self._source_cache_dir.expanduser().resolve()
         # 本地读取的唯一判据：路径必须落在允许根下。提取层交回的路径不可信：
         # 宿主 aiocqhttp 用对端可控的 OneBot 原始值装配 Image 的 file 字段，
         # 被控协议端能把 file 写成任意绝对路径。
