@@ -44,6 +44,7 @@ from .models import (
     Settings,
     config_revision,
     first_bindable_args,
+    js_trim,
     normalize_config_updates,
     normalize_string_list,
     panel_config_specs,
@@ -311,7 +312,14 @@ def _strict_float(value: Any, field: str) -> float:
     # fail loud 优于静默纠偏。
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{field} 必须是数字")
-    parsed = float(value)
+    try:
+        parsed = float(value)
+    except OverflowError as exc:
+        # JSON 超长整数字面量被解析成任意精度 int，float() 抛 OverflowError。
+        # 它是 ArithmeticError 而非 ValueError，会一路逃到最外层兜底、被报成
+        # 「请求体不是合法 JSON」——字段值错误被说成请求体错误，前端按错误
+        # 文案前缀定位字段的规则随之失效（契约 §7.1 要字段级文案）。
+        raise ValueError(f"{field} 必须是有限数字") from exc
     if not math.isfinite(parsed):
         raise ValueError(f"{field} 必须是有限数字")
     return parsed
@@ -465,7 +473,10 @@ def _config_update_was_adjusted(
         if not isinstance(submitted, list):
             return submitted != actual
         raw_items = [str(item) for item in submitted]
-        trimmed_items = [item.strip() for item in raw_items if item.strip()]
+        # 必须与条目规范化同一个字符集：裸 str.strip() 连 U+0085 一起剥，而
+        # 设置页的 String.prototype.trim() 不剥，页面放行的条目会被误报成
+        # 「已规范化」——值一个字节都没改，提示却说改过（契约 §7）。
+        trimmed_items = [js_trim(item) for item in raw_items if js_trim(item)]
         return (
             raw_items != trimmed_items
             or len(trimmed_items) != len(set(trimmed_items))

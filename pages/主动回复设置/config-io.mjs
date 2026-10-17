@@ -341,7 +341,10 @@ export function createConfigIo(deps) {
 					: "已暂停（/off）"
 				: "关闭";
 		}
-		setStatState(e.selfStat, runtimeOn ? "is-on" : "is-off");
+		// 状态类必须同时看持久 enabled 与运行态：只按 runtimeOn 判定时，
+		// 「面板里关掉总开关并保存」这一路会让复选框未勾、文字写「关闭」，
+		// 而 .master.is-on 仍命中脉冲/高亮/强调色，视觉上显示为启用。
+		setStatState(e.selfStat, config.enabled && runtimeOn ? "is-on" : "is-off");
 		setState({
 			configLoaded: true,
 			configRevision: config.config_revision,

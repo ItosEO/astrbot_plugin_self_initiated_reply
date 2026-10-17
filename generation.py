@@ -623,7 +623,14 @@ class GenerationRunner:
             )
             req.conversation = conversation
         except Exception as exc:
-            logger.debug("[%s] load conversation failed session=%s error=%s", PLUGIN_ID, umo, exc)
+            # 同 adapters 的历史读取分支：存储后端的异常串常带连接串凭证
+            # （redis://:password@host:port/0），级别低不是豁免理由。
+            logger.debug(
+                "[%s] load conversation failed session=%s error=%s",
+                PLUGIN_ID,
+                umo,
+                redact_exc_text(exc),
+            )
             return
         try:
             parsed = json.loads(conversation.history)

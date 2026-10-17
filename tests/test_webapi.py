@@ -58,6 +58,10 @@ def _bootstrap():
         ({"decision_temperature": True}, "decision_temperature"),
         ({"decision_temperature": float("nan")}, "decision_temperature"),
         ({"decision_temperature": float("inf")}, "decision_temperature"),
+        # 几百位整数字面量：json.loads 产出任意精度 int，float() 抛的是
+        # OverflowError（ArithmeticError，不是 ValueError）。只断言「抛了
+        # ValueError」时，一个漏接的 except 会让它逃到最外层兜底。
+        ({"decision_temperature": 10**400}, "decision_temperature"),
         ({"decision_timeout_sec": "x"}, "decision_timeout_sec"),
         ({"cooldown_sec": True}, "cooldown_sec"),
         ({"cooldown_sec": "5s"}, "cooldown_sec"),
@@ -775,6 +779,59 @@ def test_api_post_config_returns_normalized_values(tmp_path) -> None:
         # 运行态必须回传：前端徽标按 result.runtime_enabled 刷新（缺失时 ?? 链会
         # 静默回退到保存前的旧值，切换总开关后徽标不更新）。
         assert "runtime_enabled" in result
+
+    with_plugin(tmp_path, scenario)
+
+
+def test_api_post_config_huge_int_reports_field_not_body(tmp_path) -> None:
+    """超长整数字面量：必须回字段级文案，不得落进最外层兜底说成「请求体不是合法 JSON」。
+
+    json.loads 对几百位整数产出任意精度 int，``float()`` 抛 OverflowError。
+    它是 ArithmeticError 而非 ValueError，会逃到 ``_api_post_config`` 最外层
+    ``except Exception``：用户看到一句与字段无关的兜底文案，而前端按「错误文案
+    以键名 + 空格前缀」定位字段的规则随之失效（契约 §7.1 要字段级文案）。
+
+    变异锚定：去掉 ``_strict_float`` 里的 ``except OverflowError``，本用例红。
+    """
+
+    async def scenario(plugin, main):
+        web = sys.modules["astrbot.api.web"]
+        web.request.payload = {"decision_temperature": 10**400}
+
+        result = await webapi_module(main)._api_post_config(plugin)
+
+        assert result["ok"] is False
+        assert result["error"] == "decision_temperature 必须是有限数字", result
+        # 配置未被改动：400 不得留下半应用态
+        assert plugin.settings.decision_temperature != 10**400
+
+    with_plugin(tmp_path, scenario)
+
+
+def test_api_post_config_nel_wrapped_item_is_not_reported_adjusted(tmp_path) -> None:
+    """U+0085 包裹的集合条目：页面放行、后端原样保留，不得报「已规范化」。
+
+    缺陷形态：``_config_update_was_adjusted`` 用裸 ``str.strip()`` 判「是否被
+    trim 过」，而条目规范化用的是 ``js_trim``（设置页 ``String.prototype.trim``
+    的那一套，刻意不剥 NEL）。分歧在这一处的方向是误报：值一个字节都没改，
+    却弹出「配置已保存，已规范化：主动回复白名单会话」（契约 §7 要求
+    adjusted_fields 只列**实际被调整的**键）。
+
+    变异锚定：把 ``js_trim(item)`` 换回 ``item.strip()``，本用例红。
+    """
+
+    async def scenario(plugin, main):
+        web = sys.modules["astrbot.api.web"]
+        wrapped = "\x85fake:group:123\x85"
+        web.request.payload = {"whitelist_sessions": [wrapped]}
+
+        result = await webapi_module(main)._api_post_config(plugin)
+
+        assert result["ok"] is True, result.get("error")
+        assert "whitelist_sessions" not in result["adjusted_fields"], (
+            f"NEL 包裹的条目未被改写却报已规范化：{result['adjusted_fields']}"
+        )
+        assert wrapped in result["config"]["whitelist_sessions"], "NEL 包裹的条目本该原样保留"
 
     with_plugin(tmp_path, scenario)
 

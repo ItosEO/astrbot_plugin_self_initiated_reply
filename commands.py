@@ -11,7 +11,15 @@ from typing import TYPE_CHECKING, Any
 
 from astrbot.api.event import AstrMessageEvent
 
-from .models import CheckTrigger, SessionState, Settings, fmt_ts, now_ts, today_key
+from .models import (
+    MAX_WHITELIST_SIZE,
+    CheckTrigger,
+    SessionState,
+    Settings,
+    fmt_ts,
+    now_ts,
+    today_key,
+)
 from .plugin_state import append_recent_user_message, apply_enabled_topology, read_session_state
 from .utils import (
     clean_chat_text,
@@ -276,10 +284,15 @@ async def dispatch_command_action(
         if not plugin._can_start_tasks():
             return _lifecycle_reject_text(plugin, "修改白名单")
         added = await plugin._add_whitelist_session(umo)
+        if added:
+            return f"已将当前会话加入主动回复白名单：{umo}"
+        if session_whitelisted(umo, plugin.settings.whitelist):
+            return f"当前会话已在主动回复白名单中：{umo}"
+        # 容量已满：add 拒绝而非静默挤掉一个正常会话，必须把原因说清，
+        # 否则运营者只看到「未加入」而无从判断该做什么。
         return (
-            f"已将当前会话加入主动回复白名单：{umo}"
-            if added
-            else f"当前会话已在主动回复白名单中：{umo}"
+            f"未能加入主动回复白名单：{umo}"
+            f"（已满 {MAX_WHITELIST_SIZE} 条，请先 /selfreply remove 移出不再使用的会话）"
         )
     if action == "remove":
         if not plugin._can_start_tasks():

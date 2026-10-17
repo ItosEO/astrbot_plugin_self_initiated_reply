@@ -794,6 +794,30 @@ test("the master switch readout stays paused while the runtime is off", async ({
   expect(errors).toEqual([]);
 });
 
+test("the master switch readout stays off while the persisted switch is off", async ({ page }) => {
+  // 面板里关掉总开关并保存：持久 enabled=false，而运行态没被 /selfreply off
+  // 翻过（runtime_enabled 仍是 true）。applyConfigPayload 此前只按 runtimeOn
+  // 定 #selfStat 的状态类，漏了 config.enabled——复选框未勾、文字写「关闭」，
+  // 而 .master.is-on 仍命中 stat-dot 脉冲、卡片高亮与强调色，视觉上显示为启用。
+  // app.js 的 change 处理器用的是 on && runtimeOn，两条路径对同一个量给出
+  // 相反的类；加载配置、保存成功、刷新三条路径都走 applyConfigPayload。
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await installBridge(page, { config: { enabled: false, runtime_enabled: true } });
+  const errors = await openPage(page);
+  await expect(page.locator("#selfStat")).toHaveClass(/is-off/);
+  await expect(page.locator("#selfStatus")).toHaveText("关闭");
+
+  // 拨到开（未保存）再拨回：change 处理器与 applyConfigPayload 必须给同一个类
+  await page.locator("label.master-switch").click();
+  await expect(page.locator("#selfStatus")).toHaveText("启用（未保存）");
+  await expect(page.locator("#selfStat")).toHaveClass(/is-on/);
+
+  await page.locator("label.master-switch").click();
+  await expect(page.locator("#selfStatus")).toHaveText("关闭（未保存）");
+  await expect(page.locator("#selfStat")).toHaveClass(/is-off/);
+  expect(errors).toEqual([]);
+});
+
 test("dark theme keyboard focus stays visible on the toggle, the text action and summaries", async ({ page }) => {
   // 深色下三处元素沿用浏览器默认 outline（深色底上对比度约 1.03，等于看不见）。
   await page.setViewportSize({ width: 1440, height: 1000 });

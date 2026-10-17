@@ -1533,6 +1533,19 @@ class _NoConversationRuntime(FakeRuntime):
         raise RuntimeError("无法创建新的对话。")
 
 
+class _SigningConversationRuntime(FakeRuntime):
+    """会话后端连接失败，异常文本带连接串凭证（redis/db 后端的真实形态）。"""
+
+    async def load_session_conversation(self, event, context):
+        raise RuntimeError(f"connect failed for {_SIGNED_STORAGE_URL}")
+
+
+_SIGNED_STORAGE_URL = (
+    "https://img.example.com/group/abc/0/media.jpg"
+    "?rkey=SECRET_RKEY_VALUE&Signature=SECRET_SIGNATURE&token=SECRET_TOKEN"
+)
+
+
 async def test_corrupted_history_logs_warning_and_keeps_replying(
     tmp_path: Path, caplog: object
 ) -> None:
@@ -1611,3 +1624,29 @@ async def test_missing_conversation_stays_debug(tmp_path: Path, caplog: object) 
     assert any("load conversation failed" in r.getMessage() for r in caplog.records), (
         "会话缺失连 debug 线索都没留"
     )
+
+
+async def test_missing_conversation_log_drops_credentials(tmp_path: Path, caplog: object) -> None:
+    """会话取不到的降级 debug 日志同样要脱敏（级别低不是豁免理由）。
+
+    会话后端可能是 redis/db，其异常文本常含带 user:pass 的连接串。同一条
+    「宿主会话后端失败」的降级路径上，adapters 的历史读取分支已走
+    redact_exc_text；generation 这一处此前直打 exc。
+
+    变异锚定：把该处 ``redact_exc_text(exc)`` 换回裸 ``exc``，本用例红。
+    """
+    generation_mod, models, runner, _, _, _ = _make_runner(
+        tmp_path, runtime=_SigningConversationRuntime()
+    )
+    event = FakeEvent()
+    runner._last_events["s1"] = event
+
+    with capture_logs(caplog, generation_mod.logger, logging.DEBUG):
+        result = await runner.generate("s1", _state(models), expected_generation=1, force=True)
+    text, _ledger = result
+
+    assert text == "你好呀"
+    lines = [r.getMessage() for r in caplog.records if "load conversation failed" in r.getMessage()]
+    assert lines, "未捕获会话读取失败日志，用例已失去覆盖对象"
+    for secret in ("SECRET_RKEY_VALUE", "SECRET_SIGNATURE", "SECRET_TOKEN"):
+        assert all(secret not in line for line in lines), f"日志泄漏凭证 {secret}：{lines}"

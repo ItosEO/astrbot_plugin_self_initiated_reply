@@ -169,8 +169,12 @@ def _remove_over_quota_cache_files(
         # 而 prepared_source 已固化，parse 不会重新冻结，该图从此静默消失。
         # 宽限整个冻结预算窗口（MAX_FREEZE_BUDGET_SEC）：mtime 落在
         # [not_before - 预算, not_before] 的文件可能正被在途冻结持有、
-        # 尚未 capture_images，删了同样静默消失。代价至多是一轮清理的配额
-        # 超支一个批次的字节。
+        # 尚未 capture_images，删了同样静默消失。
+        # 代价是**整个宽限窗口内的写入量都不可配额回收**，不是"一个批次"：
+        # 熬过过期阶段的文件要么受保护（仍在索引里）、要么年龄 ≤ 保留窗口，
+        # 因此 vision_image_age_sec ≤ 预算（滑块下限 60 < 120）时配额阶段
+        # 一个都删不了。那种配置下磁盘由保留窗口兜底——文件至多存活
+        # 「保留窗口 + 在途时长」，配额只是冗余的第二道闸，不是硬上限。
         if mtime > not_before - MAX_FREEZE_BUDGET_SEC:
             continue
         try:

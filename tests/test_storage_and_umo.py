@@ -1150,6 +1150,69 @@ def test_load_sessions_non_dict_sessions(tmp_path: Path) -> None:
     assert storage.load_sessions(path, set(), 5) == {}
 
 
+def test_non_dict_sessions_is_backed_up_and_logged(tmp_path: Path, caplog: object) -> None:
+    """sessions 不是对象时同样要备份 + ERROR，不能静默归一成空表。
+
+    缺陷形态：顶层非对象那条路有 ERROR 与 .corrupt-* 备份，而往下一层
+    ``data.get("sessions", {})`` 只在 isinstance 通过时返回、否则裸 ``return {}``
+    ——两条都没有。load_sessions 随后只为白名单会话补空壳，save_storage 发现
+    payload 不匹配就 os.replace 上去，原始内容被覆盖销毁，用户无从查证
+    （契约 §8「不静默丢数据」）。
+
+    变异锚定：把 ``raise json.JSONDecodeError(...)`` 换回 ``return {}``，本用例红。
+    """
+    storage = _storage_module()
+    path = tmp_path / "state.json"
+    raw_sessions = ["not", "an", "object"]
+    path.write_text(
+        json.dumps({"version": storage.STATE_VERSION, "sessions": raw_sessions}),
+        encoding="utf-8",
+    )
+
+    with capture_logs(caplog, storage.logger, logging.ERROR):
+        sessions = storage.load_sessions(path, {"123"}, 5)
+
+    assert sessions == {}
+    backups = sorted(tmp_path.glob("state.json.corrupt-*"))
+    assert len(backups) == 1, "sessions 形状错误未备份：下一次状态落盘会静默覆盖它"
+    assert json.loads(backups[0].read_text(encoding="utf-8"))["sessions"] == raw_sessions
+
+
+def test_non_dict_session_entry_warns_before_skip(tmp_path: Path, caplog: object) -> None:
+    """单个会话条目不是对象：必须记 warning 后跳过（docstring 第 2 条的承诺）。
+
+    缺陷形态：``not isinstance(raw, dict)`` 与「不在白名单」挤在同一个 continue
+    里，而 try/except 那条 warning 只覆盖 dict 之后的解析异常——该条被换成空壳、
+    再由下一次落盘覆盖，运维在日志里看不到任何一行，表现为「某个群的日限额
+    莫名重置」且无痕可查。
+
+    变异锚定：删掉新加的 warning 分支（合回原 continue），本用例红。
+    """
+    storage = _storage_module()
+    path = tmp_path / "state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": storage.STATE_VERSION,
+                "sessions": {"qq:GroupMessage:123": "not-an-object"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with capture_logs(caplog, storage.logger, logging.WARNING):
+        sessions = storage.load_sessions(path, {"123"}, 5)
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("qq:GroupMessage:123" in message for message in warnings), (
+        f"畸形会话条目未记 warning：{warnings}"
+    )
+    # 跳过的痕迹必须可定位：点名 UMO 与形状，运营者才知道去查哪个文件
+    assert any("expected an object" in message for message in warnings), warnings
+    # 跳过即不进入结果：该条不参与加载，随后由白名单补空壳的键是裸群号
+    assert "qq:GroupMessage:123" not in sessions
+
+
 def test_load_sessions_malformed_recent_items(tmp_path: Path) -> None:
     """recent 中非 dict 条目与空文本条目跳过，合法条目保留。"""
     storage = _storage_module()

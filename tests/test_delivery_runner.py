@@ -1197,6 +1197,49 @@ async def test_send_reply_after_send_hook_error_still_delivered(tmp_path: Path) 
     assert outcome.status is models.SendStatus.DELIVERED
 
 
+async def test_send_reply_after_send_hook_error_log_is_redacted(
+    tmp_path: Path, caplog: object
+) -> None:
+    """after-send 钩子失败分支的 warning 必须脱敏，与同函数另一条 except 同口径。
+
+    钩子链上任意第三方插件的处理器抛异常时，异常文本原样进 WARNING。provider
+    类插件的异常串标准形态就是 ``Client error '401' for url '...?rkey=...'``，
+    三个凭证一起落盘。这是整条管线里异常面最宽的一处（不是本插件自己的代码），
+    而同函数下方 send 失败那条早已走 redact_exc_text 并注明"脱敏口径同 decision"。
+
+    变异锚定：把该处 ``redact_exc_text(exc)`` 换回裸 ``exc``，本用例红。
+    """
+    signed_url = (
+        "https://img.example.com/group/abc/0/media.jpg"
+        "?rkey=SECRET_RKEY_VALUE&Signature=SECRET_SIGNATURE&token=SECRET_TOKEN"
+    )
+    secrets = ("SECRET_RKEY_VALUE", "SECRET_SIGNATURE", "SECRET_TOKEN")
+
+    class _SigningHook(FakeHook):
+        """装饰正常、after-send 抛「异常文本含签名 URL」的错。"""
+
+        async def __call__(self, event: object, event_type: object) -> None:
+            self.calls.append((event, event_type))
+            if len(self.calls) > 1:
+                raise RuntimeError(f"Client error '401' for url '{signed_url}'")
+
+    delivery_mod, models, runner, last_events = _make_runner(tmp_path, hook=_SigningHook())
+    last_events["s1"] = FakeEvent()
+    with capture_logs(caplog, delivery_mod.logger, logging.WARNING):
+        outcome = await runner.send_reply("s1", "hello", expected_generation=None)
+
+    # 脱敏不得改变投递结论：钩子失败仍按已送达记账
+    assert outcome.status is models.SendStatus.DELIVERED
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("after-send hook failed" in message for message in warnings), (
+        f"未捕获 after-send 钩子失败日志：{warnings}"
+    )
+    for secret in secrets:
+        assert all(secret not in message for message in warnings), (
+            f"after-send 钩子失败日志泄漏凭证 {secret}：{warnings}"
+        )
+
+
 async def test_send_reply_decorating_hook_error_before_submit(tmp_path: Path) -> None:
     """装饰钩子抛错（发送未开始）→ FAILED_BEFORE_SUBMIT。"""
     _, models, runner, last_events = _make_runner(tmp_path, hook=_BoomHook())

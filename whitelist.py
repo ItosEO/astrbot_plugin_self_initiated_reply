@@ -18,6 +18,7 @@ from astrbot.api import logger
 
 from .models import (
     CONFIG_SPEC_BY_KEY,
+    MAX_WHITELIST_SIZE,
     PLUGIN_ID,
     Settings,
     normalize_string_list,
@@ -196,9 +197,10 @@ class WhitelistManager:
         """把当前会话加入白名单；返回是否为新加入（True）或已存在（False）。
 
         条目规则（长度/字符集/容量）由 ``replace`` 经 ``CONFIG_SPECS`` 统一执行，
-        与磁盘加载同一表达式。若目标 UMO 超出这些规则，它会被静默规范掉而本方法
+        与磁盘加载同一表达式。长度与字符集越界时目标会被静默规范掉而本方法
         仍回报已加入——真实平台的 UMO 远低于 200 字且不含非法字符，不为这条
-        不可达路径改指令回显契约。
+        不可达路径改指令回显契约。容量上限是另一回事：面板或反复 add 都能
+        真实堆到 ``MAX_WHITELIST_SIZE``，故在下方显式拒绝（见该处注释）。
         """
         existed = session_whitelisted(umo, self.settings.whitelist)
         if existed and umo not in self.settings.whitelist:
@@ -217,6 +219,20 @@ class WhitelistManager:
             )
             return False
         old_whitelist = set(self.settings.whitelist)
+        if not existed and len(old_whitelist) >= MAX_WHITELIST_SIZE:
+            # replace 的规范化是 sorted()[:max_items]：满员后再 add，新条目
+            # 字典序最大时被静默切掉（回显却说「已加入」），字典序居中时反过
+            # 来把一个正常会话挤出去——它的日配额/冷却时间戳被清零、代次表项
+            # 被删，表现为「该群主动回复莫名停了」。两种都只留一条不带条目名
+            # 的计数 WARNING。显式拒绝优于静默挤掉一个正常会话。
+            logger.warning(
+                "[%s] whitelist add rejected: capacity reached session=%s total=%d limit=%d",
+                PLUGIN_ID,
+                umo,
+                len(old_whitelist),
+                MAX_WHITELIST_SIZE,
+            )
+            return False
         # 快照必须取在 replace **之前**：replace 会 pop 掉被移出会话的映射。
         runtime_umos = self._snapshot_runtime_umos()
         pruned = self.replace(old_whitelist | {umo})

@@ -47,6 +47,18 @@ _JS_TRIM_CHARS = (
     "\t\n\v\f\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007"
     "\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
 )
+
+
+def js_trim(text: str) -> str:
+    """按设置页 ``String.prototype.trim()`` 的同一字符集去首尾空白。
+
+    条目规范化（``_normalize_list_item``）与 webapi 的「值是否被调整」判定
+    必须共用本函数：后者若用裸 ``str.strip()``，会把 U+0085 等 JS 不剥的
+    字符算成改动，弹出与事实不符的「已规范化」提示。
+    """
+    return text.strip(_JS_TRIM_CHARS)
+
+
 MAX_BOT_ALIASES = 64
 MAX_IGNORED_SENDER_IDS = 1000
 MAX_QUIET_HOURS = 24
@@ -1067,7 +1079,7 @@ def _normalize_list_item(spec: ConfigSpec, raw: Any, mode: str) -> tuple[str | N
         if mode == "api":
             raise ValueError(f"{spec.key} 条目必须是字符串")
         return None, 1, 0
-    text = raw.strip(_JS_TRIM_CHARS)
+    text = js_trim(raw)
     if not text:
         # 空条目一律丢弃：白名单与别名列表都无意义。
         return None, 1, 0

@@ -230,7 +230,14 @@ def _read_state_document(path: Path) -> dict[Any, Any]:
             )
             _backup_state_file(path)
         raw_sessions = data.get("sessions", {})
-        return raw_sessions if isinstance(raw_sessions, dict) else {}
+        if not isinstance(raw_sessions, dict):
+            # 顶层是对象但 sessions 不是对象，同样是被外部改坏的文件：不备份不
+            # 记录的话，load_sessions 把它当空表，而 save_storage 发现 payload
+            # 不匹配就 os.replace 上去，原始内容被静默覆盖、用户无从查证。
+            # 与顶层非对象走同一条备份+ERROR 路径（契约 §8「不静默丢数据」）。
+            # 键缺失时 get 返回 {}，那是合法空状态，不走到这里。
+            raise json.JSONDecodeError("state sessions is not a JSON object", str(path), 0)
+        return raw_sessions
     except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
         logger.error("[%s] failed to load state (backing up): %s", PLUGIN_ID, exc)
         _backup_state_file(path)
@@ -303,7 +310,18 @@ def load_sessions(path: Path, whitelist: set[str], recent_limit: int) -> dict[st
 
     for raw_umo, raw in raw_sessions.items():
         umo = str(raw_umo or "").strip()
-        if not umo or not session_whitelisted(umo, whitelist) or not isinstance(raw, dict):
+        if not umo or not session_whitelisted(umo, whitelist):
+            continue
+        if not isinstance(raw, dict):
+            # docstring 第 2 条承诺「单个会话条目畸形，记 warning 后跳过该条」。
+            # 挤进上面的 continue 会让该条被换成空壳、再由下一次落盘覆盖，
+            # 而运维在日志里看不到任何一行。
+            logger.warning(
+                "[%s] skipped malformed session state %s: entry is %s, expected an object",
+                PLUGIN_ID,
+                umo,
+                type(raw).__name__,
+            )
             continue
         try:
             key = whitelist_storage_key(umo)

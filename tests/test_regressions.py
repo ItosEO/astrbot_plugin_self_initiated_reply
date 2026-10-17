@@ -1176,6 +1176,43 @@ def test_on_command_is_rejected_when_degraded(tmp_path: Path) -> None:
     with_plugin(tmp_path, scenario)
 
 
+def test_add_command_reports_capacity_rejection(tmp_path: Path) -> None:
+    """白名单满员时 add 回显必须说清「未能加入」，不能只说「已加入」或「已在」。
+
+    缺陷形态：``add`` 回报 ``not existed``（截断前算的），容量把新条目切掉后
+    仍回报 True，运营者收到「已将当前会话加入主动回复白名单」而内存与磁盘里
+    都没有——该会话此后每条消息都被静默丢弃，且没有任何线索。两条旧分支
+    （已加入 / 已在）都描述不了这个状态。
+
+    变异锚定：把 commands.py 里新增的第三条分支删掉，本用例红。
+    """
+
+    async def scenario(plugin, main):
+        # 自给自足地取指令面模块：同文件其余用例依赖「前一条用例先加载过
+        # PACKAGE_NAME_R3」的顺序隐式前提，单跑会 KeyError。这里显式加载，
+        # 不复制那个脆弱点。
+        commands = _load_plugin_module("commands")
+        models = sys.modules[f"{PACKAGE_NAME_R3}.models"]
+        event = make_event()
+        # 满员白名单：新会话必然进不去
+        plugin.settings.whitelist = {
+            f"qq:GroupMessage:{i:04d}" for i in range(models.MAX_WHITELIST_SIZE)
+        }
+
+        async def refuse(_umo: str) -> bool:
+            return False
+
+        plugin._add_whitelist_session = refuse
+
+        text = await commands.dispatch_command_action(plugin, event, "add")
+
+        assert "未能加入" in text, f"满员时回显未说明失败：{text}"
+        assert "已加入" not in text.replace("未能加入", ""), f"回显仍谎报成功：{text}"
+        assert str(models.MAX_WHITELIST_SIZE) in text, f"回显未给出上限：{text}"
+
+    with_plugin(tmp_path, scenario)
+
+
 def test_check_command_waits_for_previous_run_release(tmp_path: Path) -> None:
     """在途检查时 ``/selfreply check`` 必须等在途运行让出标记，而不是自拒。
 

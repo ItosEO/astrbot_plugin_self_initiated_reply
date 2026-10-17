@@ -474,12 +474,15 @@ class DeliveryRunner:
                         last_event, self._runtime().event_type.OnAfterMessageSentEvent
                     )
                 except Exception as exc:
+                    # 脱敏口径同下方 send 失败分支：钩子链上任意第三方插件的
+                    # 异常串标准形态就带请求 URL 凭证（rkey/Signature/token），
+                    # 这条路径的异常面比本插件自己的代码更宽。
                     logger.warning(
                         "[%s] after-send hook failed ledger_id=%s session=%s error=%s",
                         PLUGIN_ID,
                         ledger_id,
                         umo,
-                        exc,
+                        redact_exc_text(exc),
                     )
             self._clear_result(last_event)
             return send_result.outcome

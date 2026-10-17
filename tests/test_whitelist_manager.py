@@ -238,6 +238,41 @@ async def test_add_applies_whitelist_spec_bounds(tmp_path: Path) -> None:
     )
 
 
+async def test_add_at_capacity_refuses_instead_of_evicting(tmp_path: Path, caplog: object) -> None:
+    """白名单满员时 add 必须显式拒绝，不能静默丢条目或挤掉一个正常会话。
+
+    缺陷形态：``replace`` 的规范化是 ``sorted()[:max_items]``。满员后再 add，
+    新条目字典序最大时被切掉而 add 仍回报 True——回显说「已将当前会话加入」，
+    内存与磁盘里都没有，该会话此后每条消息都被静默丢弃；字典序居中时反过来把
+    一个正常会话挤出去，它的日配额/冷却时间戳被清零、代次表项被删，表现为
+    「该群主动回复莫名停了」。两种都只留一条不带条目名的计数 WARNING。
+
+    变异锚定：删掉 ``add`` 里的容量守卫，本用例红。
+    """
+    _, _, models = _load_modules()
+    full = {f"qq:GroupMessage:{i:04d}" for i in range(models.MAX_WHITELIST_SIZE)}
+    whitelist_mod = _whitelist_module()
+    # 字典序最大（截断时整体丢弃）与居中（截断时挤掉别人）两种排序位置
+    for newcomer in ("qq:GroupMessage:zzzz", "qq:GroupMessage:0500x"):
+        ctx = FakeCtx(models, whitelist=set(full))
+        manager = ctx.make_manager()
+
+        with capture_logs(caplog, whitelist_mod.logger, logging.WARNING):
+            added = await manager.add(newcomer)
+
+        assert added is False, f"{newcomer} 未加入却回报已加入"
+        assert newcomer not in ctx.settings.whitelist
+        # 关键：不得挤掉任何既有会话（含字典序最大的那条）
+        assert ctx.settings.whitelist == full, "满员 add 挤掉了既有会话"
+        assert not ctx.pruned and not ctx.invalidated, "拒绝路径销毁了会话状态"
+        # 内存没变，磁盘也不该动
+        assert ctx.persistence.sync_calls == 0
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("capacity reached" in message for message in warnings), (
+            f"容量拒绝未留痕：{warnings}"
+        )
+
+
 async def test_add_existing_returns_false(tmp_path: Path) -> None:
     _, _, models = _load_modules()
     umo = _umo_with_group()
