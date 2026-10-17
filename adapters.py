@@ -112,14 +112,23 @@ class AstrBotBridge:
     def _method_call_options(func: Any, umo: str) -> list[tuple[tuple[Any, ...], dict[str, Any]]]:
         signature = AstrBotBridge._signature_or_none(func)
         if signature is None:
+            # 取不到签名时无法预检，``first_bindable_args`` 直接取首个候选，
+            # 因此后两个候选在本分支不可达。保留它们只为与其余分支同形：
+            # 调用点读到的是同一份「先名字、再位置、最后空调用」的优先级。
             return [((), {"umo": umo}), ((umo,), {}), ((), {})]
         params = signature.parameters
         keyword_names = AstrBotBridge._keyword_names(func)
         if keyword_names is None:
-            return [((), {"umo": umo}), ((), {})]
+            # 有 **kwargs：名字候选绑得上（会被吞进 kwargs），位置候选同样保留，
+            # 否则 ``def f(umo, /, **kw)`` 这类形态只会走到空调用——
+            # 宿主方法被无参调用，比静默降级更糟。
+            return [((), {"umo": umo}), ((umo,), {}), ((), {})]
         for name in ("umo", "session_id", "unified_msg_origin"):
             if name in params:
-                return [((), {name: umo}), ((), {})]
+                # 位置候选必须在关键字候选之后：形如 ``def f(umo, /)`` 的宿主
+                # 方法无法用关键字绑定，只给关键字候选会让 first_bindable_args
+                # 返回 None，调用方静默降级而不是 fail loud。
+                return [((), {name: umo}), ((umo,), {}), ((), {})]
         positional = [
             param
             for param in params.values()

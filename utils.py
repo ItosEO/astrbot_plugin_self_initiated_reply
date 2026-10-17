@@ -66,6 +66,28 @@ _UMO_PARTS = 3
 # 只认这一种形态（实证泄漏全部来自它），不做全文 secret 扫描。
 _EXCEPTION_URL_PATTERN = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s'\"<>)\]]+")
 
+# 同上的**相对路径**形态：urllib3 的 MaxRetryError 把请求 URL 拆成
+# "... Max retries exceeded with url: /v1/chat?api_key=sk-...&x=1 (Caused by ...)"，
+# 没有 scheme://，上面的模式匹配不到，而它照样把 query 凭证带进 reason 并经
+# GET /status 出网。只认「以 / 开头且带 query」的片段，且前一个字符不能是
+# 单词字符或斜杠——否则会切进绝对 URL 的 path 部分重复脱敏，也会误伤
+# ``https://`` 的那两个斜杠。
+_EXCEPTION_RELATIVE_URL_PATTERN = re.compile(r"(?<![\w/])/[^\s'\"<>()\[\]]*\?[^\s'\"<>()\[\]]+")
+
+
+def _redact_relative_url(text: str) -> str:
+    """相对路径 URL：保留路径，query 与 fragment 一律抹掉。
+
+    与 ``redact_url`` 分开是因为后者要求 scheme+netloc，路径形态会被它原样
+    放行（只截断），凭证因此漏出去。
+    """
+    cut = len(text)
+    for mark in ("?", "#"):
+        index = text.find(mark)
+        if index != -1:
+            cut = min(cut, index)
+    return text[:cut] + _REDACTED_QUERY_MARK
+
 
 def safe_exc_text(exc: BaseException) -> str:
     """异常文本提取的单点收口：``__str__`` 本身抛异常时退化为类型名。
@@ -106,8 +128,13 @@ def redact_exc_text(exc: BaseException) -> str:
     provider SDK 的异常串常把请求 URL 整段带出来（含 api_key/Signature 等
     query 凭证）。这些文本既进日志，也进 ``reason`` 经 GET /status 出网，
     故统一在此收口。非 URL 片段原样保留，便于排查。
+
+    两种 URL 形态都要收：绝对 URL（scheme://）与相对路径（urllib3
+    ``MaxRetryError`` 的 ``url: /path?key=...``）。漏掉后者时凭证照样经
+    reason 出网，而它恰恰是 httpx/requests/urllib3 连接失败的标准文本。
     """
-    return _EXCEPTION_URL_PATTERN.sub(lambda m: redact_url(m.group(0)), safe_exc_text(exc))
+    text = _EXCEPTION_URL_PATTERN.sub(lambda m: redact_url(m.group(0)), safe_exc_text(exc))
+    return _EXCEPTION_RELATIVE_URL_PATTERN.sub(lambda m: _redact_relative_url(m.group(0)), text)
 
 
 async def maybe_await(value: Any) -> Any:

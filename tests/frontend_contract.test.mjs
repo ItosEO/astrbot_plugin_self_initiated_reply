@@ -25,7 +25,7 @@ import {
 import {
   providerNeedsManualInput,
 } from "../pages/主动回复设置/providers.mjs";
-import { THEME_KEY } from "../pages/主动回复设置/theme.mjs";
+import { persistTheme, THEME_KEY } from "../pages/主动回复设置/theme.mjs";
 import { configPayload } from "./fixtures/config-payload.mjs";
 // 表单控件工厂：四个 helper 被多个用例复用，提到模块作用域只留一份实现。
 // 新增配置键时只改各用例的 fields 数组，不必再同步四份 helper 副本。
@@ -1438,8 +1438,18 @@ test("whitelist format collapses a group UMO onto its bare group id", () => {
   ]);
   assert.equal(
     summarizeWhitelist(raw),
-    "已识别 4 个有效会话（3 个纯群号，1 个完整 UMO） · 存在 1 处重复",
+    "已识别 4 条（3 个纯群号，1 个完整 UMO） · 存在 1 处重复",
   );
+});
+
+test("summarizeWhitelist does not call unvalidated entries valid", () => {
+  // 计数不校验字符集/长度：保存时会被后端拦下的非法条目一样被计入。
+  // 文案说「已识别」不说「有效」——后者会让运营者以为这些会话真的生效了。
+  assert.ok(
+    summarizeWhitelist('bad"quote').startsWith("已识别 1 条"),
+    `摘要把非法条目说成了有效会话：${summarizeWhitelist('bad"quote')}`,
+  );
+  assert.ok(!summarizeWhitelist('bad"quote').includes("有效"));
 });
 
 test("validateWhitelistLines splits on commas like the save path", () => {
@@ -1486,6 +1496,55 @@ test("prompt preview keeps unknown variables verbatim", () => {
   const out = renderPromptTemplateHtml("hi {foo} {latest_message}");
   assert.ok(out.includes("{foo}"));
   assert.ok(!out.includes("undefined"));
+});
+
+test("a non-callable ready makes getBridge return null instead of throwing", async () => {
+  // 判据必须是「可调用」：ready 为 "yes" / 1 / {} 时真值检查照样放行，下一行的
+  // .ready() 抛裸 TypeError，被 normalizeApiError 原样当作用户可见的 toast 弹出，
+  // 文档承诺的 fetch 兜底根本不会触发（CHANGELOG 说的就是「可调用」）。
+  // app.js 是带顶层副作用的页面入口（import 即跑 loadAll 与看门狗），不能整体
+  // 导入，故按源码取出该函数本体执行，只替换 window.AstrBotPluginPage 这一个输入。
+  const app = await readFile(join(pageDir, "app.js"), "utf8");
+  const source = app.match(/async function getBridge\(\) \{[\s\S]*?\n\}/);
+  assert.ok(source, "app.js 中未找到 getBridge");
+  // ``let bridgeReady`` 在工厂作用域里补上：取出的函数本体引用模块级缓存，
+  // 直接 eval 会因读未声明变量抛 ReferenceError。每次现造一份缓存，
+  // 免得第二个 ready 复用第一个的握手结论。
+  const makeGetBridge = () =>
+    new Function(`let bridgeReady; return (${source[0]});`)();
+  const originalWindow = globalThis.window;
+  try {
+    globalThis.window = {};
+    for (const ready of ["yes", 1, {}]) {
+      window.AstrBotPluginPage = { ready };
+      const getBridge = makeGetBridge();
+      assert.equal(
+        await getBridge(),
+        null,
+        `ready=${JSON.stringify(ready)} 时 getBridge 仍宣称 bridge 可用，fetch 兜底不会触发`,
+      );
+    }
+    // 反向锚：真正可调用的 ready 必须放行，否则这条会被「永不返回 bridge」满足。
+    window.AstrBotPluginPage = { ready: async () => true };
+    assert.equal(await makeGetBridge()(), window.AstrBotPluginPage);
+  } finally {
+    globalThis.window = originalWindow;
+  }
+});
+
+test("persistTheme reports a failed write instead of swallowing it", async () => {
+  // 本地缓存写在 POST 之前，失败在当期不可见；真正的代价是
+  // 下一次加载 restoreTheme 把服务器旧值覆盖回去，选择静默回退。
+  const seen = [];
+  await persistTheme("dark", async () => {
+    throw new Error("disk full");
+  }, (msg) => seen.push(msg));
+  assert.equal(seen.length, 1, "persistTheme 吐了持久化失败，运营者不会知道选择会回退");
+  assert.ok(seen[0].includes("回退"));
+  // 成功时不得弹反馈
+  const quiet = [];
+  await persistTheme("dark", async () => ({ ok: true }), (msg) => quiet.push(msg));
+  assert.deepEqual(quiet, []);
 });
 
 test("a failed POST leaves the page requiring a refresh before the next save", async () => {
@@ -1586,6 +1645,131 @@ test("a STALE_WRITE response adopts the server revision and requires a refresh",
 
   await io.saveConfig({ preventDefault() {} });
   assert.equal(posts, 1, "STALE_WRITE 后不得在刷新前再次提交");
+});
+
+test("a STALE_WRITE response tells the operator to refresh", async () => {
+  // 四个保存入口在 requiresConfigRefresh 期间全部禁用。只显示「保存失败」
+  // 时运营者看到的是点不动的按钮，不知道原因是配置已变、也不知道该刷新。
+  const classList = { add() {}, remove() {}, toggle() {} };
+  const fields = [
+    { dataset: { configKey: "enabled" }, type: "checkbox", checked: true },
+  ];
+  const form = {
+    classList,
+    inert: false,
+    querySelector: () => null,
+    querySelectorAll: () => fields,
+  };
+  const elements = {
+    configForm: form,
+    configSaveState: { textContent: "", classList },
+  };
+  const state = {
+    configLoaded: true,
+    savingConfig: false,
+    configRevision: TEST_REVISION,
+    isDirty: false,
+    requiresConfigRefresh: false,
+  };
+  const toasts = [];
+  const io = makeConfigIo({
+    elements,
+    state,
+    apiPost: async () => ({
+      ok: false,
+      error: "配置已被其他请求修改",
+      error_code: "STALE_WRITE",
+      config_revision: `sha256:${"b".repeat(64)}`,
+    }),
+    showToast: (message) => toasts.push(message),
+  });
+
+  await io.saveConfig({ preventDefault() {} });
+
+  assert.ok(
+    toasts.some((message) => message.includes("刷新")),
+    `STALE_WRITE 未提示刷新：${toasts}`,
+  );
+  assert.equal(elements.configSaveState.textContent, "保存状态未知");
+});
+
+test("persistTheme reports a rejected write, not just a transport failure", async () => {
+  // 后端拒绝走 HTTP 200 + {ok:false}（插件正在关闭 / 主题写入失败），而
+  // apiPost 只对非 2xx 抛异常。只 try/catch 会把"服务端明确拒绝"当成成功，
+  // 与 transport 失败同一副后果：下次加载 restoreTheme 静默覆盖回旧值。
+  const seen = [];
+  await persistTheme("dark", async () => ({ ok: false, error: "插件正在关闭" }), (msg) =>
+    seen.push(msg),
+  );
+  assert.equal(seen.length, 1, `ok:false 被当成成功：${seen}`);
+  assert.ok(seen[0].includes("回退"));
+});
+
+test("adjusted field labels never surface the internal config key", async () => {
+  // 判断提示词的 textarea 裹在 <label class="prompt-editor"> 里（label 包控件、
+  // 没有 for=），前两个 closest / label[for] 分支都取不到它。回退会把 schema 键
+  // "decision_prompt_template" 直接显示给运营者；清空该输入框即触发后端
+  // reset_default 归一化，这条路径可达。标签经保存成功的 toast 呈现。
+  const classList = { add() {}, remove() {}, toggle() {} };
+  const promptEditor = {
+    querySelector: (selector) =>
+      selector === ".field-label" ? { textContent: "判断提示词" } : null,
+  };
+  const promptInput = {
+    dataset: { configKey: "decision_prompt_template" },
+    value: "",
+    id: "decisionPromptInput",
+    closest: (selector) => {
+      if (selector === ".field, .provider-field, .toggle-row, .master-switch") return null;
+      if (selector === "label") return promptEditor;
+      return null;
+    },
+  };
+  const form = {
+    classList,
+    inert: false,
+    querySelector: () => null,
+    querySelectorAll: () => [promptInput],
+  };
+  const elements = {
+    configForm: form,
+    configSaveState: { textContent: "", classList },
+  };
+  const state = {
+    configLoaded: true,
+    savingConfig: false,
+    configRevision: TEST_REVISION,
+    isDirty: false,
+    requiresConfigRefresh: false,
+  };
+  const toasts = [];
+  const io = makeConfigIo({
+    elements,
+    state,
+    apiPost: async () => ({
+      ok: true,
+      config: {
+        ok: true,
+        enabled: true,
+        whitelist_sessions: [],
+        config_revision: TEST_REVISION,
+        decision_prompt_template: "",
+      },
+      config_revision: TEST_REVISION,
+      adjusted_fields: ["decision_prompt_template"],
+    }),
+    showToast: (message) => toasts.push(message),
+  });
+
+  await io.saveConfig({ preventDefault() {} });
+
+  const normalized = toasts.find((message) => message.includes("已规范化"));
+  assert.ok(normalized, `未出现规范化提示：${toasts}`);
+  assert.ok(normalized.includes("判断提示词"), `未取到字段标签：${normalized}`);
+  assert.ok(
+    !normalized.includes("decision_prompt_template"),
+    `内部 schema 键泄漏给运营者：${normalized}`,
+  );
 });
 
 test("save is rejected while the initial config load has not completed", async () => {

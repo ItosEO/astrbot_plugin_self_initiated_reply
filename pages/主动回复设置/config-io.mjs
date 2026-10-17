@@ -174,20 +174,36 @@ export function createConfigIo(deps) {
 		// 计数取**去重后**的长度：这个读数的标签是「生效会话」，而后端把裸群号与
 		// 其群 UMO 视为同一会话（utils.session_whitelisted）。用未去重的 parsed.length
 		// 时，`12347` + `qq:GroupMessage:12347` 会让顶栏读 2 而下方的摘要读
-		// 「已识别 1 个有效会话」两条都是 aria-live="polite"，读屏连续播报
-		// 两个互相抵消的数字。
+		// 「已识别 1 条」，两个数字互相矛盾。
+		// 注意读数本身不校验合法性：`bad"quote` 这种保存时会被后端拦下的条目也会
+		// 被计入。摘要文案因此说「已识别 N 条」而不是「有效」——顶栏那个
+		// 「生效会话 N」在有条目非法时同样偏乐观，保存被拦下时以字段报错为准。
 		const unique = uniqueWhitelistItems(text, parsed);
-		if (e.whitelistCount) e.whitelistCount.textContent = String(unique.length);
-		if (e.whitelistSummary)
-			e.whitelistSummary.textContent = summarizeWhitelist(text, parsed);
+		// 摘要与计数都在 input 事件上写，而 #whitelistSummary 是
+		// aria-live="polite"：textContent 赋值恒会替换文本节点，同一句话每敲一键
+		// 就被重新排进播报队列，读屏用户粘一段 20 条的名单会听到整句被反复打断。
+		// aria-describedby 已在聚焦时给出这两句，逐字相同就不再写。
+		if (e.whitelistCount && e.whitelistCount.textContent !== String(unique.length))
+			e.whitelistCount.textContent = String(unique.length);
+		const summary = summarizeWhitelist(text, parsed);
+		if (e.whitelistSummary && e.whitelistSummary.textContent !== summary)
+			e.whitelistSummary.textContent = summary;
 	}
 	function formatWhitelist() {
 		const e = getEls();
 		if (!e.whitelistInput) return;
-		const unique = uniqueWhitelistItems(e.whitelistInput.value);
-		e.whitelistInput.value = unique.join("\n");
+		const before = e.whitelistInput.value;
+		const unique = uniqueWhitelistItems(before);
+		const after = unique.join("\n");
+		e.whitelistInput.value = after;
 		updateWhitelistFeedback();
-		setDirty(true);
+		// 仅在内容真变了时才置脏。已干净、已去重的列表点一下会写出逐字节相同的文本，
+		// 无条件置脏会让四个入口的「未保存」角标与 beforeunload 守卫凭空出现，
+		// 运营者被推着做一次没有意义的保存。比的是 parseWhitelist 之后的数组：
+		// 只改空行/首尾空白的名单语义完全等价（parseWhitelist 本来就切分并 trim），
+		// 却会让 beforeunload 守卫拦住一次没有改动的离开。
+		if (parseWhitelist(after).join("\n") !== parseWhitelist(before).join("\n"))
+			setDirty(true);
 		validateWhitelist();
 		showToast(
 			unique.length ? `已整理并保留 ${unique.length} 个会话` : "白名单已清空",
@@ -303,12 +319,14 @@ export function createConfigIo(deps) {
 		// 只有 GET /config 携带 decision_prompt_default（面板视图键）；POST 返回的
 		// config 是持久配置，不含它。此处若用 decision_prompt_template 兜底，会把用户
 		// 刚提交的值写成"默认"，「恢复默认提示词」随之变成空操作。
-		if (config.decision_prompt_default) {
+		if (config.decision_prompt_default && e.decisionPromptInput) {
 			e.decisionPromptInput.dataset.defaultPrompt = config.decision_prompt_default;
 		}
-		const whitelist = parseWhitelist(e.whitelistInput.value);
-		e.whitelistInput.value = whitelist.join("\n");
-		updateWhitelistFeedback();
+		if (e.whitelistInput) {
+			const whitelist = parseWhitelist(e.whitelistInput.value);
+			e.whitelistInput.value = whitelist.join("\n");
+			updateWhitelistFeedback();
+		}
 		if (e.decisionModelStatus) {
 			const decisionOn = config.decision_model_enabled !== false;
 			e.decisionModelStatus.textContent = fmtBool(decisionOn);
@@ -316,11 +334,13 @@ export function createConfigIo(deps) {
 		}
 		renderPromptPreview();
 		const runtimeOn = config.runtime_enabled !== false;
-		e.selfStatus.textContent = config.enabled
-			? runtimeOn
-				? "启用"
-				: "已暂停（/off）"
-			: "关闭";
+		if (e.selfStatus) {
+			e.selfStatus.textContent = config.enabled
+				? runtimeOn
+					? "启用"
+					: "已暂停（/off）"
+				: "关闭";
+		}
 		setStatState(e.selfStat, runtimeOn ? "is-on" : "is-off");
 		setState({
 			configLoaded: true,
@@ -367,9 +387,14 @@ export function createConfigIo(deps) {
 			const control = configControls(form).find(
 				(item) => item.dataset.configKey === key,
 			);
+			// 容器选择器之后再兜一层 label：判断提示词的 textarea 裹在
+			// `<label class="prompt-editor">` 里（label 包控件、没有 for=），
+			// 前两个分支都取不到它，回退会把内部 schema 键
+			// "decision_prompt_template" 直接显示给运营者。清空该输入框即触发
+			// 后端 reset_default 归一化，这条路径是可达的。
 			const container = control?.closest(
 				".field, .provider-field, .toggle-row, .master-switch",
-			);
+			) || control?.closest("label");
 			const label = container?.querySelector(".field-label") ||
 				(control?.id
 					? [...document.querySelectorAll("label[for]")].find(
@@ -447,10 +472,20 @@ export function createConfigIo(deps) {
 			if (!result || result.ok !== true) {
 				const errorText = result?.error || "保存失败";
 				if (result?.error_code === "STALE_WRITE") {
+					// stale 之后必须刷新才能再提交（契约 §7 / DECISIONS 的
+					// 「设置页配置写入与请求协调」）。新 revision 先收着：
+					// requiresConfigRefresh 已挡住一切提交，它只在刷新成功后
+					// 经 applyConfigPayload 被整体替换，但服务端给了就记下，
+					// 免得将来放松前置守卫时这里又悄悄用回旧值。
 					setState({
 						configRevision: result.config_revision || state.configRevision,
 						requiresConfigRefresh: true,
 					});
+					// 与 markSaveUnknown 同一句话术：四个保存入口全被禁用时，
+					// 用户需要知道"为什么点不动"和"该做什么"。
+					setSaveState("保存状态未知", "error");
+					showToast(`${errorText}，请刷新配置后重试`, true);
+					return;
 				}
 				setSaveState("保存失败", "error");
 				const errorKey = configSaveKeys(e.configForm).find((key) =>

@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .models import AttemptLedger, SendOutcome, SendStatus, SuppressCode
-from .utils import safe_exc_text
+from .utils import redact_exc_text
 
 
 @dataclass(frozen=True)
@@ -116,9 +116,19 @@ class OutboundGateway:
             if inspect.isawaitable(raw_result):
                 raw_result = await raw_result
         except asyncio.CancelledError:
+            # 与下方 except Exception 同样分类为 UNKNOWN：提交状态未知，不得
+            # 自动重试（契约 §2）。**故意不重抛取消**——调用方分两类：
+            #   - final_reply：``delivery._send_via_context`` 依赖它正常返回，
+            #     以便走完 UNKNOWN 记账（消耗冷却与配额，防止重复直发）；
+            #   - tool_direct：``generation`` 的 tracked_send 在 agent run 内
+            #     调用，吞掉取消后该 run 只能靠 ``_graceful_stop`` 的第二次
+            #     cancel() + 宽限窗口 + 隔离登记兜底收敛。
+            # 两条路径都不希望在这里把取消变成异常上抛，故统一只分类不重抛。
             outcome = SendOutcome(SendStatus.UNKNOWN, "sender cancelled after start")
         except Exception as exc:
-            outcome = SendOutcome(SendStatus.UNKNOWN, safe_exc_text(exc))
+            # adapter 异常串常带带凭证的请求 URL（provider 与平台适配器都有），
+            # 与其余异常路径同一脱敏口径；safe_exc_text 只防 __str__ 再抛，不脱敏。
+            outcome = SendOutcome(SendStatus.UNKNOWN, redact_exc_text(exc))
         else:
             if raw_result is False:
                 outcome = SendOutcome(

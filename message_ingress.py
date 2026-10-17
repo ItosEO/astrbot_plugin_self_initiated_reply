@@ -18,6 +18,7 @@ from .utils import (
     event_umo,
     is_explicit_direct_call,
     is_self_message,
+    redact_exc_text,
     session_group_id,
     session_is_private,
     session_whitelisted,
@@ -179,6 +180,13 @@ async def handle_incoming_message(
                 active_at=active_at,
             )
         except Exception as exc:
-            logger.warning("[%s] image capture failed session=%s: %s", PLUGIN_ID, umo, exc)
+            # 脱敏后进日志：recorder 桥与 provider SDK 的异常文本常带请求 URL
+            # （含签名 token），而日志是 §7.1 要求留在服务端的那一面。
+            logger.warning(
+                "[%s] image capture failed session=%s error=%s",
+                PLUGIN_ID,
+                umo,
+                redact_exc_text(exc),
+            )
     plugin._scheduler.cleanup_events_if_needed()
     _schedule_message_check(plugin, umo, generation)

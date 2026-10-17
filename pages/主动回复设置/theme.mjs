@@ -44,7 +44,7 @@ export function applyTheme(theme, themeToggle) {
   const label = themeToggle.querySelector(".theme-label");
   if (label) label.textContent = THEME_LABELS[theme] || THEME_LABELS.auto;
 }
-export async function persistTheme(theme, apiPost) {
+export async function persistTheme(theme, apiPost, onPersistFailure) {
   // 三个字段各自只在「用户真的动过它」时才提交：后端对未提交的键保持原值，
   // 而渲染态在 GET ui/theme 返回前是本地默认（theme 恒为 "auto"、
   // dim/bold 恒为 false），把它一并提交会把服务端已存的选择静默改掉。
@@ -59,9 +59,27 @@ export async function persistTheme(theme, apiPost) {
   }
   if (Object.keys(body).length === 0) return;
   try {
-    await apiPost("ui/theme", body);
-  } catch {
-    /* 后端持久化失败仅当次生效 */
+    // 后端拒绝走的是 HTTP 200 + {ok:false}（插件正在关闭 / 主题写入失败 /
+    // 请求体不是合法 JSON，见 webapi._api_post_ui_theme），而 apiPost 只对
+    // 非 2xx 抛异常。只 try/catch 会把「服务端明确拒绝」当成成功——
+    // 与 transport 失败同一副用户可见后果（下次加载静默回退），必须一起反馈。
+    const result = await apiPost("ui/theme", body);
+    if (result && result.ok === false) {
+      throw new Error(result.error || "主题偏好写入失败");
+    }
+  } catch (err) {
+    // 不能吐：cacheThemeLocally 已把选择写进本地缓存，本次会话看起来完全成功。
+    // 真正的代价在下一次加载：restoreTheme 会把服务器上的旧值覆盖回去，
+    // 运营者的选择静默回退且没有任何解释。故此处必须给出可见反馈。
+    // onPersistFailure 由调用方注入（app.js / chrome.mjs 均传 showToast）；
+    // 不给默认值是为了让新调用方明确选择怎么告诉用户，
+    // 而不是默默恢复成“什么都不说”。
+    if (typeof onPersistFailure === "function") {
+      onPersistFailure(
+        "主题偏好保存失败，将在下次启动时回退",
+        err,
+      );
+    }
   }
 }
 export async function restoreTheme(apiGet) {

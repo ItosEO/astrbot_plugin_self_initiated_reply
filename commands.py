@@ -6,6 +6,7 @@ check/on/off 等有副作用分支，经 plugin 回调访问状态（测试可�
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Any
 
 from astrbot.api.event import AstrMessageEvent
@@ -63,7 +64,9 @@ def parse_command_text(text: str) -> tuple[str, str] | None:
     lowered = raw.lower()
     if lowered == "selfreply":
         return "help", ""
-    if not lowered.startswith("selfreply "):
+    # 分隔符取任意空白：只认 ASCII 空格时 `/selfreply\tadd` 会被判成"不是指令"，
+    # 而宿主装饰器路径的 tokenizer 仍会匹配它，两条出口给出相反答案。
+    if not re.match(r"selfreply\s", lowered):
         return None
     body = raw[len("selfreply") :].strip()
     parts = body.split(maxsplit=1)
@@ -144,6 +147,7 @@ def status_text(
     runtime_enabled: bool,
     lifecycle: str,
     last_decision: dict[str, Any] | None,
+    effective_message_delay_sec: int,
 ) -> str:
     """渲染 /selfreply status 文本。
 
@@ -172,8 +176,14 @@ def status_text(
             f"Provider: {settings.judge_provider_id or '当前会话模型'}",
             f"判断提示词: {'自定义' if settings.decision_prompt_custom else '默认'}",
             f"最少上下文消息数: {settings.decision_history_min_messages} 条",
-            f"消息后触发: {settings.enabled_message_trigger}，延迟 {settings.message_delay_sec}s，"
-            f"最小静默 {settings.min_silence_sec}s",
+            # 延迟显示**生效值**而不是配置值：调度器实际用的是
+            # max(message_delay_sec, min_silence_sec)，两者不一致时打配置值
+            # 会让用户以为调低了延迟却毫无变化（默认 60/45 恰好相等，所以这个
+            # 偏差在出厂配置下看不见）。生效值由 scheduler 单一表达式给出。
+            f"消息后触发: {settings.enabled_message_trigger}，"
+            f"延迟 {effective_message_delay_sec}s"
+            f"（配置 {settings.message_delay_sec}s，最小静默 "
+            f"{settings.min_silence_sec}s）",
             f"后台巡检: {settings.enabled_patrol_trigger}",
             "直接 @Bot: 始终交给 AstrBot 主回复链，主动回复不抢答",
             f"忽略发送者: {', '.join(sorted(settings.ignored_sender_ids)) or '-'}",
@@ -251,6 +261,9 @@ async def dispatch_command_action(
             plugin.runtime_enabled,
             plugin.lifecycle_state,
             plugin._last_decisions.get(umo) if umo else None,
+            # 生效延迟由调度器的单一表达式给出，不在此处重算 max(...)：
+            # 两处各写一遍就会出现"面板显示与实际等待不一致"。
+            plugin._scheduler.message_trigger_delay(),
         )
     if action == "list":
         return list_text(plugin.settings)
@@ -273,10 +286,12 @@ async def dispatch_command_action(
     if action == "check":
         if not plugin._can_start_tasks():
             return _lifecycle_reject_text(plugin, "手动检查")
-        generation = plugin._coordinator.invalidate(umo)
-        # 旧检查被 force-cancel 后不会立即让出运行标记（取消是异步投递的），
-        # 直接进 pipeline 会撞上「已有判断任务在运行」净效果是旧检查被静默
-        # 掐掉、新的也没执行，用户必须重发一次。故有界等待其释放。
+        # 必须 force_cancel：在途检查若不取消，它只在自己的代次闸门处退出，
+        # 而下面 2s 的释放等待等不到它，本次手动检查会撞「已有判断任务在运行」。
+        generation = plugin._coordinator.invalidate(umo, force_cancel=True)
+        # 取消是异步投递的，旧任务要到下一个 await 点才 unmark_running，直接进
+        # pipeline 会撞上「已有判断任务在运行」净效果是旧检查被静默掐掉、新的
+        # 也没执行，用户必须重发一次。故有界等待其释放。
         await _await_previous_check_release(plugin, umo)
         plugin._coordinator.record_event(umo, event, now_ts())
         text = clean_chat_text(arg or strip_command_prefix(event_text(event)))
@@ -312,6 +327,10 @@ async def dispatch_command_action(
             await apply_enabled_topology(plugin, enabled=True)
         return "主动回复插件已启用（重启后保持）。"
     if action == "off":
+        # 与 on 对等的生命周期守卫：DEGRADED 是永久降级、_stopping 期间宿主正要
+        # 卸载，两者都不该再接受一次整份配置写盘（那会用本实例的快照覆盖新实例）。
+        if not plugin._can_start_tasks():
+            return _lifecycle_reject_text(plugin, "暂停")
         async with plugin._config_lock:
             await plugin._persist_enabled(False)
             await apply_enabled_topology(plugin, enabled=False)

@@ -13,6 +13,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import importlib
+import ipaddress
 import json
 import logging
 import re
@@ -177,6 +178,50 @@ def test_resolver_rejects_valid_image_outside_trusted_root(tmp_path: Path) -> No
     resolved = asyncio.run(parser._resolve_image_url(image.ImageInfo(file_path=str(outside))))
 
     assert resolved is None
+
+
+# ============================================================================
+# 图片下载的公网地址判据：组播 / NAT64 / 保留段不得穿过"公网"闸门
+# ============================================================================
+
+
+def _load_parser_module():
+    """取 ``image.parser`` 模块（façade 刻意不导出传输层私有名）。"""
+    _load_r3_modules()
+    return load_package(PACKAGE_NAME_R3, "image.parser")
+
+
+def test_public_address_gate_rejects_multicast_nat64_and_reserved_ranges() -> None:
+    """``is_global`` 不是完整的公网判据：组播、NAT64 知名前缀与保留段都标着 global。
+
+    ``ipaddress`` 把 224.0.0.0/4、ff00::/8 和 64:ff9b::/96 内的地址判为
+    ``is_global``。主机真把 NAT64 前缀路由给翻译器时，``64:ff9b::7f00:1`` 就是
+    可达的环回——正是"看起来公网、实际打到内网服务"的那个地址。判据单点收口在
+    ``_is_safe_public_address``，解析、预检与传输层三处共用；此处钉住判据本身，
+    并顺带钉住 ``_global_addresses`` 对这些字面量返回空表。
+    """
+    parser = _load_parser_module()
+
+    rejected = [
+        "224.0.0.1",  # 组播：本机与子网内的服务可达
+        "239.255.255.255",
+        "ff02::1",
+        "64:ff9b::127.0.0.1",  # NAT64 知名前缀内的环回
+        "::ffff:127.0.0.1",  # IPv4 映射环回
+        "0.0.0.0",  # 未指定地址：请求本机全部接口
+        "100.64.0.1",  # CGNAT 共享段：落在运营商内网
+    ]
+    for literal in rejected:
+        address = ipaddress.ip_address(literal)
+        assert parser._is_safe_public_address(address) is False, (
+            f"{literal} 被判为可用的公网地址，SSRF 面被放宽"
+        )
+        assert parser._global_addresses(literal) == [], f"{literal} 通过了公网地址闸门"
+
+    # 反向锚：正常公网地址仍须放行，收紧不得变成"恒拒绝"
+    public = ipaddress.ip_address("93.184.216.34")
+    assert parser._is_safe_public_address(public) is True
+    assert parser._global_addresses("93.184.216.34") == ["93.184.216.34"]
 
 
 # ============================================================================
@@ -511,8 +556,8 @@ def test_tool_marker_in_multiline_text() -> None:
 
     result = utils.clean_reply(text, allow_multiline=True, max_chars=200)
 
-    # 预期：只过滤开头的工具标记，不影响后续内容
-    # 当前实现只检查开头，所以这应该保留后续文本
+    # 标记落在中间行：断言只覆盖"标记本身被清掉"，不覆盖后续文本是否保留
+    # （那是另一条路径的契约，本用例的独特价值在于标记不在开头）。
     assert "[tool call]" not in result, "工具标记未被清理"
 
 
@@ -675,6 +720,22 @@ def test_command_aliases_single_source() -> None:
         if names != decorators[action]
     ]
     assert not problems, "命令别名两侧不等价：\n" + "\n".join(problems)
+
+
+def test_command_prefix_separator_accepts_any_whitespace() -> None:
+    """``selfreply`` 与动作之间的分隔符取任意空白，不只 ASCII 空格。
+
+    缺陷形态：前缀判定只认字面空格时 ``/selfreply\tadd`` 被 ``parse_command_text``
+    判成"不是指令"，而宿主装饰器路径的 tokenizer 仍会匹配它，两条出口给出相反
+    答案——内联路径把命令当普通消息（可能被主动回复接话），装饰器路径却执行了它。
+    反过来 ``selfreplyx`` 仍须判非指令：前缀判定不能松成"以 selfreply 开头"。
+    """
+    _, _, commands, _, _ = _load_r3_modules()
+    for separator in (" ", "\t", "\n"):
+        assert commands.parse_command_text(f"/selfreply{separator}add") == ("add", ""), (
+            f"分隔符 {separator!r} 未被识别：两条指令出口会给出相反答案"
+        )
+    assert commands.parse_command_text("selfreplyx add") is None
 
 
 # ============================================================================
@@ -864,6 +925,37 @@ _REQUIRED_AUDITED_KEYS = {
     "vision_main_enabled",  # 图片外发总开关
     "ignored_sender_ids",  # 可静默屏蔽管理员的隐蔽开关
 }
+
+
+def test_str_config_values_drop_control_characters() -> None:
+    """str 类配置值必须剔除控制字符，否则能伪造日志行。
+
+    缺陷形态：三个 provider id 经 ``%s`` 直接进启动 INFO 日志。值里带换行时，
+    一条日志记录会裂成多行，其中一行可以是任意伪造内容（时间戳、级别、
+    甚至别的模块的消息）。列表条目早有这条规则（``STRING_LIST_ILLEGAL_RE``
+    排除 C0 控制字符），str 类是漏掉的一类。
+
+    变异锚定：把 ``coerce_config_value`` 的 str 分支换回裸 ``str(raw).strip()``，
+    本用例红。
+    """
+    install_astrbot_stubs()
+    models = load_package(MAIN_PACKAGE_NAME, "models")
+
+    settings = models.Settings.from_config(
+        {"judge_provider_id": "ok\n[2026-10-15 00:00:00] [astrbot] [ERROR] admin login ok"}
+    )
+    assert settings.judge_provider_id == (
+        "ok[2026-10-15 00:00:00] [astrbot] [ERROR] admin login ok"
+    ), "str 类配置值未剔除控制字符，可伪造日志行"
+    assert "\n" not in settings.judge_provider_id
+
+    # 正常值不受影响；首尾空白仍按原语义剥掉
+    plain = models.Settings.from_config({"judge_provider_id": "  gpt-4o-mini  "})
+    assert plain.judge_provider_id == "gpt-4o-mini"
+
+    # text 类（提示词模板）必须保留换行：它是多行内容，不是单行标识
+    template = models.Settings.from_config({"decision_prompt_template": "第一行\n第二行"})
+    assert "\n" in template.decision_prompt_template
 
 
 def test_audited_config_keys_cover_sensitive_surface() -> None:

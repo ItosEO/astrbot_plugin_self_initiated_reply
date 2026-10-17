@@ -16,6 +16,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from ._support import core_loader
 
 PACKAGE_NAME = "selfreply_decision_test_package"
@@ -149,6 +151,54 @@ async def test_decide_force_always_replies(tmp_path: Path) -> None:
     assert result["reason"] == "手动强制检查"
 
 
+async def test_recent_messages_is_capped_before_sanitizing(tmp_path: Path) -> None:
+    """判断上下文必须先截断、后净化，顺序反了会在事件循环上卡住整条决策链。
+
+    缺陷形态：``sanitize_prompt_variable`` 的逐字符过滤是 O(历史总字节) 且同步
+    跑在事件循环上。反序时它收到的是**整段**历史——一条超大消息就能让所有会话
+    与 Web 面板停摆（实测 20MB 历史 ≈ 2.1s）。截断先把它压进 2000 字预算。
+
+    用「净化器见过的最大长度」钉顺序：反序时它会收到全量历史，正序时只收到
+    预算内的一段。这比计时断言确定，不受机器快慢影响。
+    """
+    decision_mod, models, maker, _, _ = _make_decision(
+        tmp_path,
+        {
+            "decision_model_enabled": True,
+            "recent_message_limit": 10,
+            "decision_history_min_messages": 10,
+        },
+    )
+    state = _state(
+        models,
+        active_at=900.0,
+        recent=[("user", "啊" * 50_000, 990.0 - index) for index in range(10)],
+    )
+    seen: list[int] = []
+    original = decision_mod.sanitize_prompt_variable
+
+    def recording(text: str, **kwargs: object) -> str:
+        # 只记 recent_messages 那次：latest_message 等单字段变量也走同一函数，
+        # 它们自带 max_length 但截断发生在净化器内部，输入本就是全长的。
+        if kwargs.get("allow_newlines"):
+            seen.append(len(str(text)))
+        return original(text, **kwargs)
+
+    decision_mod.sanitize_prompt_variable = recording
+    try:
+        prompt = await maker.build_decision_prompt("s1", state, "message_delay")
+    finally:
+        decision_mod.sanitize_prompt_variable = original
+
+    budget = decision_mod.MAX_DECISION_CONTEXT_CHARS
+    assert max(seen) <= budget + len(decision_mod.CONTEXT_CAP_MARKER) + 8, (
+        f"净化器收到了 {max(seen)} 字符，远超 {budget} 预算：顺序反了，"
+        "超大历史会在事件循环上做全量逐字符过滤"
+    )
+    assert "啊" in prompt, "截断后仍应保留最近的聊天记录"
+    assert decision_mod.CONTEXT_CAP_MARKER in prompt, "超预算必须留下保尾标记"
+
+
 async def test_decide_no_intent_asks_model_and_returns_skip_reason(tmp_path: Path) -> None:
     decision_mod, models, maker, _, calls = _make_decision(
         tmp_path,
@@ -241,6 +291,11 @@ async def test_timeout_returns_even_when_provider_swallows_cancellation(tmp_path
     在宽限窗口后交隔离登记。宽限窗口是刻意的（``DECISION_CONVERGE_GRACE_SEC``）：
     它把"响应取消"与"吞掉取消"分开，后者要触发插件降级，不能误判。
     故本用例的耗时上界是「超时 + 宽限 + 余量」，而**不是**「超时」。
+
+    上界里的超时必须取 ``settings`` 上的**实际值**，不能抄配置里写的那个数：
+    ``decision_timeout_sec`` 的规格下限是 1，写 0.05 会被夹成 1.0。照抄 0.05
+    会让上界比理论地板只高 50ms——实测稳定 4.01s 对 4.05s，机器稍一抖动就红，
+    而行为完全正确。这是天生的 flaky，与它要守的契约无关。
     """
     quarantined: list = []
     _, models, maker, _, _ = _make_decision(
@@ -257,8 +312,9 @@ async def test_timeout_returns_even_when_provider_swallows_cancellation(tmp_path
     elapsed = time.monotonic() - started
     assert result["should_reply"] is False
     assert result["reason"] == "判断模型超时"
+    timeout_sec = maker.settings.decision_timeout_sec
     grace = _decision_module().DECISION_CONVERGE_GRACE_SEC
-    assert elapsed < 0.05 + grace + 1.0, f"判断超时未按时返回，耗时 {elapsed:.2f}s"
+    assert elapsed < timeout_sec + grace + 1.0, f"判断超时未按时返回，耗时 {elapsed:.2f}s"
     # 宽限耗尽仍未收敛的 provider 任务必须被登记为隔离（否则是静默孤儿）
     assert quarantined, "吞取消的 provider 任务未被隔离登记"
 
@@ -286,6 +342,93 @@ async def test_timeout_returns_promptly_when_provider_honors_cancellation(tmp_pa
     assert result["reason"] == "判断模型超时"
     assert elapsed < grace, f"守规矩的 provider 不该被宽限拖慢，耗时 {elapsed:.2f}s"
     assert not quarantined, "响应取消的 provider 任务不得被隔离登记"
+
+
+async def test_converge_grace_window_cancellation_quarantines_provider_task(
+    tmp_path: Path,
+) -> None:
+    """宽限窗口内又收到取消：provider 任务不得静默成孤儿。
+
+    缺陷形态：``_converge_provider_task`` 的 ``asyncio.wait`` 没有
+    ``except asyncio.CancelledError``。``terminate`` 的 force cancel 落在
+    「判断已超时、正在宽限收敛」的那一刻时，取消从 ``asyncio.wait`` 抛出，
+    而 provider 任务的 ``cancel()`` 早已投递却无人等它收敛——宿主 SDK 吞掉
+    CancelledError 时，那条真实 HTTP 请求带着零日志永久挂在后台。外层
+    ``except Exception`` 也接不住（CancelledError 是 BaseException）。
+
+    修法：镜像 ``generation._graceful_stop`` 的形状，隔离登记后原样重放。
+    """
+    quarantined: list = []
+    _, _models, maker, _, _ = _make_decision(
+        tmp_path, {"decision_model_enabled": True}, quarantine=quarantined
+    )
+
+    async def swallower() -> None:
+        # 吞掉取消后再睡一小会儿：既要活过本用例的取消时刻（t≈0.05s），
+        # 又必须自行结束——无限重试的 swallow 会让 asyncio.run 收尾时永久挂起。
+        try:
+            await asyncio.sleep(30.0)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.3)
+
+    provider = asyncio.ensure_future(swallower())
+    await asyncio.sleep(0)
+
+    async def converge() -> None:
+        await maker._converge_provider_task(provider, "decision converge interrupted")
+
+    task = asyncio.ensure_future(converge())
+    await asyncio.sleep(0.05)  # 确保已进入宽限窗口（宽限 3s，远长于此）
+    assert not task.done(), "宽限窗口内 converge 不该自行结束"
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert quarantined, "宽限窗口内又收到取消时，provider 任务必须被隔离登记"
+    assert quarantined[0][1] == "decision converge interrupted"
+
+
+async def test_timeout_path_cancellation_does_not_converge_twice(tmp_path: Path) -> None:
+    """超时路径的宽限窗口内又收到取消：不得再跑第二次收敛。
+
+    缺陷形态：``await self._converge_provider_task(task, "decision model timeout")``
+    整段落在 ``except asyncio.CancelledError`` 的保护区之内。宽限窗口内又收到
+    取消时，内层已隔离登记并原样重放，外层却把它当成"wait 期间的取消"再收敛
+    一次——第二次 ``task.cancel()`` 加一整个 3s 宽限窗口，纯属白拖关停时间，
+    且隔离原因从"decision model timeout"漂成"decision cancelled"。
+    """
+    quarantined: list = []
+    _, _models, maker, _, _ = _make_decision(
+        tmp_path,
+        # 规格下限是 1s，写 0.05 会被夹取成 1：这里按夹取后的值等待。
+        {"decision_model_enabled": True, "decision_timeout_sec": 1},
+        swallowing=True,
+        quarantine=quarantined,
+    )
+    state = _state(_models)
+    converges: list[str] = []
+    original_converge = maker._converge_provider_task
+
+    async def counting_converge(task, reason):
+        converges.append(reason)
+        await original_converge(task, reason)
+
+    maker._converge_provider_task = counting_converge
+
+    task = asyncio.ensure_future(maker.ask_decision_model("s1", state, trigger="message_delay"))
+    # 轮询等超时路径真正进入宽限窗口（宽限 3s，远长于轮询步长），比固定 sleep
+    # 更贴合意图，也不会因夹取后的超时值与预期不符而打偏。
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + 5.0
+    while not converges and loop.time() < deadline:
+        await asyncio.sleep(0.01)
+    assert converges, "超时路径未进入宽限窗口，本用例前提不成立"
+    assert not task.done(), "宽限窗口内 ask_decision_model 不该自行结束"
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert converges == ["decision model timeout"], f"重复收敛宽限窗口：{converges}"
+    assert quarantined, "宽限窗口内又收到取消时，provider 任务必须被隔离登记"
 
 
 async def test_timeout_task_finishing_with_exception_consumes_it(tmp_path: Path) -> None:

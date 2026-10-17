@@ -1,8 +1,9 @@
 """真实宿主兼容性检查：插件绑定的私有 AstrBot API 符号存在性 + 契约断言 + 加载路径。
 
 在装有真实 ``astrbot`` 包的环境中运行（CI 兼容矩阵 job 用）：契约缺口（符号缺失/
-签名缺参/危险工具未覆盖/处理器注解不可解析）即 exit 1。CI 对 latest 宿主的不阻塞
-语义由 workflow 的 ``continue-on-error`` 实现，脚本本身只有一种退出行为。
+签名缺参/危险工具未覆盖/处理器注解不可解析）即 exit 1，宿主压根没装是另一个退出码
+（``EXIT_HOST_MISSING``）。CI 对 latest 宿主的不阻塞语义由 workflow 的
+``continue-on-error`` 实现，契约检查本身只有一种退出行为。
 
 三类检查的性质不同：前两类只问「宿主有没有这个符号」，第三类
 （``_handler_signature_gaps``）**真的走一遍宿主加载期的动作**：符号存在性检查走不到加载路径，
@@ -24,6 +25,17 @@ from typing import NamedTuple
 ROOT = Path(__file__).resolve().parent.parent
 PLUGIN_PACKAGE = "astrbot_plugin_self_initiated_reply"
 
+# 宿主未安装的专用退出码：与契约缺口的 1 分开，调用方（CI 或本地）一眼看出
+# 该去装 astrbot，而不是去查上游漂移。
+EXIT_HOST_MISSING = 2
+
+# 宿主未安装时的一行提示：脚本的全部检查都建立在**真实** astrbot 之上，刻意
+# 不装 stub（那会让符号存在性检查恒绿，脚本失去意义）。
+_HOST_MISSING_HINT = (
+    "未安装真实 AstrBot 宿主，本脚本只验证真实宿主：请先 "
+    "pip install astrbot（或锁定版 pip install 'astrbot==<version>'）后重跑。"
+)
+
 
 class _BootstrapState(NamedTuple):
     workdir: Path
@@ -37,7 +49,8 @@ def _register_plugin_package() -> bool:
     优先用已安装的包（CI 的 pip install -e 后运行）；本地直接跑脚本而未安装时，
     以包名把仓库根注册进 sys.modules（与 tests 加载模式同源）。Windows 中文路径下
     editable 安装的 .pth 会被 pip 以错误编码写入导致 import 失败（CI ubuntu UTF-8
-    无此问题），此回退保证本地也能验证。
+    无此问题），此回退只解决**插件包**的导入；真实 ``astrbot`` 宿主仍须另行安装，
+    缺它时 ``main`` 的前置检查直接给出可行动提示（见 ``_HOST_MISSING_HINT``）。
 
     调用前已经存在的同名模块属于调用者，恢复阶段必须原样保留。
     """
@@ -61,7 +74,7 @@ def _bootstrap() -> _BootstrapState:
     PermissionError）。
 
     import 本模块必须无副作用：tests/test_runtime_adapter.py 只为取
-    EXPECTED_HANDLER_COUNT 而 import，模块级 chdir 会把 pytest 进程的工作目录
+    EXPECTED_HANDLER_NAMES 而 import，模块级 chdir 会把 pytest 进程的工作目录
     切到临时目录、假包注册会顶掉 sys.modules 里的同名真包。
     """
     # astrbot 包 import 会在 cwd 生成运行时 data/ 目录：切到临时目录防污染工作区
@@ -121,12 +134,29 @@ DANGEROUS_TOOL_MODULES = [
 ]
 
 
-# 本检查实际能扫到的处理器数量：on_message + 9 个子指令 = 10。
-# 指令组本身（selfreply）已被装饰器换成 RegisteringCommandable，原函数从类
+# 本检查真正走一遍注解解析的处理器名单：on_message + 9 个 /selfreply 子指令。
+# 指令组本体（selfreply）已被宿主装饰器换成 RegisteringCommandable，原函数从类
 # 属性取不到，故扫不到它；这不构成盲区：宿主只对 CommandFilter 做注解解析，
 # 指令组与 on_message 的注解宿主本身就不解析。加指令时同步改这里，
-# tests/test_runtime_adapter.py 经 import 引用本常量（单源）。
-EXPECTED_HANDLER_COUNT = 10
+# tests/test_runtime_adapter.py 经 import 引用本名单（单源）。
+#
+# 刻意按名字列名单而不是数个数：数个数会把「指令组恰好不可调用」这个宿主内部
+# 细节变成计数口径，RegisteringCommandable 一旦获得 __call__，两个消费方对同一
+# 个 10 的解读就会分叉，并在每个宿主版本上假报漂移。
+EXPECTED_HANDLER_NAMES = frozenset(
+    {
+        "on_message",
+        "selfreply_help",
+        "selfreply_status",
+        "selfreply_list",
+        "selfreply_add",
+        "selfreply_remove",
+        "selfreply_check",
+        "selfreply_on",
+        "selfreply_off",
+        "selfreply_debug",
+    }
+)
 
 
 def _handler_signature_gaps() -> list[str]:
@@ -139,14 +169,15 @@ def _handler_signature_gaps() -> list[str]:
     宿主的 CommandFilter，用 inspect 才不受宿主内部重构影响。
 
     **不允许静默空转**：处理器按名字前缀筛，改名后一个都扫不到而本函数照旧
-    返回空列表是假绿，故先断言扫到的数量等于 ``EXPECTED_HANDLER_COUNT``。
+    返回空列表是假绿，故先断言名单里的处理器都真的扫到了。按名单成员判定而
+    非比对总数：指令组哪天变成可调用，扫到的集合会多出一项，那不是漂移。
     """
     import inspect
 
     from astrbot_plugin_self_initiated_reply.main import SelfInitiatedReplyPlugin
 
     gaps: list[str] = []
-    scanned = 0
+    scanned: set[str] = set()
     for name in sorted(dir(SelfInitiatedReplyPlugin)):
         if name != "on_message" and not name.startswith("selfreply"):
             continue
@@ -154,29 +185,38 @@ def _handler_signature_gaps() -> list[str]:
         func = getattr(target, "handler", target)
         if not callable(func):
             continue
-        scanned += 1
+        scanned.add(name)
         try:
             inspect.signature(func, eval_str=True)
         except Exception as exc:
             gaps.append(f"处理器 {name} 的注解在加载期无法解析：{type(exc).__name__}: {exc}")
-    if scanned != EXPECTED_HANDLER_COUNT:
+    missing = sorted(EXPECTED_HANDLER_NAMES - scanned)
+    if missing:
         gaps.append(
-            f"加载路径检查只扫到 {scanned} 个处理器，预期 {EXPECTED_HANDLER_COUNT} 个："
+            f"加载路径检查没扫到这些处理器：{', '.join(missing)}；"
             f"筛选条件与实际处理器命名已脱节，本检查处于空转状态（假绿）"
         )
     return gaps
 
 
-def _enumerate_tool_names() -> dict[str, set[str]]:
-    """从宿主危险工具模块枚举所有 FunctionTool 子类的 name 类属性。"""
+def _enumerate_tool_names() -> dict[str, set[str] | None]:
+    """从宿主危险工具模块枚举所有 FunctionTool 子类的 name 类属性。
+
+    值为 ``None`` 表示该模块在宿主里已不存在（改名/搬走）：那片危险工具的
+    denylist 覆盖面静默消失，调用方必须报成漂移，不能当成"这片没有危险工具"。
+    """
     import importlib
     import inspect
 
     from astrbot.core.agent.tool import FunctionTool
 
-    found: dict[str, set[str]] = {}
+    found: dict[str, set[str] | None] = {}
     for mod_name in DANGEROUS_TOOL_MODULES:
-        mod = importlib.import_module(mod_name)
+        try:
+            mod = importlib.import_module(mod_name)
+        except ModuleNotFoundError:
+            found[mod_name] = None
+            continue
         names = {
             str(getattr(obj, "name", "")).strip()
             for _, obj in inspect.getmembers(mod, inspect.isclass)
@@ -186,15 +226,19 @@ def _enumerate_tool_names() -> dict[str, set[str]]:
     return found
 
 
-def _denylist_gaps() -> dict[str, list[str]]:
+def _denylist_gaps() -> list[str]:
     """宿主危险工具全集与 HOST_DANGEROUS_TOOL_IDS 的缺口（空 = 全覆盖）。"""
     from astrbot_plugin_self_initiated_reply.models import HOST_DANGEROUS_TOOL_IDS
 
-    return {
-        mod: sorted(names - HOST_DANGEROUS_TOOL_IDS)
-        for mod, names in _enumerate_tool_names().items()
-        if names - HOST_DANGEROUS_TOOL_IDS
-    }
+    gaps: list[str] = []
+    for mod, names in _enumerate_tool_names().items():
+        if names is None:
+            gaps.append(f"{mod} 缺失，宿主私有 API 漂移")
+            continue
+        missing = sorted(names - HOST_DANGEROUS_TOOL_IDS)
+        if missing:
+            gaps.append(f"denylist 未覆盖 {mod}: {', '.join(missing)}")
+    return gaps
 
 
 def _runtime_api_gaps() -> list[str]:
@@ -261,7 +305,13 @@ def run_contract_checks() -> int:
 
     failures: list[str] = []
     for mod_name, attrs in runtime_adapter.AstrBotRuntimeAdapter.host_contract():
-        mod = importlib.import_module(mod_name)
+        try:
+            mod = importlib.import_module(mod_name)
+        except ModuleNotFoundError:
+            # 模块被宿主改名/搬走时不给裸 traceback：与符号缺失同一个可行动
+            # 文案，继续查完其余条目再一次汇总。
+            failures.extend(f"{mod_name}.{attr} 缺失，宿主私有 API 漂移" for attr in attrs)
+            continue
         for attr in attrs:
             if not hasattr(mod, attr):
                 failures.append(f"{mod_name}.{attr} 缺失，宿主私有 API 漂移")
@@ -274,9 +324,7 @@ def run_contract_checks() -> int:
 
     adapter = runtime_adapter.AstrBotRuntimeAdapter.from_host()
     problems = adapter.validate(soft=True)
-    gaps = _denylist_gaps()
-    for module_name, missing in gaps.items():
-        failures.append(f"denylist 未覆盖 {module_name}: {', '.join(missing)}")
+    failures.extend(_denylist_gaps())
     failures.extend(_handler_signature_gaps())
     failures.extend(_runtime_api_gaps())
     all_problems = failures + problems
@@ -288,7 +336,21 @@ def run_contract_checks() -> int:
     return 1
 
 
+def _host_importable() -> bool:
+    """真实宿主是否可 import（缺它时 main 直接给提示并返回 EXIT_HOST_MISSING）。"""
+    try:
+        import astrbot  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def main() -> int:
+    # 前置检查放在 _bootstrap 之前：宿主缺失时不必建临时目录、切 cwd、注册假包，
+    # 也不用让调用方对着 runtime_adapter 的 ModuleNotFoundError traceback 猜原因。
+    if not _host_importable():
+        print(_HOST_MISSING_HINT, file=sys.stderr)
+        return EXIT_HOST_MISSING
     previous_cwd = Path(os.getcwd())
     state = _bootstrap()
     try:

@@ -30,6 +30,10 @@ class SessionGate:
         self._running_sessions: set[str] = set()
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._session_release: dict[str, asyncio.Event] = {}
+        # 运行标记的租约持有人。运行标记描述的是"某个在途任务正在跑"，不是
+        # 可回滚配置：``restore`` 靠它区分「检查已结束」（owner 已 pop，标记
+        # 不得复活）与「检查被 prune 过但仍在跑」（owner 仍活，标记必须保留）。
+        self._running_owners: dict[str, asyncio.Task[Any] | None] = {}
 
     @property
     def generation_view(self) -> MappingProxyType[str, int]:
@@ -68,11 +72,22 @@ class SessionGate:
 
     def mark_running(self, umo: str) -> None:
         self._running_sessions.add(umo)
+        # owner 是运行标记的租约持有人，restore 靠它区分「检查已结束」与
+        # 「检查被 prune 过但仍在跑」。拿不到 task（无事件循环的同步调用方）时
+        # 记 None = 未知：推导时保守保留标记——误保留的代价由 §5 的有界等待
+        # 兜底，误丢弃的代价是该会话与在途检查真正并发。
+        try:
+            self._running_owners[umo] = asyncio.current_task()
+        except RuntimeError:
+            self._running_owners[umo] = None
         # 新运行周期开始：清掉上一周期的 release 状态，等待者重新挂起
         self._session_release.pop(umo, None)
 
     def unmark_running(self, umo: str) -> None:
         self._running_sessions.discard(umo)
+        # owner 必须与标记同步消失：留着它会让 restore 把一个已结束的检查
+        # 判成"仍在跑"，正是本机制要防的复活。
+        self._running_owners.pop(umo, None)
         release = self._session_release.get(umo)
         if release is not None:
             release.set()
@@ -127,30 +142,55 @@ class SessionGate:
         return True
 
     def snapshot(self) -> dict[str, Any]:
-        """代次/运行集/锁三张表的浅拷贝快照，供配置回滚原地恢复。
+        """代次与锁两张表的浅拷贝快照，供配置回滚原地恢复。
 
-        release 表**刻意不快照**：等待者持有具体 Event 对象，按值恢复会制造
+        运行集**刻意不进快照**：它是在途任务的租约，任务可能在任何时刻结束，
+        快照值在回滚时已经过期。``restore`` 改为按 owner 存活推导（见其
+        docstring），照抄快照会复活已结束检查的标记、也会抹掉窗口内新起的检查。
+
+        release 表同样**刻意不快照**：等待者持有具体 Event 对象，按值恢复会制造
         孤儿事件或带回陈旧的 set 状态（空转饿死）。正确来源是恢复后的运行集，
         由 ``restore`` 反推。
         """
         return {
             "generation": dict(self._session_generation),
-            "running": set(self._running_sessions),
             "locks": dict(self._session_locks),
         }
 
     def restore(self, snap: dict[str, Any]) -> None:
-        """原地恢复三张表，并把 release 表校正到与恢复后运行集一致。
+        """原地恢复代次与锁两张表，并按 owner 存活推导运行集与 release 表。
 
         必须原地 clear+update、禁止属性重绑定：等待者与运行中的
         ``async with`` 持有容器与 Event/Lock 对象本身的引用，换掉容器身份会让
-        它们继续读写孤儿表。release 表不整表恢复，改为从恢复后的运行集反推：
-        回滚会把运行标记恢复成快照态，而支撑它的检查任务可能已在恢复前结束并
-        ``set()`` 过事件，保留已 set 状态会让等待循环紧密空转独占事件循环。
+        它们继续读写孤儿表。
+
+        运行集不照抄快照，改按 ``_running_owners`` 推导：owner 仍活着的会话
+        才真的在跑。这同时挡住两个方向——
+        - 窗口内已正常结束的检查（``unmark_running`` 已 pop owner）：照抄会把
+          无人认领的标记写回去，该会话从此被"已有判断任务在运行"永久拒绝；
+        - 窗口内新起、此刻仍在跑的检查（快照里没有它）：照抄会把它的标记抹掉，
+          下一个检查就与它并发。
+
+        release 表从推导后的运行集反推：仍运行的清掉陈旧的 set（否则等待循环
+        紧密空转独占事件循环），已不运行的 set 唤醒等待者。
         """
+        held_locks = {umo: lock for umo, lock in self._session_locks.items() if lock.locked()}
         restore_container_inplace(self._session_generation, snap["generation"])
         restore_container_inplace(self._session_locks, snap["locks"])
-        restore_container_inplace(self._running_sessions, snap["running"])
+        # 窗口内新起、此刻仍被持有的锁是活状态，不是可回滚配置：它在快照之后
+        # 才由 lock_for 创建，整表恢复会把它抹掉而在途的 async with 仍持有它。
+        for umo, lock in held_locks.items():
+            self._session_locks[umo] = lock
+        restore_container_inplace(
+            self._running_sessions,
+            {
+                umo
+                for umo, owner in self._running_owners.items()
+                # owner 为 None 表示标记时拿不到 task（同步调用方）：无从判断，
+                # 按保守方向保留。键不存在才是"检查已结束、owner 已随标记收走"。
+                if owner is None or not owner.done()
+            },
+        )
         for umo, release in self._session_release.items():
             if umo in self._running_sessions:
                 # 仍标记运行中：清掉陈旧的 set，让等待者重新挂起而非空转。
@@ -162,7 +202,13 @@ class SessionGate:
                 release.set()
 
     def prune(self, umo: str) -> None:
-        """会话移出白名单后回收全部映射与运行标记。"""
+        """会话移出白名单后回收全部映射与运行标记。
+
+        ``_running_owners`` **刻意不摘**：prune 常发生在检查仍在跑的时候
+        （白名单收缩的级联清理），摘掉 owner 会让随后的回滚把该会话判成
+        "没有在途检查"，从而抹掉它的运行标记。owner 由检查自己的
+        ``unmark_running`` 收尾，与运行标记同生同灭。
+        """
         self._session_generation.pop(umo, None)
         # 仍被在途检查持有的锁**不摘**：摘走后重加白名单的新检查会拿到新锁
         # 对象，与旧检查真正并发。锁对象由该会话下一次未持锁的 prune 回收。

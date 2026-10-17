@@ -25,6 +25,7 @@ from .models import (
 from .session_gate import SessionGate
 from .utils import (
     collapse_whitespace,
+    redact_exc_text,
     session_is_private,
     session_whitelisted,
 )
@@ -95,15 +96,9 @@ class SessionPipeline:
         if isinstance(result, str):
             record_decision(self._last_decisions, umo, trigger, should_reply=False, reason=result)
             return result
-        if not self._gate.is_current(umo, expected_generation):
-            return STALE_TASK_MESSAGE
-        record_decision(
-            self._last_decisions,
-            umo,
-            trigger,
-            should_reply=bool(result.get("should_reply")),
-            reason=str(result.get("reason") or ""),
-        )
+        # 决策 INFO 先于代次复核：模型的结论是 §9 留给 INFO 的唯一排障入口，而
+        # 代次在判断期间变化恰恰是最需要知道"模型到底说了什么"的一条路径——
+        # 放到复核之后，这条路径上运营者既看不到日志也看不到裁决。
         logger.info(
             "[%s] decision session=%s trigger=%s should_reply=%s elapsed=%.2fs reason=%s",
             PLUGIN_ID,
@@ -113,9 +108,28 @@ class SessionPipeline:
             float(result.get("elapsed_sec") or 0.0),
             collapse_whitespace(result.get("reason") or "-"),
         )
+        if not self._gate.is_current(umo, expected_generation):
+            # 登记丢弃理由而不是模型的结论：否则 /selfreply status 的「最近裁决」
+            # 会显示一条本轮什么都没发生的「接话」（与 local_gate 分支同口径，§13）。
+            record_decision(
+                self._last_decisions,
+                umo,
+                trigger,
+                should_reply=False,
+                reason=STALE_TASK_MESSAGE,
+            )
+            return STALE_TASK_MESSAGE
+        record_decision(
+            self._last_decisions,
+            umo,
+            trigger,
+            should_reply=bool(result.get("should_reply")),
+            reason=str(result.get("reason") or ""),
+        )
         if not result.get("should_reply"):
-            # 契约（decide 侧）：should_reply=False 时已转成字符串返回。走到
-            # 这里说明该契约被破坏，静默放行会造成"判断不该回复却仍然生成并发送"。
+            # decide() 的契约：should_reply=False 时必须转成字符串返回。这里
+            # 显式兜底，因为拿到 dict 意味着被注入的 decision 实现退化——那会让
+            # 判断模型明确说"不接话"的会话继续走到生成与发送，且全程无日志。
             raise RuntimeError("decide() must convert should_reply=False into a string")
         return result
 
@@ -164,8 +178,18 @@ class SessionPipeline:
         state.refresh_day()
         gate = self._decision.local_gate(state, force=force)
         if gate:
+            # 与判断路径同一套登记：网关拦截（冷却/日配额/静默不足/观察窗口）必须
+            # 进 ``last_decisions``，否则 `/selfreply status` 的「最近裁决」会显示
+            # 上一轮**过期**的"接话"——运营者读到的是"判断说该回"，实际被冷却拦着，
+            # 反向误导。默认 cooldown 900s、日配额 5，这正是最常见的路径。
+            #
+            # 但日志取 DEBUG 而非 INFO：这与 ``scheduler.delayed_check`` 把同一句
+            # result 降为 DEBUG 是同一条理由——闸门理由是高频成功路径（默认配置下
+            # 每个巡检轮次一条），而 §9 只把「判断结果」那一条留给 INFO。运营者
+            # 的可视答案在 ``/selfreply status``，不在日志流里。
+            record_decision(self._last_decisions, umo, trigger, should_reply=False, reason=gate)
             logger.debug(
-                "[%s] skip session=%s trigger=%s reason=%s",
+                "[%s] gate session=%s trigger=%s reason=%s",
                 PLUGIN_ID,
                 umo,
                 trigger,
@@ -228,44 +252,24 @@ class SessionPipeline:
             )
         finally:
             try:
-                try:
-                    finalizer = self._create_critical_task(
-                        self._finalize_ledger(
-                            umo,
-                            state,
-                            ledger,
-                            effective_reply,
-                            expected_generation=expected_generation,
-                            observed_active_at=observed_active_at,
-                        )
-                    )
-                except RuntimeError as exc:
-                    # 任务注册被拒（停止中 / 降级）：协程已被关闭，账本停在
-                    # sealed、配额不记（test_attempt_ledger 锚定）。只留日志，
-                    # 若让它从 finally 传出会改写主链已得出的结果。
-                    logger.error(
-                        "[%s] proactive ledger finalizer registration rejected session=%s error=%s",
-                        PLUGIN_ID,
+                finalizer = self._track_critical_task(
+                    self._finalize_ledger(
                         umo,
-                        exc,
+                        state,
+                        ledger,
+                        effective_reply,
+                        expected_generation=expected_generation,
+                        observed_active_at=observed_active_at,
                     )
-                else:
-                    try:
-                        await asyncio.shield(finalizer)
-                    except RuntimeError as exc:
-                        # finalizer 内部（_finalize_ledger 挂 record task 时）注册被拒
-                        # 的镜像出口：记账错误同样不外溢，理由同上。
-                        logger.error(
-                            "[%s] proactive ledger finalizer rejected session=%s error=%s",
-                            PLUGIN_ID,
-                            umo,
-                            exc,
-                        )
-                    except asyncio.CancelledError:
-                        await asyncio.shield(finalizer)
-                        raise
+                )
+                try:
+                    await asyncio.shield(finalizer)
+                except asyncio.CancelledError:
+                    await asyncio.shield(finalizer)
+                    raise
             finally:
-                # unmark 挂在最外层：注册被拒路径同样必经，否则会话永久卡在 running。
+                # unmark 挂在最外层：finalizer 抛错的路径同样必经，
+                # 否则会话永久卡在 running。
                 self._gate.unmark_running(umo)
 
     async def _record_ledger(
@@ -345,23 +349,23 @@ class SessionPipeline:
                 ledger.mark_record_failed("state persistence task cancelled")
             raise
         except Exception as exc:
+            # 先脱敏再进 str()：mark_record_failed 的实参与日志都吃这个值。
+            # 原写法直接把 exc 传给 %s、并把 str(exc) 原样喂给 mark_record_failed——
+            # 一旦 exc.__str__ 抛异常（上游 SDK 的异常见过），RuntimeError 会从
+            # 这里逃出 _record_ledger → _finalize_ledger → check_session_locked 的
+            # finally，把已经算好的返回值整段丢掉，而账本停在 RECORDING、
+            # 落盘重试再也不会发生。
+            detail = redact_exc_text(exc)
             if ledger.phase == LedgerPhase.RECORDING:
-                ledger.mark_record_failed(str(exc))
+                ledger.mark_record_failed(detail)
             logger.error(
                 "[%s] proactive ledger finalizer failed ledger_id=%s session=%s error=%s",
                 PLUGIN_ID,
                 ledger.ledger_id,
                 umo,
-                exc,
+                detail,
             )
             return
-
-    def _create_critical_task(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
-        task = self._track_critical_task(coro)
-        if task is None:
-            coro.close()
-            raise RuntimeError("critical task registration was rejected")
-        return task
 
     async def _finalize_ledger(
         self,
@@ -382,9 +386,11 @@ class SessionPipeline:
         ledger.seal()
         if ledger.phase in {LedgerPhase.RECORDED, LedgerPhase.RECORD_FAILED}:
             return
+        # 重入必须复用既有 record task：二次进入时 phase 还是 RECORDING（未终态），
+        # 若在此另起一条就会出现两个记账任务同时 apply_proactive_state。
         task = cast(asyncio.Task[Any] | None, ledger.record_task)
         if task is None:
-            task = self._create_critical_task(
+            task = self._track_critical_task(
                 self._record_ledger(
                     umo,
                     state,
@@ -394,9 +400,11 @@ class SessionPipeline:
                     observed_active_at=observed_active_at,
                 )
             )
-            if not ledger.start_recording(task):
-                task.cancel()
-                return
+            # 不需要检查 start_recording 的返回值：seal() 之后 phase 是 SEALED
+            # 且 record_task 刚判过 None，这条同步路径上 start_recording 必然
+            # 成功。判 False 只能是重入，而重入已被上面的 record_task 复用分支
+            # 接住。多出的 cancel 分支永不执行，留着只会让人以为有第二条路径。
+            ledger.start_recording(task)
         try:
             await asyncio.shield(cast(asyncio.Future[Any], task))
         except asyncio.CancelledError:

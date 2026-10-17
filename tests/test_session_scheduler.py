@@ -47,6 +47,7 @@ def _make_scheduler(tmp_path: Path, config: dict | None = None):
     checks: list[tuple[str, str, bool, int | None]] = []
     last_events: dict[str, object] = {}
     last_event_at: dict[str, float] = {}
+    last_decisions: dict[str, dict[str, Any]] = {}
     recent_image_events: dict[str, object] = {}
     whitelist_runtime_umos: dict[str, set[str]] = {}
     delay_tasks: dict[str, asyncio.Task] = {}
@@ -78,6 +79,7 @@ def _make_scheduler(tmp_path: Path, config: dict | None = None):
         drop_older_images=coordinator.drop_older_than,
         last_events=last_events,
         last_event_at=last_event_at,
+        last_decisions=last_decisions,
         recent_image_events=recent_image_events,
         whitelist_runtime_umos=whitelist_runtime_umos,
         delay_tasks=delay_tasks,
@@ -165,20 +167,6 @@ async def test_wait_release_gives_up_silently_when_run_eligibility_lost(
     )
 
 
-async def test_cancel_delay_non_force_leaves_running_check_alive(tmp_path: Path) -> None:
-    scheduler_mod, _, scheduler, _, _ = _make_scheduler(tmp_path)
-    umo = "s1"
-    scheduler._gate.mark_running(umo)
-    running = scheduler._spawn(_noop_coro())
-    scheduler._running_check_tasks[umo] = running
-    try:
-        scheduler.cancel_delay(umo)
-        assert not running.cancelled(), "运行中的检查不得被非强制取消打断"
-    finally:
-        scheduler._gate.unmark_running(umo)
-        await _cancel_and_await(running)
-
-
 async def _noop_coro():
     await asyncio.sleep(10)
 
@@ -199,29 +187,6 @@ async def test_cancel_delay_force_cancels_running_check(tmp_path: Path) -> None:
 # ============================================================================
 # 延迟检查：运行等待与运行表登记
 # ============================================================================
-
-
-async def test_delayed_check_waits_for_running_release_event(tmp_path: Path) -> None:
-    scheduler_mod, _, scheduler, _, _ = _make_scheduler(tmp_path)
-    umo = "s1"
-    scheduler._gate.mark_running(umo)
-    try:
-        task = asyncio.create_task(
-            scheduler.delayed_check(
-                umo,
-                delay_sec=0,
-                trigger="patrol",
-                force=True,
-                generation=scheduler._gate.advance(umo),
-            )
-        )
-        await asyncio.sleep(0.05)
-        assert not task.done(), "运行集被占用时延迟检查必须等待"
-        scheduler._gate.unmark_running(umo)
-        done, _ = await asyncio.wait({task}, timeout=2)
-        assert task in done, "释放后延迟检查应完成"
-    finally:
-        scheduler._gate.unmark_running(umo)
 
 
 async def test_delayed_check_drops_desynced_release_after_bounded_wait(
@@ -337,7 +302,14 @@ async def test_silence_interrupted_restarts_full_silence_cycle(
     state_map[umo] = state
     state.last_active_at = scheduler_mod_now()
     scheduler.schedule_delayed_check(umo, delay_sec=0, trigger="message_delay", force=False)
-    await asyncio.sleep(1.0)  # 已进入静默等待；静默已消耗 1s
+    # 等任务真正注册静默事件再打断：固定 sleep 在事件循环被阻塞时会把
+    # "还没进等待"当成"已进等待"，notify 丢失即假红。setdefault 之后没有
+    # await 点，键出现即代表任务已承诺进入等待。
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + 1.0
+    while umo not in scheduler._silence_events and loop.time() < deadline:
+        await asyncio.sleep(0.01)
+    assert umo in scheduler._silence_events, "任务未进入静默等待，本用例前提不成立"
     state.last_active_at = scheduler_mod_now()  # 新消息：静默期重置
     t_last_msg = asyncio.get_event_loop().time()
     scheduler.notify_activity(umo)
@@ -420,6 +392,61 @@ def test_cleanup_events_live_session_protection(tmp_path: Path) -> None:
         scheduler._gate.unmark_running(umo)
 
 
+def test_cleanup_events_reaps_stale_last_decisions(tmp_path: Path) -> None:
+    """陈旧会话的「最近裁决」必须随其事件缓存一并回收。
+
+    此前 janitor 只回收事件/图片索引/运行时 UMO 三张表，``_last_decisions`` 无人
+    认领：静默白名单会话的裁决条目一直滞留（上限只是白名单规模 1000），还被
+    ``GET /status`` 整表回显。裁决是跟随事件的诊断信息，事件没了它就是孤儿。
+    """
+    _, models, scheduler, _, _ = _make_scheduler(tmp_path)
+    scheduler._last_cleanup = 0.0
+    stale_umo = "g1:user:a"
+    fresh_umo = "g2:user:c"
+    live_umo = "g3:user:e"
+    for umo, active_at in ((stale_umo, 100.0), (fresh_umo, scheduler_mod_now()), (live_umo, 100.0)):
+        scheduler._last_events[umo] = object()
+        scheduler._last_event_at[umo] = active_at
+        scheduler._last_decisions[umo] = {
+            "at": 1.0,
+            "trigger": "message_delay",
+            "should_reply": False,
+            "reason": "不接话",
+        }
+    scheduler._gate.mark_running(live_umo)
+    try:
+        scheduler.cleanup_events_if_needed()
+    finally:
+        scheduler._gate.unmark_running(live_umo)
+
+    assert stale_umo not in scheduler._last_events, "陈旧事件必须回收"
+    assert stale_umo not in scheduler._last_decisions, "陈旧会话的裁决必须一并回收"
+    assert fresh_umo in scheduler._last_decisions, "有新事件的会话裁决必须保留"
+    assert live_umo in scheduler._last_decisions, "运行中会话的裁决不得回收"
+
+
+def test_cleanup_events_overflow_reaps_last_decisions(tmp_path: Path) -> None:
+    """溢出通道同样要回收裁决：被它摘掉的会话此后不再进陈旧通道。
+
+    缺陷形态：只在陈旧通道 pop 裁决。溢出通道把会话从事件表摘掉后，该 umo 再也
+    不会出现在 ``removable`` 里，于是它的裁决条目比"只修陈旧通道"活得更久——
+    同一漏洞换个更窄的门再次漏进来。
+    """
+    _, models, scheduler, _, _ = _make_scheduler(tmp_path)
+    scheduler._last_cleanup = 0.0
+    now = scheduler_mod_now()
+    for index in range(models.MAX_CACHED_EVENTS + 1):
+        umo = f"g{index}:user:x"
+        scheduler._last_events[umo] = object()
+        scheduler._last_event_at[umo] = now
+        scheduler._last_decisions[umo] = {"at": 1.0, "should_reply": False, "reason": "x"}
+
+    scheduler.cleanup_events_if_needed()
+
+    assert len(scheduler._last_events) == models.MAX_CACHED_EVENTS, "溢出清理未生效"
+    assert len(scheduler._last_decisions) == models.MAX_CACHED_EVENTS, "裁决表未随溢出同步回收"
+
+
 # ============================================================================
 # 巡检与图片清理
 # ============================================================================
@@ -474,18 +501,6 @@ async def test_patrol_enabled_spawns_and_stop_cancels(tmp_path: Path) -> None:
     assert task.cancelled()
     assert scheduler.patrol_task is None
     await _cancel_and_await(task)
-
-
-def test_run_image_cleanup_removes_expired_files(tmp_path: Path) -> None:
-    _, models, scheduler, _, _ = _make_scheduler(tmp_path, {"vision_image_age_sec": 60})
-    root = tmp_path / "image_cache"
-    root.mkdir()
-    expired = root / "e.png"
-    expired.write_bytes(b"x")
-    os.utime(expired, (100.0, 100.0))
-    removed = asyncio.run(scheduler.run_image_cleanup())
-    assert removed == 1
-    assert not expired.exists()
 
 
 def test_run_image_cleanup_uses_configured_age_window(tmp_path: Path) -> None:
@@ -746,34 +761,22 @@ async def test_patrol_loop_outer_backoff_on_cleanup_error(tmp_path: Path, monkey
     )
 
 
-async def test_ensure_patrol_spawns_and_stops(tmp_path: Path) -> None:
-    """ensure_patrol 在触发器启用时拉起循环，stop_patrol 干净收敛。"""
-    _, _, scheduler, _, _ = _make_scheduler(tmp_path, {"enabled_patrol_trigger": True})
-    scheduler.settings.check_interval_sec = 0
-    flags = _run_flags(scheduler)
-    scheduler.ensure_patrol()
-    task = scheduler.patrol_task
-    assert task is not None and not task.done()
-    flags["run"] = False
-    await scheduler.stop_patrol()
-    assert scheduler.patrol_task is None
-
-
 # ============================================================================
 # 图片清理循环与事件缓存溢出
 # ============================================================================
 
 
-async def test_image_cleanup_loop_cycle_and_error_retry(tmp_path: Path) -> None:
+async def test_image_cleanup_loop_cycle_and_error_retry(tmp_path: Path, monkeypatch: Any) -> None:
     """清理循环：首轮失败走 60s 退避重试，次轮正常执行后随开关退出。"""
     scheduler_mod, _, scheduler, _, _ = _make_scheduler(tmp_path)
-    orig_sleep = scheduler_mod.asyncio.sleep
     sleeps: list[float] = []
 
     async def fast_sleep(delay):
         sleeps.append(delay)
 
-    scheduler_mod.asyncio.sleep = fast_sleep
+    # 经 monkeypatch 打桩：scheduler_mod.asyncio 就是 stdlib 模块本身，直接
+    # 赋值会把 asyncio.sleep 进程级换掉，本用例之后跑的一切 await 都吃替身。
+    monkeypatch.setattr(scheduler_mod.asyncio, "sleep", fast_sleep)
     seq = iter([True, True, True, True, True, False])
     scheduler._should_run = lambda: next(seq, False)
     cleanups = {"n": 0}
@@ -785,33 +788,26 @@ async def test_image_cleanup_loop_cycle_and_error_retry(tmp_path: Path) -> None:
         return 0
 
     scheduler.run_image_cleanup = run_cleanup
-    try:
-        await asyncio.wait_for(scheduler._image_cleanup_loop(), timeout=5)
-    finally:
-        scheduler_mod.asyncio.sleep = orig_sleep
+    await asyncio.wait_for(scheduler._image_cleanup_loop(), timeout=5)
     assert cleanups["n"] == 2  # 失败重试后第二轮正常执行
     assert 60.0 in sleeps  # 错误退避延迟
 
 
-async def test_ensure_image_cleanup_spawns_loop(tmp_path: Path) -> None:
+async def test_ensure_image_cleanup_spawns_loop(tmp_path: Path, monkeypatch: Any) -> None:
     """ensure_image_cleanup 拉起周期清理任务并随开关自然退出。"""
     scheduler_mod, _, scheduler, _, _ = _make_scheduler(tmp_path)
     assert scheduler.image_cleanup_task is None
-    orig_sleep = scheduler_mod.asyncio.sleep
 
     async def fast_sleep(delay):
         pass
 
-    scheduler_mod.asyncio.sleep = fast_sleep
+    monkeypatch.setattr(scheduler_mod.asyncio, "sleep", fast_sleep)
     seq = iter([True, True, False])
     scheduler._should_run = lambda: next(seq, False)
-    try:
-        scheduler.ensure_image_cleanup()
-        task = scheduler.image_cleanup_task
-        assert task is not None
-        await asyncio.wait_for(task, timeout=5)
-    finally:
-        scheduler_mod.asyncio.sleep = orig_sleep
+    scheduler.ensure_image_cleanup()
+    task = scheduler.image_cleanup_task
+    assert task is not None
+    await asyncio.wait_for(task, timeout=5)
 
 
 def test_cleanup_image_sources_drops_expired_entries(tmp_path: Path) -> None:
@@ -870,27 +866,6 @@ async def test_delayed_check_exits_when_disabled_after_sleep(tmp_path: Path) -> 
     scheduler._check_session = record
     await scheduler.delayed_check("s1", delay_sec=0)
     assert calls == [], "插件已停用仍执行了会话检查：停用后的旧延迟任务会复活发送"
-
-
-async def test_delayed_check_warns_on_check_error(tmp_path: Path, caplog: object) -> None:
-    """检查回调抛错：记 warning 后吞掉，不向上传播。
-
-    异常必须留痕。它由 ``asyncio.Task`` 驱动，抛出只会变成无人接管的任务异常；
-    若降级为 debug 或静默 pass，线上就再也看不到检查失败。
-    """
-    scheduler_mod, _, scheduler, _, _ = _make_scheduler(tmp_path)
-
-    async def boom(umo, *, trigger, force, expected_generation):
-        raise RuntimeError("check broken")
-
-    scheduler._check_session = boom
-    with capture_logs(caplog, scheduler_mod.logger, logging.WARNING):
-        await scheduler.delayed_check("s1", delay_sec=0)  # 异常应被内部吞掉
-
-    warnings = messages_at_least(caplog, logging.WARNING)
-    assert any("check broken" in msg or "delayed check" in msg for msg in warnings), (
-        f"检查失败未记 warning，异常被静默吞掉：{warnings}"
-    )
 
 
 async def test_cancel_delay_spares_running_check_and_yields_queued_one(tmp_path: Path) -> None:

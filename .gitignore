@@ -16,6 +16,9 @@ coverage.*
 .scratch/
 dist/
 data/
+# 测试桩给宿主路径函数预留的落点（host_stubs 的默认值）。当前无人写它，但宿主
+# 能力解析一旦真落盘，运行时产物不该有进仓库的路径。
+.tmp_astrbot/
 # 本地虚拟环境（uv 默认名）：仓库根的 venv 不属于源码。
 .venv/
 node_modules/

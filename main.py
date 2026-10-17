@@ -93,6 +93,7 @@ from .utils import (
     event_umo,
     is_admin_event,
     is_explicit_direct_call,
+    redact_exc_text,
     session_group_id,
     session_whitelisted,
 )
@@ -166,6 +167,9 @@ class SelfInitiatedReplyPlugin(Star):
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._critical_tasks: set[asyncio.Task[Any]] = set()
         self._quarantined_tasks: dict[asyncio.Task[Any], str] = {}
+        # 关停窗口内被豁免的 critical task：它们自己放弃后续写入（慢写会覆盖
+        # 新实例的 state.json），但 terminate() 的最终落盘是另一个任务，照常写。
+        self._spared_critical_tasks: set[asyncio.Task[Any]] = set()
         self._lifecycle_state = PluginLifecycle.RUNNING
         self._stopping = False
         # 跨实例落盘闸门：本实例被判"最终落盘超时"后置位，仍在跑的写盘在
@@ -186,6 +190,10 @@ class SelfInitiatedReplyPlugin(Star):
         # 所有会话与 Web 面板（契约见 tests/test_cleanup_nonblocking）。
         # - 有运行中的循环 → 全部交后台任务（磁盘部分内部走 to_thread）。
         # - 无循环（同步加载的宿主）→ 原地同步执行，且**不得**在此 spawn。
+        #   该分支因此也不起巡检与图片清理循环（create_task 需要循环）；消息
+        #   触发路径仍正常，巡检要等首个异步入口（/selfreply on 或 POST /config
+        #   改 enabled / enabled_patrol_trigger）经 apply_enabled_topology 拉起。
+        #   AstrBot 在异步启动里加载插件，走的是 else 分支，这里是降级兜底。
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -285,6 +293,7 @@ class SelfInitiatedReplyPlugin(Star):
             drop_older_images=self._coordinator.drop_older_than,
             last_events=self._last_events,
             last_event_at=self._last_event_at,
+            last_decisions=self._last_decisions,
             recent_image_events=self._recent_image_events,
             whitelist_runtime_umos=self._whitelist_runtime_umos,
             delay_tasks=self._delay_tasks,
@@ -478,7 +487,22 @@ class SelfInitiatedReplyPlugin(Star):
 
     def _quarantine_task(self, task: asyncio.Task[Any], reason: str) -> None:
         """Track a task that ignored cancellation instead of pretending shutdown succeeded."""
-        if task.done() or task in self._quarantined_tasks:
+        if task in self._quarantined_tasks:
+            return
+        if task.done():
+            # 取走结果：已结束的任务不进注册表，但它的异常若没人读，asyncio 会在
+            # 事件循环里打一条无归属的 "Task exception was never retrieved"。
+            # 调用点（宽限窗口耗尽后才来登记）恰好最容易命中这个时间差。
+            # 必须自己留痕：provider 任务带着异常收敛时，静默丢弃会让整个归因
+            # 消失，与本次加固的方向相反。
+            if not task.cancelled():
+                exc = task.exception()
+                if exc is not None:
+                    logger.warning(
+                        "[%s] quarantined-task candidate already failed: %s",
+                        PLUGIN_ID,
+                        redact_exc_text(exc),
+                    )
             return
         self._quarantined_tasks[task] = reason
         task.add_done_callback(self._release_quarantined_task)
@@ -560,7 +584,26 @@ class SelfInitiatedReplyPlugin(Star):
         # 越权拒绝先行：写操作才取消在途回复，只读动作不打断进行中的检查。
         if action in SESSION_CANCEL_COMMAND_ACTIONS:
             self._cancel_event_session(event)
-        await self._send_command_text(event, await self._command_text(event, action, arg))
+        try:
+            text = await self._command_text(event, action, arg)
+        except Exception as exc:
+            # 落盘失败必须让发指令的人看见。此前的形态是异常直接逃出 on_message：
+            # 管理员在聊天里什么都收不到，`stop_event()` 也没走到，别的插件还会
+            # 把 `/selfreply remove` 当普通消息再处理一遍。而内存回滚已经发生
+            # （白名单/会话状态/运行期 UMO 都已恢复），只差这一句告知。
+            logger.warning(
+                "[%s] inline command %s failed: %s",
+                PLUGIN_ID,
+                action,
+                redact_exc_text(exc),
+            )
+            await self._send_command_text(
+                event,
+                f"主动回复指令 {action} 执行失败（配置或状态写入未成功），"
+                "内存已回滚，请查看 AstrBot 日志后重试。",
+            )
+            return
+        await self._send_command_text(event, text)
 
     async def _command_text(self, event: AstrMessageEvent, action: str, arg: str = "") -> str:
         return await dispatch_command_action(self, event, action, arg)
@@ -698,6 +741,21 @@ class SelfInitiatedReplyPlugin(Star):
 
         _, pending = await asyncio.wait(tasks, timeout=TERMINATE_TASK_TIMEOUT_SEC)
         for task in pending:
+            if task in self._critical_tasks:
+                # 关键落盘任务必须在关停中存活（track_critical_task 的契约：
+                # "Register a persistence task even while shutdown is already
+                # stopping"）。取消它会让已 apply 的内存状态停在 RECORD_FAILED，
+                # 而隔离登记会把插件永久打成 DEGRADED，只因为最终落盘慢。留给
+                # 它自己跑完，宿主不等它。
+                #
+                # 但必须同时放弃这个任务的后续写入权限：宿主不等待隔离任务就构造
+                # 新实例，它的慢写若落地会用陈旧快照覆盖新实例刚写出的
+                # state.json——与 _save_final_state_with_deadline 的超时路径同一
+                # hazard。按任务身份判定（见 plugin_state.save_storage 的 docstring）：
+                self._spared_critical_tasks.add(task)
+                task.add_done_callback(self._spared_critical_tasks.discard)
+                # 全局标志会把随后执行的最终落盘一起挡掉。
+                continue
             task.cancel()
             # 超时即取消并隔离：terminate 有界（契约 §5），取消后的清理只由
             # 任务自身的 done 回调收尾。

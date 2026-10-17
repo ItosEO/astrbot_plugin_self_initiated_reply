@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "test:frontend": "node --test tests/frontend_contract.test.mjs",
-    "test:browser": "playwright test"
+    "test:browser": "playwright test",
+    "test": "npm run test:frontend && npm run test:browser"
   },
   "devDependencies": {
     "@playwright/test": "1.62.1"

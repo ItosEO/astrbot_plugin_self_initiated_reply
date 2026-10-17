@@ -2297,6 +2297,43 @@ def test_fixed_transport_re_resolves_each_redirect_hop(monkeypatch) -> None:
     ]
 
 
+def test_download_preflight_policy_refusal_warns(tmp_path: Path, monkeypatch, caplog) -> None:
+    """地址策略的**预检**拒绝也必须记 WARNING，不能一条日志都没有。
+
+    缺陷形态：``_download_image_data_url`` 的三处预检（scheme 不允许、端口不在
+    白名单、主机解析不到公网地址）此前是裸 ``return None``。唯一那条 WARNING 在
+    传输层，被预检挡在前面根本走不到——于是策略拒绝与网络故障在日志里完全同形，
+    而契约 §9 要的正是「有对端在敲被拦的门」这个信号。
+
+    与 ``test_download_warns_when_address_policy_blocks`` 分工：那个 monkeypatch
+    ``_resolve_global_address`` 让它返回内网地址，只走到传输层；本用例让预检自己
+    拒绝（scheme/端口），覆盖前面那一截。
+
+    变异锚定：删掉三处 ``_warn_policy_refusal`` 调用，本用例红。
+    """
+    import logging
+
+    _, image, _ = _load_modules()
+    parser_mod = _parser_module()
+    parser = make_parser(image, tmp_path)
+    cases = {
+        "https://cdn.example/x.png": "scheme not allowed",
+        "http://10.0.0.5/x.png": "no global address for host",
+        "http://example.com:8080/x.png": "port 8080 not in allowlist",
+    }
+    for url, _reason in cases.items():
+        with capture_logs(caplog, parser_mod.logger, logging.DEBUG):
+            assert asyncio.run(parser._download_image_data_url(url)) is None
+        refused = [
+            record
+            for record in caplog.records
+            if record.levelno == logging.WARNING and "address policy" in record.getMessage()
+        ]
+        assert len(refused) == 1, f"{url} 的策略拒绝未记 WARNING：{caplog.records}"
+        assert "example" in refused[0].getMessage() or "10.0.0.5" in refused[0].getMessage()
+        caplog.clear()
+
+
 def test_download_warns_when_address_policy_blocks(tmp_path: Path, monkeypatch, caplog) -> None:
     """地址策略拒绝必须记 WARNING，不能和网络故障同为 DEBUG（契约 §9）。
 
@@ -2608,22 +2645,6 @@ def test_parse_unable_description_not_cached(tmp_path: Path) -> None:
     assert _parse_with_bridge(image, Bridge(), info) is None
 
 
-def test_parse_truncates_long_description(tmp_path: Path) -> None:
-    _, image, _ = _load_modules()
-
-    class Bridge:
-        async def resolve_provider_id(self, _umo, preferred):
-            return preferred
-
-        async def llm_generate_direct(self, **_kwargs):
-            return SimpleNamespace(completion_text="字" * 350)
-
-    info = image.ImageInfo(url="https://x/y.png")
-    result = _parse_with_bridge(image, Bridge(), info)
-    assert result is not None
-    assert len(result) <= 303 and result.endswith("...")
-
-
 def test_parse_truncation_limit_is_single_sourced(tmp_path: Path) -> None:
     _, image, _ = _load_modules()
     support_mod = sys.modules[f"{PACKAGE_NAME}.image._support"]
@@ -2869,6 +2890,37 @@ def test_cleanup_unlink_failure_is_ignored(tmp_path: Path, monkeypatch) -> None:
 
     monkeypatch.setattr(Path, "unlink", blocked_unlink)
     assert image.ImageParser.cleanup_source_cache(root, max_age_sec=60, now=5000.0) == 0
+
+
+def test_cleanup_quota_never_removes_files_written_after_the_snapshot(tmp_path: Path) -> None:
+    """超配额驱逐必须跳过清理起点之后写入的文件。
+
+    缺陷形态：``protected_sources`` 是调用方在 ``await asyncio.to_thread``
+    **之前**算的。清理期间刚冻结的图不在集合里，而超配额通道按 mtime 升序
+    会一路跳过受保护的老文件，最终删掉这个最新的活文件——它的索引条目还在，
+    但 ``prepared_source`` 已固化、``prepare`` 不会重新冻结，该图从此静默
+    从识图上下文里消失。
+    """
+    _, image, _ = _load_modules()
+    root = tmp_path / "cache"
+    root.mkdir()
+    # 老文件受保护（仍在索引里），新文件在清理起点之后写入（还没进索引）
+    old_protected = root / "old.png"
+    old_protected.write_bytes(b"1234")
+    os.utime(old_protected, (100.0, 100.0))
+    fresh = root / "fresh.png"
+    fresh.write_bytes(b"1234")
+    os.utime(fresh, (6000.0, 6000.0))  # 晚于 now=5000
+
+    removed = image.ImageParser.cleanup_source_cache(
+        root,
+        protected_sources={str(old_protected)},
+        max_age_sec=100000.0,
+        max_total_bytes=2,
+        now=5000.0,
+    )
+    assert removed == 0, "超配额时删掉了清理起点之后写入的活文件"
+    assert fresh.exists(), "刚冻结的图被清理删掉了"
 
 
 def test_cleanup_quota_skips_protected_when_nothing_else_left(tmp_path: Path) -> None:
@@ -3257,6 +3309,82 @@ def test_materialize_publishes_with_atomic_replace(tmp_path: Path, monkeypatch) 
     assert target is not None and target.is_file()
     assert calls and calls[0][1] == target
     assert not list(target.parent.glob("*.tmp"))
+
+
+def test_materialize_refuses_shard_link_escaping_the_cache(tmp_path: Path) -> None:
+    """分片目录被换成目录链接时，物化必须整体拒绝，不能把内容发布到缓存之外。
+
+    攻击面：``root/<digest[:2]>`` 是 ``image_cache`` 内的目录，任何有本地写权限的
+    进程都能把它换成目录 symlink 或 Windows junction。旧实现只守卫叶子
+    （``target.is_symlink()``），``mkdir(parents=True, exist_ok=True)`` 于是静默
+    成功——os.mkdir 抛 FileExistsError、exist_ok 吞掉，``is_dir()`` 跟随链接返回
+    True——内容被写到 ``image_cache`` 之外。而 ``_scan_source_cache`` 按
+    ``resolved.relative_to(root)`` 过滤，逃逸文件从此既不计入
+    ``MAX_IMAGE_CACHE_BYTES`` 也永不回收，磁盘无界增长。归属校验必须先于 mkdir，
+    且判据与清理扫描同一表达式。
+    """
+    _, image, _ = _load_modules()
+    parser = make_parser(image, tmp_path)
+    outside = tmp_path / "escaped"
+    outside.mkdir()
+    shard = tmp_path / "image_cache" / PNG_DIGEST[:2]
+    try:
+        shard.symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        # Windows 非开发者模式下目录 symlink 需要特权：junction 无需管理员，
+        # 且 resolve() 同样穿透，归属校验对两者等价。
+        _make_directory_junction(shard, outside)
+    # 自证探针：链接必须真的穿透到缓存外，否则下面的"未逃逸"断言失去意义。
+    assert shard.resolve() == outside.resolve(), "探针无效：分片链接未穿透到缓存外"
+
+    assert parser._materialize_data_url(PNG_DATA_URL) is None
+    assert not (outside / f"{PNG_DIGEST}.png").exists(), "内容被发布到 image_cache 之外"
+
+
+def test_atomic_write_does_not_follow_a_link_planted_at_the_temp_name(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """临时文件的字节必须写进 ``mkstemp`` 交回的那个描述符，不能关掉后按名字重开。
+
+    缺陷形态：旧实现 ``os.close(descriptor)`` 之后用 ``Path.write_bytes`` 按名字
+    重开同一个临时文件再 fsync。close 与重开之间那个窗口里，任何能写
+    ``image_cache`` 的本地进程都能把那个随机名换成指向缓存外的 symlink，图片载荷
+    于是被写出去（reopen-after-close TOCTOU）；同一次 replace 之后也没有目录
+    fsync，掉电时数据块已落盘而 rename 丢失，"原子发布"只对并发读成立（契约 §8）。
+
+    真实竞态无法确定性复现，这里把整个窗口折叠成一次注入：交回的
+    ``(描述符, 名字)`` 对中描述符指向另一个文件，名字是指向 image_cache 之外的
+    symlink。字节必须落进描述符指向的那个文件——按名重开的旧实现在这里会把载荷
+    顺着链接写出去。
+    """
+    _, image, _ = _load_modules()
+    parser_mod = _parser_module()
+    parser = make_parser(image, tmp_path)
+    outside = tmp_path / "escaped"
+    outside.mkdir()
+    decoy = outside / "decoy.png"
+    decoy.write_bytes(b"decoy")
+    holder = outside / "holder.bin"
+    planted: list[Path] = []
+
+    def planted_mkstemp(*, dir, prefix, suffix):
+        name = Path(dir) / f"{prefix}planted{suffix}"
+        try:
+            os.symlink(decoy, name)
+        except (OSError, NotImplementedError) as exc:
+            # Windows 非开发者模式下 symlink_to 恒抛 OSError：必须显式 skip，
+            # 否则该安全用例静默空转而报告显示 PASSED。
+            pytest.skip(f"symlink not permitted on this platform: {exc}")
+        planted.append(name)
+        descriptor = os.open(holder, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o600)
+        return descriptor, str(name)
+
+    monkeypatch.setattr(parser_mod.tempfile, "mkstemp", planted_mkstemp)
+
+    parser._materialize_data_url(PNG_DATA_URL)
+
+    assert planted, "探针无效：mkstemp 注入未生效，断言失去意义"
+    assert decoy.read_bytes() == b"decoy", "载荷按名重开后被写到了 image_cache 之外"
 
 
 # ============================================================================

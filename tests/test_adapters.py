@@ -8,6 +8,7 @@ read_astrbot_history 的宿主接口差异分支。
 
 from __future__ import annotations
 
+import inspect
 import json
 from typing import Any
 
@@ -169,14 +170,58 @@ def test_method_call_options_varkw(bridge) -> None:
     def target(**kwargs) -> None:  # pragma: no cover - 仅签名
         pass
 
-    assert bridge._method_call_options(target, "umo1") == [((), {"umo": "umo1"}), ((), {})]
+    # 位置候选同样保留：``def f(umo, /, **kw)`` 这类形态下名字候选绑不上，
+    # 少了它 first_bindable_args 会落到空调用——宿主方法被无参调用。
+    assert bridge._method_call_options(target, "umo1") == [
+        ((), {"umo": "umo1"}),
+        (("umo1",), {}),
+        ((), {}),
+    ]
+
+
+def test_method_call_options_positional_only_with_varkw(bridge) -> None:
+    def target(umo: str, /, **kwargs: object) -> None:  # pragma: no cover - 仅签名
+        pass
+
+    options = bridge._method_call_options(target, "umo1")
+    assert options == [((), {"umo": "umo1"}), (("umo1",), {}), ((), {})]
+    bindable = [candidate for candidate in options if _binds(target, candidate)]
+    assert bindable == [(("umo1",), {})]
 
 
 def test_method_call_options_named_umo(bridge) -> None:
     def target(umo: str) -> None:  # pragma: no cover - 仅签名
         pass
 
-    assert bridge._method_call_options(target, "umo1") == [((), {"umo": "umo1"}), ((), {})]
+    # 位置候选必须跟在关键字候选之后：形如 ``def f(umo, /)`` 的宿主方法
+    # 无法按名字绑定，只给关键字候选会让 first_bindable_args 返回 None，
+    # 调用方静默降级而不是 fail loud。
+    assert bridge._method_call_options(target, "umo1") == [
+        ((), {"umo": "umo1"}),
+        (("umo1",), {}),
+        ((), {}),
+    ]
+
+
+def test_method_call_options_named_umo_positional_only(bridge) -> None:
+    def target(umo: str, /) -> None:  # pragma: no cover - 仅签名
+        pass
+
+    options = bridge._method_call_options(target, "umo1")
+    assert options == [((), {"umo": "umo1"}), (("umo1",), {}), ((), {})]
+    # 关键字候选绑不上位置专属形参，必须有一个能绑上的候选：否则
+    # first_bindable_args 返回 None，调用方静默降级而不是 fail loud。
+    bindable = [candidate for candidate in options if _binds(target, candidate)]
+    assert bindable == [(("umo1",), {})]
+
+
+def _binds(target: Any, candidate: tuple[tuple[Any, ...], dict[str, Any]]) -> bool:
+    args, kwargs = candidate
+    try:
+        inspect.signature(target).bind(*args, **kwargs)
+    except TypeError:
+        return False
+    return True
 
 
 def test_method_call_options_positional(bridge) -> None:

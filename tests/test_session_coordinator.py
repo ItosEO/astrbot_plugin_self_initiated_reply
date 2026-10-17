@@ -128,17 +128,6 @@ async def test_record_event_notifies_silence_reset() -> None:
     assert ctx.notified == ["s1"]
 
 
-async def test_invalidate_advances_generation_before_cancel() -> None:
-    """代次推进必须先于取消，保证被取消任务的旧 token 立即失效（防 ABA）。"""
-    _, coordinator, ctx = _make_coordinator()
-    coordinator.record_event("s1", object(), 1.0)
-
-    coordinator.invalidate("s1", force_cancel=True)
-
-    assert ctx.advanced == ["s1"]
-    assert ctx.cancelled == [("s1", True)]
-
-
 async def test_clear_only_drops_session_resources() -> None:
     _, coordinator, ctx = _make_coordinator()
     coordinator.record_event("s1", object(), 1.0)

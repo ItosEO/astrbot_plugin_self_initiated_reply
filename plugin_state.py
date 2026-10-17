@@ -189,19 +189,38 @@ def save_storage_sync(plugin: SelfInitiatedReplyPlugin) -> None:
 
 
 async def save_storage(plugin: SelfInitiatedReplyPlugin) -> None:
+    """落盘会话状态；内容与磁盘一致时跳过（无谓 fsync 与 mtime 扰动）。
+
+    放弃判据按**任务身份**而不是全局标志：``terminate()`` 里被豁免的 critical
+    task 自己放弃写入（它慢到越过关停窗口，落地会用陈旧快照覆盖新实例刚写出的
+    state.json），而随后执行的最终落盘是另一个任务、必须照常写——它在
+    ``terminate()`` 返回之前完成，不暴露在那个跨实例竞态里。用全局标志会把
+    最终落盘一起挡掉，静默丢掉「最后一次记录之后又有内存变更」。
+    """
     async with plugin._save_lock:
-        if plugin._abandon_disk_writes:
-            # 本实例已被判"最终落盘超时"：此时任何落盘都可能用陈旧快照覆盖
-            # 新实例写出的状态。放弃是主动决策，不抛异常、不记错误。
+        current = asyncio.current_task()
+
+        def abandoned() -> bool:
+            if plugin._abandon_disk_writes:
+                return True
+            return current is not None and current in plugin._spared_critical_tasks
+
+        if abandoned():
+            # 放弃是主动决策，不抛异常、不记错误。
             logger.debug("[%s] state save skipped: instance abandoned", PLUGIN_ID)
             return
         payload = _build_payload(plugin)
+        # 跳写判据的读+解析也进线程：state.json 可达数十 MB（白名单规模 ×
+        # recent_message_limit × 单条长度），同步跑在事件循环上会阻塞该进程内
+        # 所有会话与 Web 面板——写盘一侧的同一纪律见 tests/test_cleanup_nonblocking。
+        if await asyncio.to_thread(sessions_payload_matches, plugin._storage_path, payload):
+            return
         write_task = asyncio.create_task(
             asyncio.to_thread(
                 write_json_atomic,
                 plugin._storage_path,
                 payload,
-                abandoned=lambda: plugin._abandon_disk_writes,
+                abandoned=abandoned,
             )
         )
         try:
@@ -210,12 +229,12 @@ async def save_storage(plugin: SelfInitiatedReplyPlugin) -> None:
             # 等 shield 保护的那次写完只为决定要不要留失败日志；取消必须
             # 原样重放，改写成 OSError 会把「被取消」上报成「写盘失败」，
             # 调用方会落到 except Exception 分支，取消路径的回滚语义丢失。
-            if not await write_task and not plugin._abandon_disk_writes:
+            if not await write_task and not abandoned():
                 logger.warning(
                     "[%s] state save failed while cancelled: %s", PLUGIN_ID, plugin._storage_path
                 )
             raise
-        if not success and not plugin._abandon_disk_writes:
+        if not success and not abandoned():
             raise OSError(f"状态文件写入失败：{plugin._storage_path}")
 
 
@@ -232,9 +251,8 @@ async def persist_enabled(plugin: SelfInitiatedReplyPlugin, enabled: bool) -> No
     old_runtime = plugin.runtime_enabled
     plugin.settings.enabled = enabled
     plugin.runtime_enabled = enabled
-    try:
-        await plugin._persist_config()
-    except Exception:
+
+    async def rollback() -> None:
         plugin.settings.enabled = old_enabled
         plugin.runtime_enabled = old_runtime
         try:
@@ -246,6 +264,20 @@ async def persist_enabled(plugin: SelfInitiatedReplyPlugin, enabled: bool) -> No
                 enabled,
                 rollback_exc,
             )
+
+    try:
+        await plugin._persist_config()
+    except asyncio.CancelledError:
+        # 取消同样要回滚：CancelledError 不落 except Exception，而 enabled 已在
+        # 内存翻面。少了这一步，§6.1 承诺的「重启后保持」反向变成「重启后回落」。
+        restore = asyncio.ensure_future(rollback())
+        try:
+            await asyncio.shield(restore)
+        except asyncio.CancelledError:
+            pass
+        raise
+    except Exception:
+        await rollback()
         raise
 
 

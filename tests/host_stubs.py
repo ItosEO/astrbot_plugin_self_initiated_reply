@@ -4,7 +4,10 @@
 FakeToolSet / FakeEvent / FakeContext / FakeBuildResult。stub 安装是幂等补全式
 的：已存在的模块沿用，缺失的模块或属性补齐，因此可以与其他测试文件共存。
 
-每个测试用独立动态包名加载插件，避免 sys.modules 污染。
+模块隔离的边界：除 ``load_main`` 外的模块都按各测试文件的独立动态包名加载，
+彼此不共享 sys.modules 条目；``load_main`` 固定用 ``MAIN_PACKAGE_NAME``，因此
+``main`` 及其传递导入（plugin_state / storage / webapi / models / …）是进程级
+单例，由 ``load_main`` 的六个调用方测试文件共享，跨文件改动会互相可见。
 """
 
 from __future__ import annotations
@@ -27,7 +30,18 @@ MAIN_PACKAGE_NAME = "selfreply_main_test_package"
 # 单源守卫的扫描面：用 rglob 并在此单点声明排除目录，避免各守卫各写一套。
 # 非递归的 ROOT.glob("*.py") 会把 image/ 子包漏在视野外。
 _NON_PRODUCTION_DIRS = frozenset(
-    {"tests", "scripts", ".scratch", "data", "dist", "build", "__pycache__", ".venv", ".git"}
+    {
+        "tests",
+        "scripts",
+        ".scratch",
+        ".tmp_astrbot",
+        "data",
+        "dist",
+        "build",
+        "__pycache__",
+        ".venv",
+        ".git",
+    }
 )
 
 
@@ -178,8 +192,6 @@ def install_astrbot_stubs() -> None:
 
     if not hasattr(pipeline_ctx, "call_event_hook"):
         pipeline_ctx.call_event_hook = _call_event_hook
-    if not hasattr(pipeline_ctx, "_hook_calls"):
-        pipeline_ctx._hook_calls = []
 
     if not hasattr(astrbot_path, "get_astrbot_config_path"):
         astrbot_path.get_astrbot_config_path = lambda: str(ROOT / ".tmp_astrbot" / "config")
@@ -283,12 +295,6 @@ def load_main() -> types.ModuleType:
     return load_package(MAIN_PACKAGE_NAME, "main")
 
 
-def reset_hook_calls() -> None:
-    pipeline_ctx = sys.modules.get("astrbot.core.pipeline.context")
-    if pipeline_ctx is not None:
-        pipeline_ctx._hook_calls = []
-
-
 async def until(predicate: Any, timeout: float = 2.0) -> None:
     """Wait until ``predicate()`` is truthy, yielding to the loop meanwhile.
 
@@ -350,6 +356,18 @@ def messages_at_least(caplog: Any, level: int) -> list[str]:
     return [record.getMessage() for record in caplog.records if record.levelno >= level]
 
 
+def restore_path_functions(main: types.ModuleType) -> None:
+    """把 ``make_plugin`` 临时改写的两个路径函数还原成宿主桩的原绑定。
+
+    ``main`` 经 ``load_main`` 的固定包名加载，是进程级单例：``tmp_path`` 随用例
+    结束被 pytest 清掉，留着过期闭包等于让后续用例从模块名字上读到一个已删除的
+    目录。宿主桩幂等安装，此处取回的正是 import 期的原绑定。
+    """
+    astrbot_path = sys.modules["astrbot.core.utils.astrbot_path"]
+    main.get_astrbot_config_path = astrbot_path.get_astrbot_config_path
+    main.get_astrbot_plugin_data_path = astrbot_path.get_astrbot_plugin_data_path
+
+
 def with_plugin(tmp_path: Path, scenario: Any, **config_overrides: Any) -> Any:
     """Instantiate the plugin inside a running loop, run a scenario, terminate.
 
@@ -364,6 +382,7 @@ def with_plugin(tmp_path: Path, scenario: Any, **config_overrides: Any) -> Any:
             return await scenario(plugin, main)
         finally:
             await plugin.terminate()
+            restore_path_functions(main)
 
     return asyncio.run(_inner())
 
@@ -606,16 +625,16 @@ async def _fake_run_agent(
     stream_to_general: bool = False,
     show_reasoning: bool = False,
     buffer_intermediate_messages: bool = True,
-    **_kwargs: Any,
 ) -> Any:
+    # 签名刻意与 _RUN_REQUIRED 逐一对应、不收 **kwargs：_validate_callable 见到
+    # VAR_KEYWORD 就整段返回，加了逃逸口会让 stub 上的 run 契约断言恒真。
     if False:
         yield  # pragma: no cover - marker for async generator compatibility
     return
 
 
 async def _call_event_hook(event: Any, event_type: Any, *args: Any, **kwargs: Any) -> bool:
-    pipeline_ctx = sys.modules["astrbot.core.pipeline.context"]
-    pipeline_ctx._hook_calls.append((event, event_type))
+    # 宿主未装钩子时返回 False：链上无处理器，与空注册表的语义一致。
     return False
 
 
@@ -726,17 +745,9 @@ class FakeContext:
     def __init__(self) -> None:
         self.register_web_api_calls: list[tuple[str, Any, list[str], str]] = []
         self.astrbot_config: dict[str, Any] = {}
-        self.sent: list[tuple[str, Any]] = []
 
     def register_web_api(self, route: str, handler: Any, methods: list[str], desc: str) -> None:
         self.register_web_api_calls.append((route, handler, methods, desc))
-
-    async def send_message(self, umo: str, message: Any) -> Any:
-        self.sent.append((umo, message))
-        # 真实宿主 Context.send_message 找到平台返回 True、未找到返回 False；
-        # 桩默认模拟"找到平台"的正常路径，避免把 context 兜底路径的
-        # UNKNOWN/FAILED_BEFORE_SUBMIT 语义掩盖掉。
-        return True
 
 
 class FakeContextSend:

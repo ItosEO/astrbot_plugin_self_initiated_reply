@@ -223,6 +223,36 @@ def test_tool_direct_unknown_is_retained_in_the_attempt_ledger() -> None:
     assert ledger.attempts[0].state is models.AttemptState.UNKNOWN
 
 
+def test_adapter_exception_detail_is_redacted() -> None:
+    """adapter 异常的 detail 必须经 ``redact_exc_text``，不得原样带出 URL 凭证。
+
+    缺陷形态：``except Exception`` 用 ``safe_exc_text(exc)``，它只防 ``__str__``
+    再抛，不脱敏。该 detail 会被 ``delivery._send_via_context`` 的 UNKNOWN 分支
+    写进 WARNING 日志，而平台适配器异常串常形如
+    ``... for url 'https://api.example.com/bot<token>/sendMessage?token=...'``。
+    判断/生成/投递/webapi 各异常路径都已脱敏，产出 detail 的网关是漏掉的那一个。
+
+    变异锚定：把该处 ``redact_exc_text(exc)`` 换回 ``safe_exc_text(exc)``，本用例红。
+    """
+    outbound = _load_gateway()
+
+    async def sender(_message):
+        raise RuntimeError(
+            "Client error '401' for url "
+            "'https://api.example.com/bot123/sendMessage?token=SECRET_TOKEN"
+            "&Signature=SECRET_SIGNATURE'"
+        )
+
+    gateway = outbound.OutboundGateway(sender)
+    result = asyncio.run(gateway.send("message"))
+
+    assert result.outcome.status is outbound.SendStatus.UNKNOWN
+    detail = result.outcome.detail
+    assert "SECRET_TOKEN" not in detail, f"detail 泄漏凭证：{detail}"
+    assert "SECRET_SIGNATURE" not in detail, f"detail 泄漏凭证：{detail}"
+    assert "api.example.com" in detail, "脱敏不应把整条 URL 抹掉，排障需要主机名"
+
+
 def test_unstringable_adapter_exception_still_classifies_and_records() -> None:
     """``__str__`` 坏掉的 adapter 异常不得让异常逃出 gateway，也不得丢记账。
 

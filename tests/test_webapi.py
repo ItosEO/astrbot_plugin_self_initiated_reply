@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 from types import SimpleNamespace
 from typing import Any
@@ -35,7 +36,11 @@ def _bootstrap():
     yield
     web = sys.modules.get("astrbot.api.web")
     if web is not None:
+        # FakeRequest 是进程级单例（webapi 在 import 期绑定它）：error 不随之清零，
+        # 本文件中途失败就会把「请求体不是合法 JSON」传染给之后每一个 POST，
+        # 级联出成片与失败原因无关的假红。
         web.request.payload = {}
+        web.request.error = None
 
 
 # ============================================================================
@@ -74,7 +79,9 @@ def _bootstrap():
     ],
 )
 def test_parse_config_updates_rejects_invalid(payload: Any, field: str) -> None:
-    with pytest.raises(ValueError):
+    # match 钉住字段名：只断言「抛了 ValueError」时，函数顶部一句无差别
+    # raise 能让全部行保持绿，而用户拿到的是定位不到字段的报错。
+    with pytest.raises(ValueError, match=re.escape(field)):
         _webapi()._parse_config_updates(payload)
 
 
@@ -597,6 +604,73 @@ def test_api_post_config_stopping(tmp_path) -> None:
         plugin._stopping = True
         result = await webapi_module(main)._api_post_config(plugin)
         assert result["ok"] is False
+
+    with_plugin(tmp_path, scenario)
+
+
+def test_api_post_config_body_read_does_not_hold_the_config_lock(tmp_path) -> None:
+    """读取请求体不得持锁：等待客户端上传的时长由客户端决定。
+
+    缺陷形态：``await _request_json()`` 跑在 ``async with plugin._config_lock``
+    里面，一个慢/挂死的上传就连坐 ``terminate()`` 与一切 ``/selfreply`` 写指令
+    （它们同一把 ``_config_lock``）。§7 的「在 ``_config_lock`` 内比较 revision」
+    不受影响——比较仍在锁内、且在任何变更之前。
+
+    变异锚定：把 ``await _request_json()`` 挪回 ``async with
+    plugin._config_lock`` 内，本用例红（terminate 被连坐阻塞）。
+    """
+
+    async def scenario(plugin, main):
+        webapi = webapi_module(main)
+        original = webapi._request_json
+        reading = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocked_json():
+            reading.set()
+            await release.wait()
+            return {"cooldown_sec": 111}
+
+        webapi._request_json = blocked_json
+        posting = asyncio.create_task(webapi._api_post_config(plugin))
+        termination = asyncio.create_task(plugin.terminate())
+        try:
+            await reading.wait()
+            done, _ = await asyncio.wait({termination}, timeout=5.0)
+            assert termination in done, (
+                "POST 读取请求体期间持锁：terminate() 被客户端上传时长连坐阻塞"
+            )
+        finally:
+            release.set()
+            webapi._request_json = original
+            await asyncio.wait({posting, termination}, timeout=5.0)
+
+        # 请求本身照常收口：放行后拿到的是关停拒绝，而不是被丢掉或挂住
+        assert posting.result()["ok"] is False
+
+    with_plugin(tmp_path, scenario)
+
+
+def test_api_post_config_malformed_body_keeps_field_error(tmp_path) -> None:
+    """请求体与字段校验失败的文案必须原样回显，不得被通用文案吞掉。
+
+    前端表单依赖这串文案定位出错字段；校验移到锁外之后这条回显路径仍要走通。
+    """
+
+    async def scenario(plugin, main):
+        webapi = webapi_module(main)
+        web = sys.modules["astrbot.api.web"]
+        original_cooldown = plugin.settings.cooldown_sec
+
+        web.request.payload = ["not", "a", "dict"]
+        result = await webapi._api_post_config(plugin)
+        assert result == {"ok": False, "error": "请求体必须是 JSON 对象"}
+
+        web.request.payload = {"cooldown_sec": "5s"}
+        result = await webapi._api_post_config(plugin)
+        assert result["ok"] is False
+        assert result["error"] == "cooldown_sec 必须是整数"
+        assert plugin.settings.cooldown_sec == original_cooldown
 
     with_plugin(tmp_path, scenario)
 

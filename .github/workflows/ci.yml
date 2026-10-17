@@ -11,8 +11,11 @@ on:
   workflow_dispatch:
 
 jobs:
+  # nightly schedule 只为驱动 compat 作业的 astrbot==latest 上游漂移预警（见下方
+  # cron 注释），其余作业在 schedule 上跳过：门禁本身不因时钟触发而重复跑。
   lint:
     runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -29,6 +32,7 @@ jobs:
 
   frontend:
     runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -37,15 +41,20 @@ jobs:
       - name: Frontend syntax
         run: |
           shopt -s nullglob
+          matched=0
           for f in pages/主动回复设置/*.{js,mjs}; do
             echo "node --check $f"
             node --check "$f"
+            matched=$((matched + 1))
           done
+          # nullglob 下目录被改名或清空会让整个循环静默跳过（假绿），必须钉住匹配数。
+          [ "$matched" -gt 0 ] || { echo "pages/主动回复设置 下没有 js/mjs 可检查"; exit 1; }
       - name: Frontend contract
         run: node --test tests/frontend_contract.test.mjs
 
   frontend-browser:
     runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -67,6 +76,7 @@ jobs:
 
   mypy:
     runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -79,6 +89,7 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
     strategy:
       # 纯 Python 无 C 扩展：两端夹住（最低支持版 + 最新版），中间版增量差异面小。
       matrix:

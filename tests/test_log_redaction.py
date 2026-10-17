@@ -76,6 +76,36 @@ def test_decision_exception_reason_drops_url_credentials() -> None:
         assert secret not in result["reason"], f"reason 泄漏凭证 {secret}：{result['reason']}"
 
 
+def test_decision_exception_reason_drops_relative_url_credentials() -> None:
+    """urllib3 的 MaxRetryError 把请求 URL 以**相对路径**形态带出来，同样要脱敏。
+
+    缺陷形态：``redact_exc_text`` 的模式只认 ``scheme://`` 绝对 URL，而
+    httpx/requests/urllib3 连接失败的标准文本是
+    ``... Max retries exceeded with url: /v1/chat?api_key=sk-...&x=1``——
+    没有 scheme，匹配不到，凭证原样进 reason 并经 GET /status 出网。
+    reason 的回出面比日志更宽（任何能访问控制台的调用方），这条必须先堵。
+
+    变异锚定：删掉 ``_EXCEPTION_RELATIVE_URL_PATTERN`` 那一遍 sub，本用例红。
+    """
+    install_astrbot_stubs()
+    utils_mod = load_package(f"{PACKAGE_NAME}_utils", "utils")
+    relative = (
+        "HTTPSConnectionPool(host='api.example.com', port=443): "
+        "Max retries exceeded with url: /v1/chat?api_key=sk-REL123&x=1 "
+        "(Caused by NewConnectionError('connection failed'))"
+    )
+    redacted = utils_mod.redact_exc_text(RuntimeError(relative))
+    assert "sk-REL123" not in redacted, f"相对路径 URL 的 query 凭证漏进 reason：{redacted}"
+    assert "/v1/chat" in redacted, "脱敏把路径也吃掉了，排障价值受损"
+    assert "?<redacted>" in redacted, "未留下脱敏标记，读者不知道有参数被抹掉"
+
+    # 绝对 URL 与 userinfo 两种既有形态不得被这次扩展破坏
+    absolute = "Client error for url 'https://api.example.com/v1/chat?api_key=sk-ABS123'"
+    assert "sk-ABS123" not in utils_mod.redact_exc_text(RuntimeError(absolute))
+    userinfo = "failed https://user:pa55@api.example.com/v1/chat"
+    assert "pa55" not in utils_mod.redact_exc_text(RuntimeError(userinfo))
+
+
 def test_decision_exception_log_drops_url_credentials() -> None:
     """同一条异常写进日志时同样不得带出凭证。"""
     models, maker, decision = _make_failing_maker()
@@ -390,3 +420,46 @@ def test_webapi_failure_log_drops_url_credentials() -> None:
     assert lines, "未捕获 webapi 失败日志，用例已失去覆盖对象"
     for secret in SECRETS:
         assert secret not in lines[-1], f"webapi 失败日志泄漏凭证 {secret}：{lines}"
+
+
+def test_webapi_status_failure_log_drops_url_credentials() -> None:
+    """``_api_status`` 的失败日志同样必须经 ``redact_exc_text``。
+
+    缺陷形态：``_api_get_config`` 等分支都走了脱敏，唯独 ``_api_status`` 直打
+    ``exc`` 原文。它从 gate 视图、任务计数、缓存与 last_decisions 组装载荷，
+    今天碰不到带凭证的异常串，但这是本文件唯一未脱敏的失败分支——契约是
+    「webapi 全部失败日志同口径」，漏一个就让"已经统一脱敏"变成假话。
+
+    变异锚定：把该处 ``redact_exc_text(exc)`` 换回裸 ``exc``，本用例红。
+    """
+    install_astrbot_stubs()
+    webapi = load_package(f"{PACKAGE_NAME}_webapi_status", "webapi")
+
+    class BoomPlugin:
+        runtime_enabled = True
+
+        def __getattr__(self, _name):
+            # 只让缺失属性抛：runtime_enabled 是类属性可正常取到，其余
+            # （lifecycle_state / _gate / …）一律抛带凭证的异常串。
+            raise RuntimeError(f"Client error '401' for url '{SIGNED_URL}'")
+
+    lines: list[str] = []
+
+    class _Recorder:
+        def warning(self, template: str, *args: object) -> None:
+            lines.append(template % args if args else template)
+
+        def __getattr__(self, _name):
+            return lambda *a, **k: None
+
+    original_logger = webapi.logger
+    webapi.logger = _Recorder()
+    try:
+        result = asyncio.run(webapi._api_status(BoomPlugin()))
+    finally:
+        webapi.logger = original_logger
+
+    assert result["ok"] is False, "异常路径必须返回失败载荷"
+    assert lines, "未捕获 status 失败日志，用例已失去覆盖对象"
+    for secret in SECRETS:
+        assert secret not in lines[-1], f"status 失败日志泄漏凭证 {secret}：{lines}"

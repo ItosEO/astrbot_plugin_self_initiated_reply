@@ -8,10 +8,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import logging
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from ._support import core_loader
 from .host_stubs import capture_logs, messages_at_least
@@ -32,9 +35,15 @@ class FakePersistence:
         self.save_calls = 0
         self.sync_fail = False
         self.save_fail = False
+        # 取消只注入一次：回滚期的重写必须能正常完成，否则测的是「回滚也失败」
+        # 那条既有路径，而非「取消也要回滚」本身。
+        self.sync_cancel = False
 
     async def sync(self) -> bool:
         self.sync_calls += 1
+        if self.sync_cancel:
+            self.sync_cancel = False
+            raise asyncio.CancelledError()
         if self.sync_fail:
             raise RuntimeError("config write failed")
         return True
@@ -192,6 +201,43 @@ async def test_add_success_writes_once_and_creates_state(tmp_path: Path) -> None
     assert ctx.ensured == [umo]  # 会话状态已创建
 
 
+async def test_add_applies_whitelist_spec_bounds(tmp_path: Path) -> None:
+    """``add`` 必须走规格表的同一条规范化，不能自带一套宽松规则。
+
+    缺陷形态：``replace`` 用 ``{str(item).strip() ...}`` 自行归一，``max_items``
+    与 ``item_max_len`` 都只作用于 ``from_config`` 的读侧。于是
+    ``/selfreply add`` 能把超长 UMO 或超量条目写进内存与磁盘，直到下次加载才被
+    静默截断——超长 UMO 的会话在重启后莫名不再命中白名单，而内存态与磁盘态
+    长期超出 ``MAX_WHITELIST_SIZE`` 这个"硬边界"。
+    """
+    _, _, models = _load_modules()
+    ctx = FakeCtx(models)
+    manager = ctx.make_manager()
+
+    # 超长 UMO：写侧就该按 item_max_len 截断，与读侧同一表达式
+    long_umo = "qq:GroupMessage:" + "x" * 400
+    await manager.add(long_umo)
+    assert ctx.settings.whitelist == {long_umo[: models.MAX_STRING_LIST_ITEM_LEN]}, (
+        "add 未按 item_max_len 截断，重启后该会话将不再命中白名单"
+    )
+
+    # 条目含非法字符：写侧直接丢弃，不落盘
+    ctx2 = FakeCtx(models)
+    manager2 = ctx2.make_manager()
+    await manager2.add('qq:GroupMessage:1"')
+    assert ctx2.settings.whitelist == set(), "add 未丢弃含非法字符的条目"
+
+    # 条目数上限：写侧就夹住，不等到下次加载
+    ctx3 = FakeCtx(
+        models, whitelist={f"qq:GroupMessage:{i}" for i in range(models.MAX_WHITELIST_SIZE)}
+    )
+    manager3 = ctx3.make_manager()
+    await manager3.add("qq:GroupMessage:overflow")
+    assert len(ctx3.settings.whitelist) == models.MAX_WHITELIST_SIZE, (
+        "add 未夹住 max_items，内存与磁盘长期超出声明上限"
+    )
+
+
 async def test_add_existing_returns_false(tmp_path: Path) -> None:
     _, _, models = _load_modules()
     umo = _umo_with_group()
@@ -289,6 +335,77 @@ async def test_remove_rollback_restores_pruned_session_state(tmp_path: Path) -> 
     assert restored["daily_count"] == 7
     assert restored["last_proactive_at"] == 12345.0
     assert restored["recent"] == [1]
+
+
+async def test_remove_rollback_restores_runtime_umo_map(tmp_path: Path) -> None:
+    """双写失败回滚必须恢复 ``_whitelist_runtime_umos``。
+
+    缺陷形态：``replace`` 对被移出会话的映射是**整键 pop**（不是过滤后留空集）。
+    回滚时再跑一遍 ``replace`` 也拿不回来——那时表已经空了。裸群号条目因此失去
+    运行时 UMO，而 ``_runtime_umos_for_whitelist_item`` 对裸群号直接返回空集，
+    巡检从此不再访问该群，直到下一条消息重新注册。全程无日志，表现为"该群的
+    主动回复莫名停了"。
+
+    变异锚定：删掉 ``commit_change`` 里 ``_runtime_umos`` 的原地恢复，本用例红。
+    """
+    _, _, models = _load_modules()
+    umo = _umo_with_group()
+    group = _group_key(umo)
+    ctx = FakeCtx(models, whitelist={group})
+    # 裸群号条目的运行期映射：消息入口为群号键与完整 UMO 键各注册一份
+    ctx.runtime_umos[group] = {umo}
+    ctx.runtime_umos[umo] = {umo}
+    manager = ctx.make_manager()
+    ctx.persistence.save_fail = True
+
+    try:
+        await manager.remove(umo)
+        raise AssertionError("expected RuntimeError")
+    except RuntimeError:
+        pass
+
+    assert ctx.settings.whitelist == {group}, "白名单未回滚"
+    assert ctx.runtime_umos == {group: {umo}, umo: {umo}}, (
+        "回滚后运行期 UMO 映射丢失：该群的巡检将不再被访问"
+    )
+
+
+async def test_remove_rollback_runs_when_persist_is_cancelled(tmp_path: Path) -> None:
+    """B2 回归：双写被**取消**时同样要走回滚，而不是被 except Exception 跳过。
+
+    缺陷链：``asyncio.CancelledError`` 派生自 ``BaseException``，旧的
+    ``except Exception`` 整段跳过它，而 ``replace`` 早已单向前进（代次已推进、
+    会话状态已摘下、磁盘未写）。于是 remove 看起来成功了——内存里会话已被移出，
+    磁盘却仍写着它在白名单里，重启即复活；同时该会话的配额与冷却被清零。
+    add 侧则相反：内存里会话已加入，磁盘没有，重启后不再命中白名单。
+
+    变异锚定：删掉 ``commit_change`` 里的 ``except asyncio.CancelledError``
+    分支（只留 ``except Exception``），本用例红。
+    """
+    _, _, models = _load_modules()
+    umo = _umo_with_group()
+    group = _group_key(umo)
+    ctx = FakeCtx(models, whitelist={umo, group})
+    # 预灌运行态：日配额 7 次 + 冷却时间戳
+    state = {"daily_count": 7, "last_proactive_at": 12345.0}
+    ctx.sessions[umo] = state
+    ctx.sessions[group] = {"daily_count": 7}
+    ctx.runtime_umos[group] = {umo}
+    manager = ctx.make_manager()
+    ctx.persistence.sync_cancel = True
+
+    with pytest.raises(asyncio.CancelledError):
+        await manager.remove(umo)
+
+    # 白名单已回滚
+    assert ctx.settings.whitelist == {umo, group}, "取消后白名单未回滚"
+    # SessionState 必须按**身份**复活：配额/冷却未被清零（B2）
+    assert ctx.sessions[umo] is state, "取消后 SessionState 被 _prune 销毁"
+    assert ctx.sessions[group] == {"daily_count": 7}
+    assert ctx.runtime_umos == {group: {umo}}, "取消后运行期 UMO 映射未恢复"
+    # 回滚自带重写：shield 保护的那次必须跑完，否则磁盘仍留着未应用的变更
+    assert ctx.persistence.sync_calls == 2
+    assert ctx.persistence.save_calls == 1
 
 
 async def test_replace_returns_pruned_state_snapshot(tmp_path: Path) -> None:

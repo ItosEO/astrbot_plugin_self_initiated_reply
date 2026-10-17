@@ -22,6 +22,7 @@ from typing import Any, NamedTuple
 from astrbot.api import logger
 
 from .models import PLUGIN_ID
+from .utils import redact_exc_text
 
 
 def _require[T](value: T | None, name: str) -> T:
@@ -351,6 +352,24 @@ class AstrBotRuntimeAdapter:
     # main.py 在 import 期把 capabilities 里的这几项绑成模块级名字，测试按名字替换。
     # 路径解析失败由 resolve_paths 让异常传播、加载期即崩。
 
+    @staticmethod
+    def _read_func_tool(req: Any) -> Any:
+        """读 ``req.func_tool``，属性读取本身抛时返回 ``_MISSING``。
+
+        ``getattr(req, "func_tool", _MISSING)`` 的默认值只在宿主抛
+        ``AttributeError`` 时生效；宿主把它实现成会抛别的异常的 property 时
+        （RuntimeError 等），异常会原样逃出本类。那会把「无法枚举」变成一次裸
+        异常，而 ``filter_final_tools`` 正是工具边界的 fail-closed 接缝——它必须
+        先于调用方能处理的层级把这类失败收敛成哨兵。
+
+        加载期 ``_PROVIDER_REQUEST_FIELDS`` 断言不覆盖这种情况：``dir()`` 照样
+        列出一个会抛的 property，``validate()`` 因此通过。
+        """
+        try:
+            return getattr(req, "func_tool", _MISSING)
+        except Exception:
+            return _MISSING
+
     def _tool_list(self, req: Any) -> list[str] | None:
         """共享工具枚举前奏：哨兵/None/tools 三段判定。
 
@@ -361,7 +380,7 @@ class AstrBotRuntimeAdapter:
         处理：后者是宿主声明「本次无工具」，前者是读不到字段本身，返回
         ``[]`` 会把"查不到"谎报成"查过了、是空的"。
         """
-        tool_set: Any = getattr(req, "func_tool", _MISSING)  # Any：见 filter_final_tools 说明
+        tool_set: Any = self._read_func_tool(req)  # Any：见 filter_final_tools 说明
         if tool_set is _MISSING:
             logger.debug(
                 "[%s] tool enumeration unavailable: req has no 'func_tool' (type=%s)",
@@ -371,7 +390,14 @@ class AstrBotRuntimeAdapter:
             return None
         if tool_set is None:
             return []
-        tools = getattr(tool_set, "tools", None)
+        try:
+            tools = getattr(tool_set, "tools", None)
+        except Exception as exc:
+            # 属性读取本身抛（宿主 property 坏了）时同样必须 fail closed：
+            # 让异常逃出 filter_final_tools 会把"无法枚举"变成一次裸异常，
+            # 调用方只能按 generate 的兜底分支处理，归因反而更糊。
+            logger.debug("[%s] tool enumeration failed: %s", PLUGIN_ID, redact_exc_text(exc))
+            return None
         if tools is None:
             logger.debug(
                 "[%s] tool enumeration unavailable: func_tool has no 'tools' (type=%s)",
@@ -385,7 +411,7 @@ class AstrBotRuntimeAdapter:
             logger.debug(
                 "[%s] tool enumeration failed: %s",
                 PLUGIN_ID,
-                exc,
+                redact_exc_text(exc),
             )
             return None
 
@@ -422,7 +448,7 @@ class AstrBotRuntimeAdapter:
         if tool_ids is None:
             # fail-closed 恰好一条 WARNING 且须点名原因（test_missing_func_tool_
             # attribute_fails_closed_not_open / test_fail_closed_warning_names_the_reason）。
-            tool_set: Any = getattr(req, "func_tool", _MISSING)
+            tool_set: Any = self._read_func_tool(req)
             if tool_set is _MISSING:
                 logger.warning(
                     "[%s] tool boundary fail-closed: req has no 'func_tool' attribute "
@@ -442,9 +468,19 @@ class AstrBotRuntimeAdapter:
             # func_tool 显式 None（宿主声明本次无工具）或工具集本身为空：
             # 无工具可调，两种模式的核验都平凡通过。
             return True
-        tool_set = req.func_tool  # _tool_list 已排除 _MISSING/None tools
-        tools = tool_set.tools
+        tool_set = self._read_func_tool(req)  # _tool_list 已排除 _MISSING/None tools
+        if tool_set is _MISSING or tool_set is None:
+            # 上一次枚举还能读到，此刻读不到：宿主属性在两次读取之间变了。
+            # fail-closed 接缝不猜这种情况，直接判失败。
+            logger.warning(
+                "[%s] tool boundary fail-closed: req.func_tool became unreadable "
+                "(type=%s); aborting proactive run",
+                PLUGIN_ID,
+                type(req).__name__,
+            )
+            return False
         try:
+            tools = tool_set.tools
             for tool in list(tools):
                 name = str(getattr(tool, "name", "") or "").strip()
                 if not name:
@@ -455,11 +491,16 @@ class AstrBotRuntimeAdapter:
                 elif name in drop:
                     tool_set.remove_tool(name)
         except Exception as exc:
+            # 脱敏后进日志：tool_set 的实现可能把宿主配置路径、插件名或上游
+            # SDK 原文带进异常文本，而这条是 fail-closed 的安全缝。顺带挡住
+            # exc.__str__ 再抛——那会让日志调用本身在 except 块里炸掉，
+            # fail-closed 的归因随之丢失（同 outbound.safe_exc_text 的理由）。
+            detail = redact_exc_text(exc)
             logger.warning(
-                "[%s] tool boundary fail-closed: removing tools failed (%s); "
+                "[%s] tool boundary fail-closed: tool set read or removal failed (%s); "
                 "aborting proactive run",
                 PLUGIN_ID,
-                exc,
+                detail,
             )
             return False
         remaining = self._tool_list(req)

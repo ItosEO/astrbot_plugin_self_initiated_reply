@@ -132,7 +132,8 @@ omit = ["tests/*", "scripts/*"]
 fail_under = 89
 
 [tool.mypy]
-# 仓库目录名含连字符，mypy 无法按包发现：显式列出全生产源码文件，并忽略宿主
+# 仓库目录名含连字符，mypy 无法按包发现：显式列出生产源码文件（`__init__.py`
+# 只有一行 docstring、无可检查代码，故不在列），并忽略宿主
 # astrbot/quart 缺失 stub（宿主兼容层，不设 strict 门槛）。
 explicit_package_bases = true
 ignore_missing_imports = true

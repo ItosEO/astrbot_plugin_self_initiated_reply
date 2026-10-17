@@ -274,7 +274,12 @@ def test_system_hint_matches_tool_policy(tmp_path: Path) -> None:
 
 
 def test_cache_hit_does_not_rewrite_file(tmp_path: Path) -> None:
-    """内容寻址命中且未篡改时不得重写文件（digest 比较修复）。"""
+    """内容寻址命中且未篡改时不得重写文件（digest 比较修复）。
+
+    断言走 inode 而不是数 ``Path.write_bytes`` 调用：原子发布用
+    ``os.replace``，重写必然换 inode，缓存命中则保持原 inode。这样断言钉住的
+    是「有没有换文件」这个行为，与写入用了哪个 API 无关。
+    """
 
     image = _load_plugin_module("image")
     parser = image.ImageParser(object(), source_cache_dir=tmp_path / "image_cache")
@@ -284,21 +289,11 @@ def test_cache_hit_does_not_rewrite_file(tmp_path: Path) -> None:
     digest = hashlib.sha256(payload).hexdigest()
     target = tmp_path / "image_cache" / digest[:2] / f"{digest}.png"
 
-    writes: list[bytes] = []
-    original_write = Path.write_bytes
-
-    def counting_write_bytes(self, data):
-        writes.append(bytes(data))
-        return original_write(self, data)
-
-    Path.write_bytes = counting_write_bytes
-    try:
-        assert parser._materialize_data_url(data_url) is not None
-        assert parser._materialize_data_url(data_url) is not None
-        assert len(writes) == 1, f"命中缓存不得重写，实际写入 {len(writes)} 次"
-        assert target.read_bytes() == payload
-    finally:
-        Path.write_bytes = original_write
+    assert parser._materialize_data_url(data_url) is not None
+    first_inode = target.stat().st_ino
+    assert parser._materialize_data_url(data_url) is not None
+    assert target.stat().st_ino == first_inode, "命中缓存不得重写文件"
+    assert target.read_bytes() == payload
 
 
 def test_config_rollback_restores_sessions_and_locks(tmp_path: Path) -> None:
@@ -566,6 +561,8 @@ def test_rollback_reschedules_delayed_check(tmp_path: Path) -> None:
         )
         old_task = plugin._delay_tasks.get(UMO)
         assert old_task is not None and not old_task.cancelled()
+        # 快照代次：并发在途检查持有的就是它
+        baseline = plugin._gate.current(UMO)
 
         async def boom():
             raise OSError("disk full")
@@ -580,6 +577,49 @@ def test_rollback_reschedules_delayed_check(tmp_path: Path) -> None:
         assert new_task is not None
         assert new_task is not old_task
         assert not new_task.cancelled()
+        # 重建必须复用快照代次：advance 会让并发在途检查被判过期、回复被静默丢弃，
+        # 回滚于是部分抵消了自己刚恢复的代次。
+        assert plugin._gate.current(UMO) == baseline, "回滚重建延迟检查时推进了代次"
+        assert plugin._gate.is_current(UMO, baseline)
+
+    with_plugin(tmp_path, scenario)
+
+
+def test_rollback_restores_last_decisions(tmp_path: Path) -> None:
+    """回滚必须补回被白名单变更 pop 掉的「最近裁决」条目。
+
+    缺陷形态：快照没收 ``_last_decisions``，而白名单收缩经 ``_prune_session``
+    会 pop 掉非白名单会话的条目。回滚后 settings/sessions/coordinator/gate 全部
+    恢复，唯独裁决表不回填，``/selfreply status`` 的「最近裁决」静默退化成
+    「暂无记录」，直到该会话下一次检查。
+    """
+
+    import sys
+
+    async def scenario(plugin, main):
+        plugin.settings.whitelist = {UMO}
+        plugin._last_decisions[UMO] = {
+            "at": 1.0,
+            "trigger": "message_delay",
+            "should_reply": True,
+            "reason": "点名 Bot",
+        }
+        plugin._state_for(UMO)
+
+        async def boom():
+            raise OSError("disk full")
+
+        plugin._save_storage = boom
+        web = sys.modules["astrbot.api.web"]
+        # 白名单收缩到空：apply 阶段经 _prune_session pop 掉 UMO 的裁决条目
+        web.request.payload = {"whitelist_sessions": []}
+        result = await webapi_module(main)._api_post_config(plugin)
+        assert result.get("ok") is False
+
+        assert UMO in plugin._last_decisions, "回滚未补回被 pop 的裁决条目"
+        assert plugin._last_decisions[UMO]["reason"] == "点名 Bot"
+        # 容器身份不能被换掉：scheduler 与 pipeline 持同一个 dict 引用
+        assert plugin._scheduler._last_decisions is plugin._last_decisions
 
     with_plugin(tmp_path, scenario)
 
@@ -1162,6 +1202,62 @@ def test_check_command_waits_for_previous_run_release(tmp_path: Path) -> None:
     with_plugin(tmp_path, scenario)
 
 
+def test_check_command_force_cancels_in_flight_check(tmp_path: Path) -> None:
+    """``/selfreply check`` 必须 force-cancel 在途检查，不能留着它占运行标记。
+
+    缺陷形态：check 分支调 ``invalidate(umo)``（``force_cancel=False``）。
+    ``cancel_delay`` 的 keep_running 分支据此判定「运行中的检查不被新消息取消」，
+    在途检查于是活过整轮手动检查；而释放等待只有 2s，等不到一个正在跑 LLM 的
+    检查，本次手动检查撞「已有判断任务在运行」——在途那次已付费的 LLM 调用也
+    被白白浪费。docstring 与注释里写的都是 force_cancel=True，实现与契约不符。
+    """
+
+    async def scenario(plugin, main):
+        # 自足加载：本文件其余用例多数依赖文件内先跑某个用例把包装进
+        # sys.modules，单独跑会 KeyError。这里显式加载，单跑也成立。
+        _load_r3_modules()
+        commands = sys.modules[f"{PACKAGE_NAME_R3}.commands"]
+        event = make_event()
+        plugin.settings.whitelist = {UMO}
+        plugin.settings.min_silence_sec = 0
+        plugin._last_events[UMO] = event
+        plugin._last_event_at[UMO] = main.now_ts()
+        plugin._state_for(UMO).last_active_at = main.now_ts() - 300
+
+        entered = asyncio.Event()
+
+        async def in_flight_check() -> None:
+            entered.set()
+            await asyncio.sleep(30.0)
+
+        # 与 delayed_check 进入 _run_registered_check 后的表状态一致：同一个
+        # task 同时占延迟表与在途检查表，keep_running 分支才认得出它。
+        old = asyncio.ensure_future(in_flight_check())
+        plugin._delay_tasks[UMO] = old
+        plugin._running_check_tasks[UMO] = old
+        await entered.wait()
+
+        async def fake_check(umo, **_kwargs):
+            return "已执行"
+
+        plugin._pipeline.check_session = fake_check
+        try:
+            text = await commands.dispatch_command_action(plugin, event, "check")
+            # 必须在自行 cleanup 之前取：取消是异步投递的，但这一路已有多个
+            # await 点，任务此时应已真正收敛为 cancelled。
+            cancelled_by_check = old.cancelled() or old.cancelling() > 0
+        finally:
+            old.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await old
+
+        assert cancelled_by_check, "check 未 force-cancel 在途检查，运行标记不会让出"
+        assert "已执行" in text, f"在途检查挤掉了本次手动检查：{text}"
+        assert "已有判断任务在运行" not in text, f"手动检查自拒了：{text}"
+
+    with_plugin(tmp_path, scenario)
+
+
 # ============================================================================
 # 0.1 P0：run_task 孤儿泄漏
 # ============================================================================
@@ -1610,25 +1706,124 @@ def test_config_rollback_reschedules_cancelled_delayed_checks(tmp_path: Path) ->
 
     with_plugin(tmp_path, scenario)
 
-    with_plugin(tmp_path, scenario, enabled_patrol_trigger=True)
 
+def test_gate_restore_keeps_locks_held_during_the_apply_window(tmp_path: Path) -> None:
+    """回滚不得抹掉窗口内新起、此刻仍被持有的会话锁。
 
-def test_gate_restore_recovers_running_set(tmp_path: Path) -> None:
-    """restore 必须恢复运行集快照，否则回滚后运行标记漂移。
+    缺陷形态：``restore`` 对锁表做 clear+update，而窗口内新起的检查是用
+    ``lock_for`` 在快照**之后**创建的锁。整表恢复把它从表里抹掉，在途的
+    ``async with`` 仍持有那个对象；下一个检查会 ``setdefault`` 拿到一把新锁并
+    立刻获得，与在途检查并发——重复的模型调用、可能重复的发送。
 
-    变异锚定：session_gate.restore 删除 ``self._running_sessions = snap["running"]``
-    后本测试必须变红。
+    变异锚定：删掉 ``restore`` 里 held_locks 的并回逻辑，本用例红。
     """
 
     async def scenario(plugin, main):
         gate = plugin._gate
-        gate.mark_running(UMO)
-        snap = gate.snapshot()
-        gate.unmark_running(UMO)
-        gate.mark_running("other:session")
+        umo = "qq:GroupMessage:999"
+        snap = gate.snapshot()  # 此刻该会话还没有锁
+        assert umo not in snap["locks"]
+
+        held = gate.lock_for(umo)  # 窗口内新起的检查持有它
+        await held.acquire()
+        try:
+            gate.restore(snap)
+            assert gate.lock_for(umo) is held, "回滚抹掉了在途检查持有的锁：下一个检查会与它并发"
+            assert held.locked(), "在途检查的锁被恢复动作破坏了"
+        finally:
+            held.release()
+
+    with_plugin(tmp_path, scenario)
+
+
+def test_gate_restore_drops_running_marks_whose_check_already_exited(tmp_path: Path) -> None:
+    """回滚不得复活"检查已结束"的运行标记。
+
+    缺陷形态：``restore`` 照抄快照的 ``_running_sessions``。若在途检查在
+    快照之后、落盘失败之前正常结束（``unmark_running`` 已跑），照抄会把一个
+    无人认领的标记写回去。此后该会话被"已有判断任务在运行"永久拒绝：巡检每轮
+    静默跳过（无日志），消息路径每轮白等 600s 再丢弃，只有移除白名单或重载
+    插件才能恢复。
+
+    三种结束形态都要覆盖，因为它们走的是不同的判据：
+    - ``unmark_running`` 正常收尾：owner 随标记一起摘掉，靠"键不存在"排除；
+    - 漏销（持有标记的任务结束但没走 ``unmark_running``）：owner 仍在表里但
+      指向一个已 done 的任务，只有存活过滤能排除它。少了这一形态，把过滤整个
+      删掉也不会红——那正是本用例要防的漏洞。
+
+    与之相对的另一半：窗口内**新起**、此刻仍在跑的检查，其标记必须保留——
+    它不在快照里，照抄快照反而会抹掉它，导致与下一个检查并发。
+    """
+
+    async def scenario(plugin, main):
+        gate = plugin._gate
+        finished = "qq:GroupMessage:111"  # 正常走完 unmark_running
+        still_running = "qq:GroupMessage:222"  # 此刻仍在跑
+        leaked = "qq:GroupMessage:333"  # 任务结束但漏了 unmark_running
+
+        gate.mark_running(finished)
+        gate.mark_running(still_running)
+        started = asyncio.Event()
+
+        async def hold() -> None:
+            gate.mark_running(leaked)
+            started.set()
+            await asyncio.sleep(0)
+
+        holder = asyncio.create_task(hold())
+        await started.wait()
+        snap = gate.snapshot()  # 快照时三个都在跑
+        await holder  # holder 结束，但没走 unmark_running：标记与 owner 都还在
+
+        gate.unmark_running(finished)
         gate.restore(snap)
-        assert gate.is_running(UMO) is True
-        assert gate.is_running("other:session") is False
+
+        assert not gate.is_running(finished), "回滚复活了已结束检查的运行标记"
+        assert not gate.is_running(leaked), "回滚复活了漏销检查的标记：owner 已 done"
+        assert gate.is_running(still_running), "回滚抹掉了仍在跑检查的运行标记"
+
+    with_plugin(tmp_path, scenario)
+
+
+def test_gate_restore_reconciles_running_marks_with_live_owners(tmp_path: Path) -> None:
+    """回滚必须按 owner 存活推导运行集，两个方向都不得漂移。
+
+    运行标记是「某个在途任务正在跑」的租约，不是可回滚配置。apply 窗口里
+    白名单收缩的 prune 级联会把标记清掉，检查自己也会在窗口内正常结束——照抄
+    快照无法区分这两者：
+    - 照抄会把已结束检查的租约写回去，该会话从此被「已有判断任务在运行」
+      永久拒绝（巡检每轮静默跳过，消息路径每轮白等 600s 再丢弃）；
+    - 照抄也会抹掉窗口内新起、此刻仍在跑的检查，下一个检查就与它并发。
+
+    故以 ``_running_owners`` 的存活为准：prune 不摘 owner，``unmark_running``
+    随标记一起摘。
+
+    变异锚定：把 restore 的运行集推导换回 ``snap["running"]``（或删掉整段），
+    本测试红。
+    """
+
+    async def scenario(plugin, main):
+        gate = plugin._gate
+        still_running = "qq:GroupMessage:111"
+        finished = "qq:GroupMessage:222"
+
+        gate.mark_running(still_running)
+        gate.mark_running(finished)
+        snap = gate.snapshot()
+
+        # apply 窗口：白名单收缩的 prune 级联把两个标记都清掉（owner 不摘）
+        gate.prune(still_running)
+        gate.prune(finished)
+        assert not gate.is_running(still_running)
+        assert not gate.is_running(finished)
+
+        # finished 的检查在窗口内正常结束：unmark_running 连 owner 一起摘走
+        gate.unmark_running(finished)
+
+        gate.restore(snap)
+
+        assert gate.is_running(still_running), "仍在跑的检查，其运行标记必须被回滚恢复"
+        assert not gate.is_running(finished), "已结束检查的租约不得被回滚复活"
 
     with_plugin(tmp_path, scenario)
 
@@ -1636,10 +1831,11 @@ def test_gate_restore_recovers_running_set(tmp_path: Path) -> None:
 def test_gate_restore_clears_stale_release_for_still_running(tmp_path: Path) -> None:
     """回滚后仍标记运行中的会话：陈旧的 release set 必须清掉，事件身份必须不变。
 
-    ``unmark_running`` 只 set 不 pop，所以回滚把运行标记恢复成快照态后，表里
-    那个事件仍是已 set 的。此时 scheduler 的 ``while is_running: await
-    release_event(umo).wait()`` 每轮立即返回，紧密空转独占事件循环，整个 bot
-    卡死。
+    运行集按 owner 存活推导后，仍会被判成「运行中」的只剩一种会话：检查此刻
+    真的在跑。apply 窗口里白名单收缩的 prune 级联会连运行标记带 release 事件
+    一起摘掉，等待者随后重新挂起拿到一个新事件——若这个事件带着陈旧的 set，
+    scheduler 的 ``while is_running: await release_event(umo).wait()`` 每轮立即
+    返回，紧密空转独占事件循环，整个 bot 卡死。
 
     变异锚定：删除 ``restore`` 中的 ``release.clear()`` 分支后本测试必须变红。
     """
@@ -1647,14 +1843,20 @@ def test_gate_restore_clears_stale_release_for_still_running(tmp_path: Path) -> 
     async def scenario(plugin, main):
         gate = plugin._gate
         gate.mark_running(UMO)
-        waiter_event = gate.release_event(UMO)  # 等待者持有此对象
         snap = gate.snapshot()
-        gate.unmark_running(UMO)  # set 但不 pop
+
+        # apply 窗口：prune 级联把运行标记和 release 事件都摘掉
+        gate.prune(UMO)
+        assert not gate.is_running(UMO)
+
+        # 等待者在窗口内重新挂起，并留下一个陈旧的 set
+        waiter_event = gate.release_event(UMO)
+        waiter_event.set()
         assert waiter_event.is_set()
 
         gate.restore(snap)
 
-        assert gate.is_running(UMO) is True
+        assert gate.is_running(UMO), "仍在跑的检查，其运行标记必须被回滚恢复"
         assert gate.release_event(UMO) is waiter_event, "等待者持有的事件被换掉（孤儿事件）"
         assert not waiter_event.is_set(), "陈旧 set 未清除：scheduler 将空转饿死事件循环"
         with pytest.raises(asyncio.TimeoutError):
@@ -1666,19 +1868,35 @@ def test_gate_restore_clears_stale_release_for_still_running(tmp_path: Path) -> 
 def test_gate_restore_wakes_waiter_for_no_longer_running(tmp_path: Path) -> None:
     """回滚后不再运行的会话：等待者必须被唤醒，否则它等一个不会到来的信号。
 
+    构造方式刻意让 owner 是一个**已结束的任务**：持有运行标记的协程结束时没
+    走 ``unmark_running``，这正是运行标记泄漏的真实形态。此时推导必须判它
+    「不在跑」，并把等待者唤醒——留着这个标记，该会话从此被「已有判断任务在
+    运行」永久拒绝，主动回复静默死亡。
+
     变异锚定：删除 ``restore`` 中的 ``release.set()`` 分支后本测试必须变红。
     """
 
     async def scenario(plugin, main):
         gate = plugin._gate
         snap = gate.snapshot()  # 快照时该会话未运行
-        gate.mark_running(UMO)
+        started = asyncio.Event()
+
+        async def hold() -> None:
+            gate.mark_running(UMO)
+            started.set()
+            await asyncio.sleep(0)
+
+        holder = asyncio.create_task(hold())
+        await started.wait()
+        await holder  # 任务结束，但没走 unmark_running：标记与 owner 都还在
+        assert gate.is_running(UMO), "前提失效：holder 结束后标记应仍在（未 unmark）"
+
         waiter_event = gate.release_event(UMO)
         assert not waiter_event.is_set()
 
         gate.restore(snap)
 
-        assert gate.is_running(UMO) is False
+        assert gate.is_running(UMO) is False, "owner 已结束的标记不得被回滚复活"
         assert waiter_event.is_set(), "等待者未被唤醒：该会话主动回复静默死亡"
         await asyncio.wait_for(waiter_event.wait(), timeout=0.02)
 

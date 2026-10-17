@@ -99,15 +99,28 @@ class DecisionMaker:
 
         ``cancel()`` 是异步投递的，刚调用时 ``task.done()`` 必然为 False，
         故照 ``generation._graceful_stop`` 的形状给一个宽限窗口，只有宽限
-        耗尽仍未收敛（宿主 provider 吞掉 CancelledError）才交隔离登记。
+        耗尽仍未收敛（宿主 provider 吞掉 CancelledError）才交隔离登记；
+        宽限窗口内再次收到取消也隔离登记后原样重放，与 ``_graceful_stop``
+        的 ``except asyncio.CancelledError`` 分支同形。
         """
         task.cancel()
-        done, _ = await asyncio.wait({task}, timeout=DECISION_CONVERGE_GRACE_SEC)
+        try:
+            done, _ = await asyncio.wait({task}, timeout=DECISION_CONVERGE_GRACE_SEC)
+        except asyncio.CancelledError:
+            # 宽限窗口内又收到取消：``cancel()`` 已投递但没人等它收敛，宿主
+            # 吞掉 CancelledError 时即成零日志孤儿（真实 HTTP 请求挂在后台）。
+            # 隔离登记后原样重放，与 generation._graceful_stop 同口径。
+            self._quarantine_or_warn(task, reason)
+            raise
         if done or task.done():
             # 宽限窗口内收敛的任务：吃掉以异常收尾者的异常，避免任务回收时
             # 以无归属的循环级 ERROR 出现（generation 侧同语义）。
             consume_task_result(task)
             return
+        self._quarantine_or_warn(task, reason)
+
+    def _quarantine_or_warn(self, task: asyncio.Task[Any], reason: str) -> None:
+        """未收敛 provider 任务的唯一收口：能隔离就隔离，不能就留痕。"""
         if self._quarantine_task is not None:
             self._quarantine_task(task, reason)
             return
@@ -275,9 +288,11 @@ class DecisionMaker:
         # 会话锁与运行标记永不释放。wait 只等待、不含取消语义，未收敛的任务
         # 交隔离登记（同款取舍见 generation._graceful_stop）。
         task = asyncio.ensure_future(self._llm_generate(provider_id, prompt))
+        converged = False
         try:
             done, _ = await asyncio.wait({task}, timeout=self.settings.decision_timeout_sec)
             if not done:
+                converged = True
                 await self._converge_provider_task(task, "decision model timeout")
                 return {
                     "should_reply": False,
@@ -286,8 +301,11 @@ class DecisionMaker:
                 }
             response = task.result()
         except asyncio.CancelledError:
-            # wait 不把调用方的取消传给内层，必须自己传。
-            await self._converge_provider_task(task, "decision cancelled")
+            # wait 不把调用方的取消传给内层，必须自己传。已收敛过时（超时路径的
+            # 宽限窗口内又收到取消）_converge_provider_task 已隔离登记并原样重放，
+            # 再收敛一次只是再等一个完整宽限窗口，白拖关停时间。
+            if not converged:
+                await self._converge_provider_task(task, "decision cancelled")
             raise
         except Exception as exc:
             # 异常文本常带请求 URL（含凭证），reason 会经 GET /status 出网，
@@ -343,18 +361,27 @@ class DecisionMaker:
             "session": sanitize_prompt_variable(umo, max_length=200),
             "trigger": sanitize_prompt_variable(trigger, max_length=50),
             "bot_aliases": sanitize_prompt_variable(aliases, max_length=200),
-            "last_message_age_sec": str(int(state.age_sec(self._clock()))),
+            # 年龄钳到非负：``as_timestamp`` 允许 persisted 时间戳超前
+            # now + MAX_CLOCK_SKEW_SEC，手工编辑过的 state.json 会算出负年龄，
+            # 提示词里出现 "-300" 只会让判断模型困惑（local_gate 已对同一
+            # 输入类做 max(0, …)，这里补同一道）。
+            "last_message_age_sec": str(max(0, int(state.age_sec(self._clock())))),
             "last_reply_age_sec": str(
-                int(self._clock() - state.last_proactive_at) if state.last_proactive_at else -1
+                max(0, int(self._clock() - state.last_proactive_at))
+                if state.last_proactive_at
+                else -1
             ),
             "latest_message": sanitize_prompt_variable(latest, max_length=500),
             # recent_messages 是多行聊天记录：保留换行才能区分发言人与轮次；
             # 超预算时保尾（不能用 sanitize 自带的保头截断，那会先丢最新几条，
             # 与模板「优先参考最近至少 8 条」的要求相反）。
-            "recent_messages": cap_context_text(
-                sanitize_prompt_variable(recent, max_length=None, allow_newlines=True),
-                MAX_DECISION_CONTEXT_CHARS,
-                marker=CONTEXT_CAP_MARKER,
+            # 顺序必须是「先截断、后净化」：sanitize 的逐字符过滤是 O(历史总字节)
+            # 且同步跑在事件循环上，反序会让一条超大消息把整条决策链卡住
+            # （实测 20MB 历史 ≈ 2.1s）。截断先把它压到 2000 字预算内。
+            "recent_messages": sanitize_prompt_variable(
+                cap_context_text(recent, MAX_DECISION_CONTEXT_CHARS, marker=CONTEXT_CAP_MARKER),
+                max_length=None,
+                allow_newlines=True,
             ),
         }
         # 回落取 ``ConfigSpec.reset_value``：与读侧落盘、面板「恢复默认」同一表达式。

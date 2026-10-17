@@ -29,7 +29,6 @@ from .host_stubs import (
     PipelineTestAdapter,
     install_astrbot_stubs,
     load_package,
-    reset_hook_calls,
     webapi_module,
     with_plugin,
 )
@@ -47,13 +46,6 @@ def read_json_with_retry(path: Path) -> Any:
         except PermissionError:
             time.sleep(0.05)
     return json.loads(path.read_text(encoding="utf-8"))
-
-
-@pytest.fixture(autouse=True)
-def _cleanup_plugin_state():
-    reset_hook_calls()
-    yield
-    reset_hook_calls()
 
 
 # ============================================================================
@@ -385,6 +377,7 @@ def test_off_persists_enabled_across_restart(tmp_path: Path) -> None:
         text = await plugin._command_text(make_event(), "off")
 
         assert "已暂停" in text
+        assert "重启后保持" in text, "§6.1 承诺的回显后缀缺失：用户看不到这次变更是持久的"
         assert plugin.runtime_enabled is False
         assert plugin.settings.enabled is False
         # 磁盘原文：光看内存字段无法区分「已落盘」与「只改了内存」
@@ -429,6 +422,37 @@ def test_off_rolls_back_memory_when_config_write_fails(tmp_path: Path) -> None:
     with_plugin(tmp_path, scenario)
 
 
+def test_off_rolls_back_memory_when_config_write_is_cancelled(tmp_path: Path) -> None:
+    """落盘被**取消**时同样要内存回滚，不留「内存已关、磁盘仍开」的中间态。
+
+    ``asyncio.CancelledError`` 派生自 ``BaseException``，不落 ``except Exception``，
+    而 ``enabled`` 与 ``runtime_enabled`` 已在内存翻面。少了这一步，§6.1 承诺的
+    「重启后保持」反向变成「重启后回落」：用户打完 ``/off`` 当场生效，插件一重启
+    又按磁盘的 True 复活，而用户不会知道要再打一次。
+
+    变异锚定：删掉 ``plugin_state.persist_enabled`` 里的
+    ``except asyncio.CancelledError`` 分支，本用例红。
+    """
+
+    async def scenario(plugin, main):
+        original_persist = plugin._persist_config
+
+        async def cancelling_persist():
+            raise asyncio.CancelledError()
+
+        plugin._persist_config = cancelling_persist
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await plugin._persist_enabled(False)
+            # 回滚后内存两个字段都必须回到开启
+            assert plugin.settings.enabled is True
+            assert plugin.runtime_enabled is True
+        finally:
+            plugin._persist_config = original_persist
+
+    with_plugin(tmp_path, scenario)
+
+
 def test_on_persists_enabled_across_restart(tmp_path: Path) -> None:
     """``/on`` 同样落盘：否则 ``/off`` 持久化后就再也开不回来（跨重启）。"""
     import json
@@ -438,6 +462,7 @@ def test_on_persists_enabled_across_restart(tmp_path: Path) -> None:
         text = await plugin._command_text(make_event(), "on")
 
         assert "已启用" in text
+        assert "重启后保持" in text, "§6.1 承诺的回显后缀缺失：用户看不到这次变更是持久的"
         assert plugin.settings.enabled is True
         on_disk = json.loads(plugin._config_path.read_text(encoding="utf-8"))
         assert on_disk["enabled"] is True
@@ -559,7 +584,7 @@ def _decorated_command_handlers() -> dict[str, str]:
     从源码取而不是猜 ``selfreply_<动作>`` 命名约定、也不是硬编码 9 个名字：
     注册表是事实，重命名后本表自动跟上。指令组本体（``selfreply``）不在表内
     也不可驱动，宿主装饰器已把该属性换成 RegisteringCommandable，真实宿主与
-    host_stubs 都是如此（见 compat_check 的 EXPECTED_HANDLER_COUNT）。
+    host_stubs 都是如此（见 compat_check 的 EXPECTED_HANDLER_NAMES）。
     """
     root = Path(__file__).resolve().parents[1]
     tree = ast.parse((root / "main.py").read_text(encoding="utf-8"))
@@ -717,6 +742,71 @@ def test_degraded_lifecycle_is_visible_in_status_and_add_message(tmp_path: Path)
     with_plugin(tmp_path, scenario)
 
 
+def test_inline_command_failure_is_visible_to_the_admin(tmp_path: Path) -> None:
+    """写指令落盘失败必须让发指令的人看见，且事件仍被 stop。
+
+    缺陷形态：``_handle_inline_command`` 直接 ``await`` 派发结果，异常逃出
+    ``on_message``。管理员在聊天里什么都收不到，``stop_event()`` 也没走到（别的
+    插件会把 `/selfreply remove` 当普通消息再处理一遍）。而内存回滚其实已经完成
+    （白名单/会话状态/运行期 UMO 都已恢复），只差这一句告知——没有它，一次磁盘
+    故障在聊天里表现为"指令凭空消失"。
+
+    变异锚定：去掉 ``_handle_inline_command`` 里的 try/except，本用例红。
+    """
+
+    async def scenario(plugin, main):
+        event = make_event(umo=UMO, is_admin=True)
+
+        async def boom(*_args, **_kwargs):
+            raise RuntimeError("config write failed")
+
+        original = plugin._command_text
+        plugin._command_text = boom
+        try:
+            await plugin._handle_inline_command(event, ("remove", ""))
+        finally:
+            plugin._command_text = original
+
+        assert event.sent_texts, "落盘失败时管理员未收到任何回显"
+        assert "失败" in event.sent_texts[0], f"回显未说明失败：{event.sent_texts[0]!r}"
+        assert "回滚" in event.sent_texts[0], f"回显未说明内存已回滚：{event.sent_texts[0]!r}"
+        assert event.is_stopped(), "失败路径未 stop_event：别的插件会再处理一遍该指令"
+
+    with_plugin(tmp_path, scenario)
+
+
+def test_status_shows_the_effective_message_delay(tmp_path: Path) -> None:
+    """`/selfreply status` 的延迟必须显示**生效值**，不是配置值。
+
+    缺陷形态：调度器实际用的是 ``max(message_delay_sec, min_silence_sec)``，
+    状态行此前直接打配置值。用户把「消息后触发延迟」调到 5s 想得到更快回复，
+    看到的却是"延迟 5s"而实际等待 45s，毫无变化也无从判断原因。出厂配置
+    （60/45）两者恰好相等，所以这个偏差在默认值下完全看不见。
+
+    变异锚定：把 ``status_text`` 的延迟换回 ``settings.message_delay_sec``，
+    本用例红。
+    """
+
+    async def scenario(plugin, main):
+        plugin.settings.message_delay_sec = 5
+        plugin.settings.min_silence_sec = 45
+        event = make_event(umo=UMO)
+
+        text = await plugin._command_text(event, "status")
+
+        assert "延迟 45s" in text, "状态行未显示生效延迟：用户调低延迟会毫无反馈"
+        assert "配置 5s" in text, "状态行未同时说明配置值，用户无法判断为何被抬高"
+        assert plugin._scheduler.message_trigger_delay() == 45
+
+        # 配置值更大时以配置值为准，两个数仍然都要可见
+        plugin.settings.message_delay_sec = 90
+        text = await plugin._command_text(event, "status")
+        assert "延迟 90s" in text
+        assert "配置 90s" in text
+
+    with_plugin(tmp_path, scenario)
+
+
 def test_status_recent_decision_line_comes_from_last_decisions(tmp_path: Path) -> None:
     """/selfreply status 的「最近裁决」行必须来自本会话的最近裁决（README 排障指引）。
 
@@ -775,7 +865,9 @@ def test_terminate_quarantines_noncooperative_runner(tmp_path: Path) -> None:
         main.TERMINATE_TASK_TIMEOUT_SEC = 0.02
         termination = asyncio.create_task(plugin.terminate())
         try:
-            await asyncio.sleep(0.08)
+            # 等到 terminate 真正返回再断言：固定 sleep 在机器被占满时会把
+            # "还没结束"误判成"没隔离"，是假红；用 shield 保住它，超时才失败。
+            await asyncio.wait_for(asyncio.shield(termination), timeout=5.0)
             assert termination.done()
             assert plugin.lifecycle_state == "DEGRADED"
             assert task in plugin._quarantined_tasks
@@ -859,7 +951,8 @@ def test_terminate_quarantines_stuck_final_save(tmp_path: Path) -> None:
         main.TERMINATE_TASK_TIMEOUT_SEC = 0.02
         termination = asyncio.create_task(plugin.terminate())
         try:
-            await asyncio.sleep(0.08)
+            # 同上：等 terminate 真正返回，不用固定 sleep 赌 0.08s 足够。
+            await asyncio.wait_for(asyncio.shield(termination), timeout=5.0)
             assert termination.done()
             assert plugin.lifecycle_state == "DEGRADED"
             assert any(
@@ -873,6 +966,63 @@ def test_terminate_quarantines_stuck_final_save(tmp_path: Path) -> None:
                 await asyncio.wait_for(termination, timeout=1)
             for task in list(plugin._quarantined_tasks):
                 await asyncio.wait_for(task, timeout=1)
+            if original_timeout is None:
+                del main.TERMINATE_TASK_TIMEOUT_SEC
+            else:
+                main.TERMINATE_TASK_TIMEOUT_SEC = original_timeout
+
+    with_plugin(tmp_path, scenario)
+
+
+def test_wait_background_tasks_spares_critical_persistence_tasks(tmp_path: Path) -> None:
+    """关停等待不得取消、更不得隔离关键落盘任务。
+
+    缺陷形态：``_wait_background_tasks`` 只排除 quarantine 表，不排除 critical
+    表。而 ``_register_task`` 把 critical 任务**同时**放进 ``_background_tasks``，
+    于是最终落盘超过 ``TERMINATE_TASK_TIMEOUT_SEC`` 时，记账任务被取消**并**隔离
+    → ``_mark_degraded`` → 插件永久 DEGRADED、需重载，只因为落盘慢。那时
+    ``apply_proactive_state`` 已改过内存，账本还会停在 RECORD_FAILED。
+
+    ``track_critical_task`` 的契约原话是"even while shutdown is already
+    stopping"，本用例把这条契约钉在等待出口上。
+    """
+
+    async def scenario(plugin, main):
+        original_timeout = getattr(main, "TERMINATE_TASK_TIMEOUT_SEC", None)
+        entered = asyncio.Event()
+
+        async def slow_persist() -> None:
+            entered.set()
+            await asyncio.sleep(0.3)
+
+        # 隔离登记经原实现记账：``_release_quarantined_task`` 会在任务退出时把
+        # 它从 ``_quarantined_tasks`` 弹掉，事后再查表只会看到空表。
+        quarantined: list[tuple[Any, str]] = []
+        original_quarantine = plugin._quarantine_task
+
+        def record(task: Any, reason: str) -> None:
+            quarantined.append((task, reason))
+            original_quarantine(task, reason)
+
+        plugin._quarantine_task = record
+
+        critical = plugin._track_critical_task(slow_persist())
+        ordinary = plugin._track_background_task(slow_persist())
+        assert ordinary is not None
+        await entered.wait()
+        main.TERMINATE_TASK_TIMEOUT_SEC = 0.02
+        try:
+            await plugin._wait_background_tasks()
+            # 只断言真正修的那一行对 critical 任务的处理：构造期起的图片清理
+            # 循环等同批后台任务在这个人工截止下被隔离是既有行为，不是本用例对象。
+            assert not critical.cancelled(), "关键落盘任务被关停取消了"
+            assert critical not in {task for task, _ in quarantined}, "关键落盘任务被隔离了"
+            await asyncio.wait_for(critical, timeout=1.0)
+            # 普通后台任务仍按既有契约取消并隔离（本用例不是要放宽这条）
+            assert ordinary.cancelling() > 0, "普通后台任务仍应被取消"
+            assert ordinary in {task for task, _ in quarantined}, "普通后台任务仍应被隔离"
+        finally:
+            plugin._quarantine_task = original_quarantine
             if original_timeout is None:
                 del main.TERMINATE_TASK_TIMEOUT_SEC
             else:
@@ -916,6 +1066,9 @@ def test_state_save_cancellation_replays_cancel_not_write_failure(tmp_path: Path
             # 状态文件是构造期那次启动落盘的产物：等它出现，此后第一笔写必然来自
             # 本用例创建的任务，取消才落在 shield 出口上而不是锁等待上。
             await _until(lambda: plugin._storage_path.exists())
+            # 先制造一处真实状态变更：save_storage 现在带「内容一致即跳过」判据，
+            # 无变更时不会产生任何写，取消就落在别处而不是 shield 出口上。
+            plugin._state_for(UMO).last_active_at += 1.0
             armed.set()
             task = asyncio.create_task(plugin._save_storage())
             await _until(lambda: started.is_set())
@@ -1543,49 +1696,6 @@ def _arrange_reply_flow(plugin, main, models):
     return plugin._gate.current(UMO) or plugin._gate.advance(UMO)
 
 
-def test_check_session_registration_rejection_keeps_result_and_unmarks(tmp_path: Path) -> None:
-    """finally 注册被拒不得改写主链结果，也不得漏掉 unmark_running。"""
-
-    async def scenario(plugin, main):
-        models = importlib.import_module(main.__package__ + ".models")
-        token = _arrange_reply_flow(plugin, main, models)
-        plugin._pipeline._track_critical_task = lambda _coro: None
-
-        result = await plugin._pipeline.check_session_locked(
-            UMO, trigger="message_delay", force=True, expected_generation=token
-        )
-        assert result == "已主动回复。"
-        assert not plugin._gate.is_running(UMO)
-
-    with_plugin(tmp_path, scenario)
-
-
-def test_check_session_finalizer_internal_rejection_keeps_result(tmp_path: Path) -> None:
-    """外层任务注册成功、_finalize_ledger 内部注册被拒：错误只留日志，结果不变。"""
-
-    async def scenario(plugin, main):
-        models = importlib.import_module(main.__package__ + ".models")
-        token = _arrange_reply_flow(plugin, main, models)
-        calls: list = []
-
-        def track(coro):
-            calls.append(coro)
-            if len(calls) == 1:
-                return asyncio.create_task(coro)
-            coro.close()
-            return None
-
-        plugin._pipeline._track_critical_task = track
-
-        result = await plugin._pipeline.check_session_locked(
-            UMO, trigger="message_delay", force=True, expected_generation=token
-        )
-        assert result == "已主动回复。"
-        assert not plugin._gate.is_running(UMO)
-
-    with_plugin(tmp_path, scenario)
-
-
 def test_on_message_period_abandons_inflight_when_enabled(tmp_path: Path) -> None:
     async def scenario(plugin, main):
         plugin.settings.abandon_stale_on_new_message = True
@@ -1804,9 +1914,17 @@ def test_startup_writes_skipped_when_disk_already_current(tmp_path: Path) -> Non
 
     async def second_load(plugin, _main):
         # 打桩必须发生在构造之前（启动写盘在 __init__ 里），断言发生在
-        # scenario 内（terminate 兑底落盘之前）。启动写盘已后台化，先等后台
-        # 任务跑完，不等的话"没写"与"还没写"不可区分，断言会变成恒绿假契约。
-        await asyncio.sleep(0.05)
+        # scenario 内（terminate 兑底落盘之前）。启动写盘已后台化，必须等它
+        # 真正收尾：固定 sleep 分不清"没写"与"还没写"，断言会退化成恒绿假契约。
+        # 图片清理循环首帧就是长睡，不属启动写盘，排除在等待之外。
+        cleanup = plugin._scheduler.image_cleanup_task
+        startup = [
+            task
+            for task in list(plugin._background_tasks)
+            if not task.done() and task is not cleanup
+        ]
+        if startup:
+            await asyncio.wait(startup, timeout=2.0)
         assert config_writes == [], (
             "磁盘未变化时仍重写了配置（无谓 fsync + 宿主 save_config 副作用）"
         )

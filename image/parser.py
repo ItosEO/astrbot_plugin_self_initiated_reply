@@ -77,6 +77,12 @@ _UNABLE_PATTERNS = re.compile(
 _UNABLE_RESIDUAL_MIN_LENGTH = 10
 # HTTP 状态码 >= 该值即视为下载失败（图片 URL 通常是 302 后的 CDN，4xx/5xx 一律放弃）。
 _HTTP_ERROR_STATUS_MIN = 400
+# 增量哈希的分块大小：内容寻址缓存的完整性复核不该付第二份载荷的内存。
+_HASH_CHUNK_BYTES = 1 << 16
+# NAT64 知名前缀：64:ff9b::/96 内的 IPv4 地址在 ipaddress 里 is_global 为 True，
+# 但主机真把该前缀路由给翻译器时，::ffff:7f00:1 就是可达的环回。地址判据单点收口
+# 在 _is_safe_public_address，传输层与预检共用。
+_NAT64_NETWORK = ipaddress.ip_network("64:ff9b::/96")
 
 _CacheEntry = tuple[float, Path, int, Path]
 
@@ -145,16 +151,22 @@ def _remove_expired_cache_files(
 
 
 def _remove_over_quota_cache_files(
-    files: list[_CacheEntry], protected: set[Path], quota: int | None
+    files: list[_CacheEntry], protected: set[Path], quota: int | None, *, not_before: float
 ) -> int:
     if quota is None:
         return 0
     removed = 0
     total_bytes = sum(size for _, _, size, _ in files)
-    for _, path, size, resolved in sorted(files, key=lambda item: item[0]):
+    for mtime, path, size, resolved in sorted(files, key=lambda item: item[0]):
         if total_bytes <= quota:
             break
         if resolved in protected:
+            continue
+        if mtime > not_before:
+            # 清理起点之后写入的文件不在 protected 快照里——受保护源集合是调用方
+            # 在 await to_thread 之前算的，这期间刚冻结的图还没进集合。超配额时
+            # 按 mtime 升序会一路跳过受保护的老文件，最终删掉这个最新的活文件；
+            # 而 prepared_source 已固化，parse 不会重新冻结，该图从此静默消失。
             continue
         try:
             path.unlink()
@@ -184,28 +196,87 @@ def _remove_empty_cache_directories(directories: list[Path], resolved_root: Path
             pass
 
 
+def _hash_file(path: Path) -> str:
+    """增量 sha256：内容寻址缓存的完整性复核不该付第二份载荷的内存。"""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(_HASH_CHUNK_BYTES), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _atomic_write(path: Path, content: bytes) -> None:
     """Write bytes beside the target and publish them with one replacement."""
     temporary_path: Path | None = None
+    descriptor: int | None = None
     try:
         descriptor, temporary_name = tempfile.mkstemp(
             dir=path.parent,
             prefix=f".{path.name}.",
             suffix=".tmp",
         )
-        os.close(descriptor)
         temporary_path = Path(temporary_name)
-        temporary_path.write_bytes(content)
-        with temporary_path.open("rb+") as temporary:
-            os.fsync(temporary.fileno())
+        # 写已持有的描述符，不按名字重开：重开是经典的 reopen-after-close
+        # TOCTOU，期间在该随机名上植一个 symlink 就能把内容改道。
+        # 必须循环：os.write 允许短写（POSIX 明文许可，大载荷+信号即可触发），
+        # 少写的那截会被 os.replace 原样发布出去。
+        view = memoryview(content)
+        while view:
+            view = view[os.write(descriptor, view) :]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
         os.replace(temporary_path, path)
         temporary_path = None
+        # replace 之后补一次目录 fsync：否则掉电时数据块已落盘而 rename 丢失，
+        # "原子发布"只对并发读成立、对持久化不成立（契约 §8）。
+        # Windows 打不开目录（CRT 需要 FILE_FLAG_BACKUP_SEMANTICS），那里只能
+        # 依赖 NTFS 日志覆盖 rename 的持久性；打不开与 fsync 失败都按尽力而为
+        # 处理——文件已经发布成功，让它退化成"少一层持久性保证"而不是整张图被丢。
+        try:
+            dir_fd = os.open(path.parent, getattr(os, "O_DIRECTORY", os.O_RDONLY))
+        except OSError:
+            return
+        try:
+            os.fsync(dir_fd)
+        except OSError:
+            pass
+        finally:
+            os.close(dir_fd)
     finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         if temporary_path is not None:
             try:
                 temporary_path.unlink()
             except OSError:
                 pass
+
+
+def _is_safe_public_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Return whether an address is both globally routable and not a special-use range.
+
+    ``is_global`` alone is not the whole SSRF story: ``ipaddress`` leaves
+    multicast (224.0.0.0/4, ff00::/8) and the well-known NAT64 prefix
+    (64:ff9b::/96) marked global, and a NAT64-mapped loopback is exactly the
+    "public-looking" address that reaches an internal service. The remaining
+    flags are belt-and-braces so a future CPython change to ``is_global``
+    cannot silently widen the gate.
+    """
+    if address in _NAT64_NETWORK:
+        return False
+    return bool(
+        address.is_global
+        and not address.is_multicast
+        and not address.is_reserved
+        and not address.is_link_local
+        and not address.is_loopback
+        and not address.is_private
+        and not address.is_unspecified
+    )
 
 
 def _global_addresses(host: str) -> list[str]:
@@ -226,13 +297,13 @@ def _global_addresses(host: str) -> list[str]:
         if not addresses:
             return []
         parsed = [ipaddress.ip_address(address) for address in addresses]
-        if not all(address.is_global for address in parsed):
+        if not all(_is_safe_public_address(address) for address in parsed):
             return []
         # IPv4 优先、组内按字符串稳定排序：纯字符串排序会把双栈域名的 IPv6
         # 顶到首位，而运行主机 v6 无路由时调用方只连第一个地址，等于整站下载
         # 恒失败。不轮询下一地址：每次下载只 pin 一个已校验地址。
         return [str(ip) for ip in sorted(parsed, key=lambda ip: (ip.version, str(ip)))]
-    return [str(literal)] if literal.is_global else []
+    return [str(literal)] if _is_safe_public_address(literal) else []
 
 
 def _resolve_global_address(host: str) -> str | None:
@@ -346,7 +417,7 @@ class _FixedAddressTransport(httpx.AsyncBaseTransport):
             checked_address = ipaddress.ip_address(str(address))
         except ValueError:
             checked_address = None
-        if checked_address is None or not checked_address.is_global:
+        if checked_address is None or not _is_safe_public_address(checked_address):
             raise _ImageAddressBlocked(f"拒绝连接非公网主机: {host}")
 
         pool = httpcore.AsyncConnectionPool(
@@ -406,6 +477,10 @@ class ImageParser:
         self._bridge = bridge
         self._provider_id = str(provider_id or "").strip()
         self._recorder_bridge = recorder_bridge
+        # 描述 LRU 的条目数上限：与字节预算（MAX_IMAGE_DESCRIPTION_CACHE_BYTES）
+        # 并列。50 条的取值理由是「一个会话的近期图片索引上限是
+        # MAX_CACHED_IMAGE_EVENTS × vision_max_images，同一张图的重复解析在
+        # 一轮检查内必然撞上；条目上限只防不同图把 key 撑爆，不参与淘汰顺序」。
         self._cache = ImageCache(
             max_size=50,
             max_bytes=MAX_IMAGE_DESCRIPTION_CACHE_BYTES,
@@ -469,7 +544,8 @@ class ImageParser:
                 logger.debug("[%s] image frozen as in-memory data URL", PLUGIN_ID)
             return True
         except Exception as exc:
-            logger.warning("[%s] image capture failed: %s", PLUGIN_ID, exc)
+            # 脱敏后进日志：这条路径覆盖远程下载，异常文本常带签名 URL。
+            logger.warning("[%s] image capture failed: %s", PLUGIN_ID, redact_exc_text(exc))
             return False
 
     @staticmethod
@@ -636,7 +712,10 @@ class ImageParser:
         if not cache_root.is_dir():
             return 0
         # 保留窗口的下限夹取在 scheduler._image_age_sec，此处只按传入值执行。
-        cutoff = (time.time() if now is None else now) - max_age_sec
+        # 清理起点同时是两道闸的共同边界：晚于它写入的文件既不算过期，也不算
+        # 可驱逐（见 _remove_over_quota_cache_files 的 not_before）。
+        snapshot_now = time.time() if now is None else now
+        cutoff = snapshot_now - max_age_sec
 
         resolved_root = cache_root.resolve()
         protected = _resolve_protected_cache_sources(resolved_root, protected_sources)
@@ -644,7 +723,9 @@ class ImageParser:
         files, directories = _scan_source_cache(cache_root, resolved_root)
         removed, survivors = _remove_expired_cache_files(files, protected, cutoff)
 
-        removed += _remove_over_quota_cache_files(survivors, protected, max_total_bytes)
+        removed += _remove_over_quota_cache_files(
+            survivors, protected, max_total_bytes, not_before=snapshot_now
+        )
         _remove_empty_cache_directories(directories, resolved_root)
         return removed
 
@@ -705,6 +786,9 @@ class ImageParser:
                 data_url = await self._fetch_image_data_url(file_value)
                 if data_url:
                     return data_url
+                # 网络故障记 INFO；地址策略拒绝已由
+                # _download_image_data_url 自己记 WARNING（契约 §9）。
+                # 两者分级的原因是否则第一种会把第二种淹没。
                 logger.info("[%s] image URL download failed: %s", PLUGIN_ID, redact_url(file_value))
             path = Path(file_value)
             # 本地路径一律走 allowlist：trusted_local_path 是提取层的推断值，
@@ -721,6 +805,7 @@ class ImageParser:
             data_url = await self._fetch_image_data_url(image_info.url)
             if data_url:
                 return data_url
+            # 同上：网络故障 INFO，策略拒绝已自行 WARNING。
             logger.info("[%s] image URL download failed: %s", PLUGIN_ID, redact_url(image_info.url))
         return None
 
@@ -743,9 +828,23 @@ class ImageParser:
         root = self._source_cache_dir
         if root is None:
             return None
-        target = root / digest[:2] / f"{digest}{extension}"
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
+            # 归属校验必须先于 mkdir：`root/<digest[:2]>` 是目录，被换成
+            # 目录 symlink / Windows junction 时 mkdir(exist_ok=True) 会静默
+            # 成功（os.mkdir 抛 FileExistsError，exist_ok 吞掉；is_dir() 跟随
+            # 链接返回 True），后续写入就落在 image_cache 之外——而 _scan_source_cache
+            # 按 resolved.relative_to(root) 过滤，逃逸文件从此既不计入配额也永不
+            # 被回收。判据与清理扫描同一表达式。
+            shard = root / digest[:2]
+            resolved_root = root.resolve()
+            resolved_shard = shard.resolve()
+            resolved_shard.relative_to(resolved_root)
+            shard.mkdir(parents=True, exist_ok=True)
+        except (OSError, ValueError):
+            logger.debug("[%s] image cache shard unavailable: %s", PLUGIN_ID, digest[:2])
+            return None
+        target = shard / f"{digest}{extension}"
+        try:
             # exists() 对断开的 symlink 返回 False；先单独拒绝 symlink，
             # 避免 write_bytes 跟随链接把内容写出 image_cache。
             if target.is_symlink():
@@ -755,8 +854,9 @@ class ImageParser:
                     return None
                 # 内容寻址的完整性前提是"文件内容 = 文件名 hash"：
                 # 同大小内容被外部替换时重算哈希兜底，不符即原子重写。
+                # 增量哈希而非 read_bytes：否则一次缓存命中要付两份载荷的内存。
                 needs_write = target.stat().st_size != len(content) or (
-                    hashlib.sha256(target.read_bytes()).hexdigest() != digest
+                    _hash_file(target) != digest
                 )
             else:
                 needs_write = True
@@ -786,6 +886,20 @@ class ImageParser:
         except (OSError, RuntimeError, ValueError):
             return None
 
+    @staticmethod
+    def _warn_policy_refusal(url: str, reason: str) -> None:
+        """地址策略拒绝的统一出口：WARNING + 脱敏 URL。
+
+        与网络故障的 INFO 分开（契约 §9）。URL 必须脱敏：它是聊天里出现的远端
+        地址，query 可能带签名凭证，而这条日志要能给运维看。
+        """
+        logger.warning(
+            "[%s] image download refused by address policy (%s): %s",
+            PLUGIN_ID,
+            reason,
+            redact_url(url),
+        )
+
     async def _fetch_image_data_url(self, url: str) -> str | None:
         """下载远程图片；整个下载（DNS+连接+读取）受单图超时约束，超限返回 None。
 
@@ -805,17 +919,25 @@ class ImageParser:
 
         安全约束（每条都是拒绝理由）：固定地址传输（每跳重新解析并绑定公网 IP）、
         TLS 证书验证、重定向上限 3 跳、体积双重设限（content-length 先看，
-        流式读取再累计校验）、MIME 由载荷嗅探决定。失败时全部静默返回 ``None``
-        （语义是"这张图不可用"不是"出错了"）；地址策略拒绝记 WARNING，其余记 DEBUG。
+        流式读取再累计校验）、MIME 由载荷嗅探决定。
+
+        日志分级（契约 §9）：**地址策略**拒绝记 WARNING——它说明有对端在敲被拦的
+        门（私网、非白名单端口、逐跳重解析后落回内网），运维必须看得见；网络故障
+        记 INFO。此前这三处预检是裸 ``return None``，一条日志都没有，而唯一那条
+        WARNING 在传输层、被预检挡在前面根本走不到，于是策略拒绝与网络故障在日志里
+        完全同形，§9 想保住的那个信号实际是丢的。
         """
         try:
             parsed = urlparse(url)
             if parsed.scheme not in HTTP_SCHEMES or not parsed.hostname:
+                self._warn_policy_refusal(url, "scheme not allowed")
                 return None
             if parsed.port is not None and parsed.port not in ALLOWED_IMAGE_PORTS:
+                self._warn_policy_refusal(url, f"port {parsed.port} not in allowlist")
                 return None
             address = await asyncio.to_thread(_resolve_global_address, parsed.hostname)
             if not address:
+                self._warn_policy_refusal(url, "no global address for host")
                 return None
             transport = _FixedAddressTransport(address=address)
             async with httpx.AsyncClient(

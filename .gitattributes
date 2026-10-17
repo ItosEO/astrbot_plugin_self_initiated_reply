@@ -10,6 +10,9 @@ data/ export-ignore
 node_modules/ export-ignore
 package.json export-ignore
 package-lock.json export-ignore
+# 构建配置：AstrBot 插件加载只读 metadata.yaml，pyproject 与 wheel 的 exclude
+# 列表同属开发侧，不进部署包。
+pyproject.toml export-ignore
 playwright.config.mjs export-ignore
 uv.lock export-ignore
 .editorconfig export-ignore

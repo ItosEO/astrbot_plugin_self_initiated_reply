@@ -271,11 +271,12 @@ def test_command_handler_annotations_resolve_at_runtime() -> None:
         name for name in dir(plugin_cls) if name == "on_message" or name.startswith("selfreply")
     ]
     assert "on_message" in handler_names
-    # 指令族数量与 scripts/compat_check.py 的 EXPECTED_HANDLER_COUNT 同源：
-    # 少于该数说明漏扫了（脚本侧同名常量防「检查空转」假绿）。
-    from scripts.compat_check import EXPECTED_HANDLER_COUNT
+    # 处理器名单与 scripts/compat_check.py 的 EXPECTED_HANDLER_NAMES 同源：
+    # 指令组本体（selfreply）被装饰器换成 RegisteringCommandable，不在名单里，
+    # 摘掉它之后剩下的必须与名单一一对应（改名即红，脚本侧同份名单防假绿）。
+    from scripts.compat_check import EXPECTED_HANDLER_NAMES
 
-    assert len([n for n in handler_names if n.startswith("selfreply")]) == EXPECTED_HANDLER_COUNT
+    assert {name for name in handler_names if name != "selfreply"} == EXPECTED_HANDLER_NAMES
 
     for name in handler_names:
         target = getattr(plugin_cls, name)
@@ -464,6 +465,84 @@ def test_tool_list_degraded_shapes() -> None:
     assert (
         adapter._tool_list(SimpleNamespace(func_tool=SimpleNamespace(tools=BoomIterable()))) is None
     )
+
+    class BoomProperty:
+        @property
+        def tools(self):
+            raise RuntimeError("property broken")
+
+    # 属性读取本身抛也必须 fail closed：逃出 _tool_list 会让"无法枚举"变成
+    # 一次裸异常，调用方只能按 generate 的兜底分支处理，归因更糊。
+    assert adapter._tool_list(SimpleNamespace(func_tool=BoomProperty())) is None
+
+
+class BoomFuncTool:
+    """宿主把 func_tool 实现成会抛非 AttributeError 的 property。
+
+    ``getattr(req, "func_tool", _MISSING)`` 的默认值只在抛 AttributeError 时
+    生效，这种形态会原样逃出。加载期 ``_PROVIDER_REQUEST_FIELDS`` 断言也不覆盖：
+    ``dir()`` 照样列出这个 property，``validate()`` 因此通过。
+    """
+
+    @property
+    def func_tool(self):
+        raise RuntimeError("host property broken")
+
+
+def test_read_func_tool_converges_raising_property_to_sentinel() -> None:
+    """读 func_tool 抛异常必须收敛成哨兵，不得以裸异常逃出 fail-closed 接缝。"""
+    runtime = _load_adapter()
+    adapter = _adapter(runtime)
+    boom = BoomFuncTool()
+    assert adapter._read_func_tool(boom) is runtime._MISSING
+    # 哨兵化后 _tool_list 判"无法枚举"，filter_final_tools 据此 abort
+    assert adapter._tool_list(boom) is None
+    assert adapter.filter_final_tools(boom, keep=frozenset()) is False
+
+
+def test_func_tool_turning_unreadable_after_enumeration_fails_closed(caplog: object) -> None:
+    """枚举成功之后 func_tool 变读不到：不猜，直接判失败，且告警点明原因。
+
+    形态是宿主属性在两次读取之间被置空，或开始抛异常（请求被重置、宿主重入）。
+    此时 470 行的 ``req.func_tool`` 会以裸异常或 ``None.tools`` 的
+    AttributeError 逃出 try 之前的代码。
+
+    注意不能写成"第一次读就读不到"：那会被 ``_tool_list`` 按"宿主声明本次无
+    工具"判成 ``[]``，走的是 466 行的平凡放行出口，够不到这条分支。
+
+    只断言 ``is False`` 不够：去掉显式守卫后 ``None.tools`` 仍会被 except 兜住
+    并返回 False（实测过），guard 的增量价值全在归因上，故一并钉住告警文案。
+    第二次读用**抛异常**而不是返回 None，是为了让本用例同时抓住"三个调用点
+    换回裸读取"这一变异——裸读会让 RuntimeError 直接逃出本方法。
+    """
+    import logging
+
+    runtime = _load_adapter()
+    adapter = _adapter(runtime)
+
+    class VanishingReq:
+        def __init__(self) -> None:
+            self.tool_set = _ToolSet([_Tool("safe")])
+            self.reads = 0
+
+        @property
+        def func_tool(self):
+            self.reads += 1
+            if self.reads == 1:
+                return self.tool_set
+            raise RuntimeError("host property broken")
+
+    # 前提：第一次枚举确实成功（否则本用例走的是平凡放行，什么都验不到）
+    healthy = VanishingReq()
+    assert adapter._tool_list(healthy) == ["safe"]
+
+    with capture_logs(caplog, runtime.logger, logging.DEBUG):
+        assert adapter.filter_final_tools(VanishingReq(), keep=frozenset({"safe"})) is False
+    rendered = [
+        record.getMessage() for record in caplog.records if record.levelno >= logging.WARNING
+    ]
+    assert len(rendered) == 1, f"fail-closed 打出 {len(rendered)} 条告警：{rendered}"
+    assert "became unreadable" in rendered[0], f"告警未点明真实原因：{rendered}"
 
 
 def test_filter_final_tools_skip_nameless_and_fail_closed() -> None:

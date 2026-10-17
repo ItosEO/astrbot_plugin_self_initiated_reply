@@ -247,10 +247,10 @@ def test_from_config_migrates_legacy_alias_keys() -> None:
     assert "cooldown_seconds" not in persisted
 
 
-# _restore_plugin_state 原地恢复的 5 个容器 → 全部持有者绑定。
-# 这 11 个绑定任一处退回属性重绑定都不会变红：scheduler/coordinator/whitelist
-# 构造时捕获的是容器对象本身的引用，main 从新 dict 读而它们继续写旧 dict，
-# 该会话主动回复静默停止直到重启，且不抛异常、无日志。
+# _restore_plugin_state 原地恢复的 6 个容器 → 全部持有者绑定。
+# 这 14 个绑定任一处退回属性重绑定都不会变红：scheduler/coordinator/whitelist/
+# pipeline 构造时捕获的是容器对象本身的引用，main 从新 dict 读而它们继续写旧
+# dict，该会话主动回复静默停止直到重启，且不抛异常、无日志。
 # 表驱动而非逐行 assert，是为了新增持有者时只加一行、且失败信息能点名是谁。
 CONTAINER_HOLDERS: tuple[tuple[str, str, str], ...] = (
     ("_last_events", "_scheduler", "_last_events"),
@@ -265,6 +265,9 @@ CONTAINER_HOLDERS: tuple[tuple[str, str, str], ...] = (
     # 它不是只读，whitelist.py 会写回 self._runtime_umos，正是 B1 的失效形态
     # （回滚后继续写孤儿表 → 裸群号到 UMO 的映射丢失）。
     ("_whitelist_runtime_umos", "_whitelist", "_runtime_umos"),
+    ("_last_decisions", "_scheduler", "_last_decisions"),
+    ("_last_decisions", "_pipeline", "_last_decisions"),
+    ("_last_events", "_pipeline", "_last_events"),
     ("sessions", "_whitelist", "_sessions"),
 )
 
@@ -332,6 +335,7 @@ def test_assembled_components_share_plugin_containers(tmp_path) -> None:
             id(plugin._last_event_at): "_last_event_at",
             id(plugin._recent_image_events): "_recent_image_events",
             id(plugin._whitelist_runtime_umos): "_whitelist_runtime_umos",
+            id(plugin._last_decisions): "_last_decisions",
             id(plugin.sessions): "sessions",
         }
         owners = {
@@ -340,6 +344,7 @@ def test_assembled_components_share_plugin_containers(tmp_path) -> None:
             "_delivery": plugin._delivery,
             "_generation": plugin._generation,
             "_whitelist": plugin._whitelist,
+            "_pipeline": plugin._pipeline,
         }
         actual: set[tuple[str, str, str]] = set()
         for owner_name, owner in owners.items():

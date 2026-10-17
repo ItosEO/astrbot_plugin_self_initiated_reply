@@ -1410,7 +1410,12 @@ test("skip link and invalid whitelist stay keyboard-accessible", async ({ page }
   await page.locator("#saveTopBtn").click();
   await expect(page.locator("#whitelistError")).toBeVisible();
   await expect(page.locator("#whitelistInput")).toHaveAttribute("aria-invalid", "true");
-  await expect(page.locator("#whitelistInput")).toHaveAttribute("aria-describedby", "whitelistError");
+  // 摘要也归入 aria-describedby：「存在 N 处重复」与超上限告警只存在于那个 span，
+  // 不引用它的话读屏用户拿不到这两句。
+  await expect(page.locator("#whitelistInput")).toHaveAttribute(
+    "aria-describedby",
+    "whitelistError whitelistSummary",
+  );
   await expect(page.locator("#whitelistInput")).toBeFocused();
   expect(errors).toEqual([]);
 });
@@ -1773,20 +1778,76 @@ test("whitelist count and summary agree on the same deduplicated input", async (
   await page.locator("#whitelistInput").fill("12347\nqq:GroupMessage:12347");
   const collapsed = await read();
   expect(collapsed.count).toBe("1");
-  expect(collapsed.summary).toContain("已识别 1 个有效会话");
+  expect(collapsed.summary).toContain("已识别 1 条");
   expect(collapsed.summary).toContain("存在 1 处重复");
 
   // 反向锚：两个真正不同的会话不得被折叠成 1（防「恒 1」式的错误修复）
   await page.locator("#whitelistInput").fill("111\nqq:GroupMessage:222");
   const two = await read();
   expect(two.count).toBe("2");
-  expect(two.summary).toContain("已识别 2 个有效会话");
+  expect(two.summary).toContain("已识别 2 条");
 
   // 完全重复的同一项同样按去重后计数
   await page.locator("#whitelistInput").fill("12347\n12347");
   const dup = await read();
   expect(dup.count).toBe("1");
-  expect(dup.summary).toContain("已识别 1 个有效会话");
+  expect(dup.summary).toContain("已识别 1 条");
 
+  expect(errors).toEqual([]);
+});
+
+test("the whitelist live region is written only when its text changes", async ({
+  page,
+}) => {
+  // #whitelistSummary 是 aria-live="polite"，却挂在 input 事件上逐键写。
+  // textContent 赋值恒会替换文本节点：逐字相同也照样把整句摘要重新排进播报
+  // 队列，读屏用户粘一段 20 条的名单会听到同一句话被每个按键打断一次，
+  // 还与 #whitelistError 的 role="alert" 交错。aria-describedby 已在聚焦时
+  // 给出这两句，live region 只该播报“变了”的那几次。
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await installBridge(page);
+  const errors = await openPage(page);
+
+  const watch = () =>
+    page.evaluate(() => {
+      const summary = document.getElementById("whitelistSummary");
+      window.__summaryWrites = [];
+      const observer = new MutationObserver(() => {
+        window.__summaryWrites.push(summary.textContent);
+      });
+      observer.observe(summary, {
+        childList: true,
+        characterData: true,
+        subtree: true,
+      });
+      window.__stopSummaryWatch = () => observer.disconnect();
+    });
+  const writes = () =>
+    page.evaluate(() => {
+      window.__stopSummaryWatch();
+      return window.__summaryWrites.slice();
+    });
+
+  await page.locator("#whitelistInput").fill("");
+  await watch();
+  // 9 次按键只产生 5 句不同的摘要（每个逗号都不改变解析结果）：逐键写会看到 9 次。
+  await page.locator("#whitelistInput").pressSequentially("1,2,3,4,7", { delay: 0 });
+  await page.waitForTimeout(100);
+  const seen = await writes();
+  expect(seen.length, `逐键写死了 live region：${seen.length} 次写入`).toBeLessThan(9);
+  // 每次写入都必须是内容真变了：同一句写两遍就是重复播报。
+  expect(new Set(seen).size, `摘要被重复写入：${seen.join(" | ")}`).toBe(seen.length);
+  await expect(page.locator("#whitelistSummary")).toHaveText("已识别 5 条（5 个纯群号）");
+  await expect(page.locator("#whitelistCount")).toHaveText("5");
+
+  // 反向锚：摘要真的变了仍必须写，否则这条会被「恒不写」满足。
+  await watch();
+  await page.evaluate(async () => {
+    const input = document.getElementById("whitelistInput");
+    input.value = "only-one";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+  expect(await writes()).toEqual(["已识别 1 条（1 个完整 UMO）"]);
   expect(errors).toEqual([]);
 });

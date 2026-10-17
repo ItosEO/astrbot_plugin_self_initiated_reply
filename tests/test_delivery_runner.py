@@ -252,7 +252,15 @@ async def test_record_unconfirmed_sets_state_fields(tmp_path: Path) -> None:
 # ============================================================================
 
 
-async def test_deliver_delivered_advances_observation_and_history(tmp_path: Path) -> None:
+async def test_deliver_reply_returns_delivered_text_without_recording_state(
+    tmp_path: Path,
+) -> None:
+    """DELIVERED 出口只回文案：记账归 ``apply_proactive_state``/``persist_proactive_state``。
+
+    ``deliver_reply`` 自己不碰状态（本节标题里的「观察窗口推进」由下面几条
+    apply/persist 用例钉住），故这里不断言状态字段——``_state`` 的种子值会让
+    那样的断言恒真。只留「发送成功时返回的那串文案」这一条真实出口。
+    """
     _, models, runner, _ = _make_runner(tmp_path)
     state = _state(models)
     result = await runner.deliver_reply(
@@ -267,9 +275,6 @@ async def test_deliver_delivered_advances_observation_and_history(tmp_path: Path
     )
 
     assert result == "已主动回复。"
-    assert state.daily_count == 0
-    assert state.last_proactive_observed_at == 50.0
-    assert state.last_proactive_text == ""
 
 
 async def test_record_stale_generation_skips_observation_advance(tmp_path: Path) -> None:
@@ -330,6 +335,9 @@ async def test_apply_then_persist_retry_does_not_duplicate_state(tmp_path: Path)
 
     assert state.daily_count == 1
     assert len(state.recent) == 1
+    # 正向锚点：代次未变时观察窗口必须推到 observed_active_at。删掉这条，
+    # 上面「不得重复」只守住不增量，守不住「根本没推进」。
+    assert state.last_proactive_observed_at == 100.0
     assert await runner.persist_proactive_state() is False
     assert await runner.persist_proactive_state() is True
     assert writes == ["save", "save"]
@@ -384,25 +392,6 @@ async def test_deliver_direct_only_no_text_send(tmp_path: Path) -> None:
 
     assert result == "已通过工具主动回复。"
     assert state.daily_count == 0
-    assert state.last_proactive_text == ""
-
-
-async def test_deliver_text_only_sends_once(tmp_path: Path) -> None:
-    """纯文本：发送一次文本回复。"""
-    _, models, runner, _ = _make_runner(tmp_path)
-    state = _state(models)
-    result = await runner.deliver_reply(
-        "s1",
-        state,
-        "你好",
-        0,
-        ledger=models.AttemptLedger(),
-        expected_generation=1,
-        force=False,
-        trigger="patrol",
-    )
-
-    assert result == "已主动回复。"
     assert state.last_proactive_text == ""
 
 
@@ -578,6 +567,56 @@ async def test_deliver_non_stopping_suppression_stays_stale(tmp_path: Path) -> N
     assert result == "会话已更新，放弃旧回复。"
 
 
+async def test_deliver_stopping_suppression_outranks_generation_change(tmp_path: Path) -> None:
+    """停止成因的 SUPPRESSED 必须先于代次复核判定，代次同窗口变了的组合也要报停止。
+
+    缺陷形态：装饰 hook 是一次 await，期间插件重载会同时置 ``_stopping`` 并推进
+    代次。旧顺序先查 ``is_current``，"因停止而抑制"被误报成「会话已更新」，排障
+    方向被指错（DECISIONS.md 的 SUPPRESSED 文案按成因分流一节）。
+
+    与 ``test_deliver_suppressed_while_stopping_reports_stop`` 的分工：那条只覆盖
+    代次未变的一半（旧实现在那里也绿）；本条把同窗口内代次也变了的组合钉住，
+    FlipGate 让发送前的代次复核通过、发送后的复核翻转。
+
+    变异锚定：把 SUPPRESSED 成因判定挪回 ``is_current`` 复核之后，本用例红。
+    """
+    _, models, runner, _ = _make_runner(tmp_path)
+    runner.send_reply = FakeSender(
+        models.SendOutcome(
+            models.SendStatus.SUPPRESSED,
+            "plugin is stopping",
+            models.SuppressCode.STOPPING,
+        )
+    )
+
+    # 对照：hook await 期间只有 _stopping 被置位，代次未变
+    current = await runner.deliver_reply(
+        "s1",
+        _state(models),
+        "你好",
+        0,
+        ledger=models.AttemptLedger(),
+        expected_generation=7,
+        force=False,
+        trigger="patrol",
+    )
+    assert current == "插件正在停止，放弃回复。"
+
+    # 同一窗口内代次也变了：第一次 is_current 过发送前闸门，之后一律过期
+    runner._gate = FlipGate(true_times=1)
+    stale = await runner.deliver_reply(
+        "s1",
+        _state(models),
+        "你好",
+        0,
+        ledger=models.AttemptLedger(),
+        expected_generation=7,
+        force=False,
+        trigger="patrol",
+    )
+    assert stale == "插件正在停止，放弃回复。"
+
+
 # ============================================================================
 # 发送前门卫
 # ============================================================================
@@ -692,13 +731,21 @@ async def test_send_reply_stale_before_hooks_skips_hooks(tmp_path: Path) -> None
 
 async def test_send_reply_context_fallback_when_no_event(tmp_path: Path) -> None:
     """事件被清理（生成期间）→ 走 context 兜底路径，仍记 DELIVERED。"""
-    _, models, runner, _ = _make_runner(tmp_path)
+    delivery, models, runner, _ = _make_runner(tmp_path)
     context_send = FakeContextSend()
     runner._context_send = context_send
     outcome = await runner.send_reply("s1", "你好", expected_generation=1)
 
     assert outcome.status is models.SendStatus.DELIVERED
     assert [umo for umo, _msg in context_send.calls] == ["s1"]
+    # §14.1：context 兜底路径不引用——该路径的前提就是事件已不在手边，没有消息
+    # ID 可用，插进去只会引到一个空/错的消息。判据按 delivery 自己绑定的 Reply
+    # 取（与 test_mention 的 _at_items 同款具名判据），不写"链里只有正文"那种
+    # 可被改写的恒真形式。
+    sent = context_send.calls[0][1]
+    chain = list(getattr(sent, "chain", []) or [])
+    assert chain, "context 兜底没有链内容，本条断言会空转"
+    assert not any(isinstance(item, delivery.Reply) for item in chain), "context 路径不得引用"
 
 
 async def test_context_send_pre_submit_failure_is_not_unknown(tmp_path: Path, monkeypatch) -> None:

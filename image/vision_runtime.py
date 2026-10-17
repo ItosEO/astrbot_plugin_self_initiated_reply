@@ -13,6 +13,7 @@ from ..adapters import AstrBotBridge
 from ..models import PLUGIN_ID, Settings
 from ..session_coordinator import SessionCoordinator
 from ..session_gate import SessionGate
+from ..utils import redact_exc_text
 from ._support import VISION_MAX_CONCURRENT, ImageInfo, format_image_context
 from .parser import ImageParser
 from .recorder_bridge import MessageRecorderBridge
@@ -131,7 +132,12 @@ class VisionService:
         except TimeoutError:
             logger.warning("[%s] image capture timed out for umo=%s", PLUGIN_ID, umo)
         except Exception as exc:
-            logger.warning("[%s] image capture failed for umo=%s error=%s", PLUGIN_ID, umo, exc)
+            logger.warning(
+                "[%s] image capture failed for umo=%s error=%s",
+                PLUGIN_ID,
+                umo,
+                redact_exc_text(exc),
+            )
 
     async def build_context(self, umo: str, *, enabled: bool, provider_id: str = "") -> str:
         if not enabled:

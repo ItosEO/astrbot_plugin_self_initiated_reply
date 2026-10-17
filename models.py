@@ -359,12 +359,26 @@ class MessageRecord:
 # 取不到发送者名字时的兜底显示名：提示词历史行与事件侧必须同一称呼。
 FALLBACK_SENDER_NAME = "用户"
 
+# 助手在提示词历史里的固定称呼。单独命名是因为它同时是"用户昵称不得冒充"的
+# 比较基准（见 history_display_name），散成字面量会让这条约束无从查找。
+ASSISTANT_HISTORY_NAME = "Bot"
+
 
 def history_display_name(role: str, name: str | None = None) -> str:
     """历史展示名：助手固定 Bot，其他人用名字，缺名才回落用户。"""
     if role == "assistant":
-        return "Bot"
-    return str(name or FALLBACK_SENDER_NAME)
+        return ASSISTANT_HISTORY_NAME
+    label = str(name or FALLBACK_SENDER_NAME)
+    # 群成员可自选昵称。取成助手称呼时，他那一行与真正的助手轮次完全同形
+    # （``Bot: <他写的话>``），提示词注入面随之从"聊天内容"扩大到"助手身份"——
+    # 判断与生成两条路径都吃这个标签。撞上就改写成带兜底称呼的形态，让任何
+    # 用户行都不可能渲染成 ``Bot:`` 开头。
+    #
+    # 只在真撞上时改写：其余会话的提示词逐字节不变，判断模型已形成的行为不受
+    # 影响。比较用 strip 后的值，``"Bot "`` 这类带空白的昵称同样算撞上。
+    if label.strip() == ASSISTANT_HISTORY_NAME:
+        return f"{FALLBACK_SENDER_NAME}({ASSISTANT_HISTORY_NAME})"
+    return label
 
 
 class ReadHistoryCallback(Protocol):
@@ -791,7 +805,9 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec(
         "decision_history_min_messages",
         "int",
-        # 消费值即 MIN_RECENT_TEXT_RECORDS，再写一遍数字等于允许两者被单独改掉。
+        # 默认值与生成路径的 MIN_RECENT_TEXT_RECORDS 同源（只是取值复用）；
+        # 消费方只有 decision 的判断提示词，生成上下文另由 recent_message_limit
+        # 与 MIN_RECENT_TEXT_RECORDS 决定，两者刻意不同源。
         MIN_RECENT_TEXT_RECORDS,
         0,
         30,
@@ -1028,10 +1044,13 @@ def normalize_string_list(
         unique_items = sorted(set(items))
         dropped += len(items) - len(unique_items)
         items = unique_items
-    if spec.max_items is not None and len(items) > spec.max_items:
-        if mode == "disk":
-            dropped += len(items) - spec.max_items
-            items = items[: spec.max_items]
+    if spec.max_items is not None and mode == "disk" and len(items) > spec.max_items:
+        # 容量上限只在 disk 模式生效：api 模式由 normalize_config_updates 的
+        # 第二次 disk 夹取收口（并据此回 adjusted_fields）。写成嵌套 if 会让
+        # 后来人以为 api 在这里也做容量判定，删掉内层那行就把 api 的截断点
+        # 搬到本函数、连带改变计数型 WARNING 的触发时机。
+        dropped += len(items) - spec.max_items
+        items = items[: spec.max_items]
 
     result: list[str] | set[str]
     result = set(items) if spec.container == "set" and mode == "disk" else items
@@ -1092,7 +1111,11 @@ def coerce_config_value(spec: ConfigSpec, raw: Any, fallback: Any) -> Any:
             logger.warning("[%s] %s list value invalid; using fallback", PLUGIN_ID, spec.key)
             return normalize_string_list(spec, fallback, mode="disk")
     if spec.kind == "str":
-        return _truncate_text(spec, str(raw or "").strip())
+        # 单行标识（三个 provider id）剔除控制字符：它们经 %s 进日志，带换行就能
+        # 伪造出一行假日志。列表条目早有同一条规则（STRING_LIST_ILLEGAL_RE 排除
+        # C0 控制字符），str 类此前是缺口。
+        text = "".join(char for char in str(raw or "").strip() if ord(char) >= _PRINTABLE_CHAR_MIN)
+        return _truncate_text(spec, text)
     # 规格表写错 kind 不得静默降级：那会让 int/bool 键带着非法值落盘并显示成
     # 正常值。与上面缺边界的自检同口径，加载期响。
     raise RuntimeError(f"{spec.key}: 未知配置 kind {spec.kind!r}")

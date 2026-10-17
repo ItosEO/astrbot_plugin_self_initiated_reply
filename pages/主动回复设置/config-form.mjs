@@ -50,7 +50,9 @@ export function summarizeWhitelist(text, parsedItems = null) {
   if (pureNumbers > 0) parts.push(`${pureNumbers} 个纯群号`);
   if (umos > 0) parts.push(`${umos} 个完整 UMO`);
   const dupText = items.length > unique.length ? ` · 存在 ${items.length - unique.length} 处重复` : "";
-  const base = `已识别 ${unique.length} 个有效会话（${parts.join("，")}）${dupText}`;
+  // 说「已识别」不说「有效」：这里不校验字符集与长度，
+  // 保存时会被后端拦下的非法条目一样被计数。用「有效」会让运营者以为这些会话真的生效了。
+  const base = `已识别 ${unique.length} 条（${parts.join("，")}）${dupText}`;
   if (unique.length > WHITELIST_MAX_COUNT)
     return `${base} · 超过 ${WHITELIST_MAX_COUNT} 条上限，多余条目会被截断或拒绝`;
   return base;

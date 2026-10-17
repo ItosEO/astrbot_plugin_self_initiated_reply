@@ -1,7 +1,7 @@
 """compat_check 必须可被 import，且自有的临时目录生命周期必须闭合。
 
 脚本本体在模块级做进程级副作用（sys.path 注入 / chdir 临时目录 / 注册假包），
-而 tests/test_runtime_adapter.py 为取 EXPECTED_HANDLER_COUNT 而 import 它，
+而 tests/test_runtime_adapter.py 为取 EXPECTED_HANDLER_NAMES 而 import 它，
 副作用会改掉 pytest 进程的 cwd、并在宿主真包已装时用假包顶掉 sys.modules 里的
 同名条目。副作用因此收敛进 _bootstrap()，只由 __main__ 入口调用。
 
@@ -43,7 +43,7 @@ assert Path.cwd() == before_cwd, f"cwd changed to {Path.cwd()}"
 assert sys.path == before_path, "sys.path mutated at import time"
 after_module = sys.modules.get("astrbot_plugin_self_initiated_reply")
 assert after_module is before_module, "fake package injected into sys.modules at import time"
-print(scripts.compat_check.EXPECTED_HANDLER_COUNT)
+print(len(scripts.compat_check.EXPECTED_HANDLER_NAMES))
 """
     proc = subprocess.run(
         [sys.executable, "-X", "utf8", "-c", probe],
@@ -62,7 +62,7 @@ def test_importing_compat_check_does_not_chdir_even_once_loaded() -> None:
     before = Path.cwd()
     module = importlib.import_module("scripts.compat_check")
     assert Path.cwd() == before
-    assert isinstance(module.EXPECTED_HANDLER_COUNT, int)
+    assert isinstance(module.EXPECTED_HANDLER_NAMES, frozenset)
 
 
 # --- 自有临时目录生命周期 ------------------------------------------------------
@@ -71,6 +71,19 @@ def test_importing_compat_check_does_not_chdir_even_once_loaded() -> None:
 def _no_plugin_package(monkeypatch: pytest.MonkeyPatch) -> None:
     """让 ``_bootstrap`` 走假包注册分支（无论是否装了真包）。"""
     monkeypatch.setitem(sys.modules, PKG_NAME, None)
+
+
+@pytest.fixture(autouse=True)
+def _host_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    """把宿主前置检查钉成"已安装"。
+
+    本文件测的是 bootstrap 与清理生命周期，与真实 ``astrbot`` 在不在无关；而
+    ``main()`` 的前置检查缺宿主时直接返回 ``EXIT_HOST_MISSING``，根本不进
+    bootstrap。不钉这一下，本文件在未装宿主的机器上单独跑就会红在退出码上，
+    而不是红在被测的生命周期断言上。
+    """
+    compat = importlib.import_module("scripts.compat_check")
+    monkeypatch.setattr(compat, "_host_importable", lambda: True)
 
 
 @pytest.fixture
@@ -241,3 +254,49 @@ def test_main_cleans_up_when_checks_do_not_succeed(
     assert not workdir.exists(), "检查失败路径未删除自有临时目录"
     assert Path.cwd() == before_cwd, f"cwd 未复原：{Path.cwd()} != {before_cwd}"
     assert sys.path == before_path, "失败路径后 sys.path 未复原"
+
+
+def test_main_reports_missing_host_before_bootstrapping(
+    monkeypatch: pytest.MonkeyPatch,
+    compat: ModuleType,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """缺宿主：一行可行动提示 + 专用退出码，且不建临时目录、不切 cwd。
+
+    没有前置检查时，缺宿主以 ``runtime_adapter`` 的 ``ModuleNotFoundError``
+    traceback 结束，调用方看不出该去装 astrbot；退出码也与契约缺口的 1 混在
+    一起，分不清"环境没装"和"上游漂移"。
+    """
+    created = _instrumented_tempfile(monkeypatch, compat)
+    monkeypatch.setattr(compat, "_host_importable", lambda: False)
+    before_cwd = Path.cwd()
+    before_path = list(sys.path)
+
+    assert compat.main() == compat.EXIT_HOST_MISSING
+    assert compat.EXIT_HOST_MISSING != 1, "缺宿主必须与契约缺口用不同退出码"
+
+    assert not created, "缺宿主时不该建临时目录"
+    assert Path.cwd() == before_cwd, f"cwd 未复原：{Path.cwd()} != {before_cwd}"
+    assert sys.path == before_path, "失败路径后 sys.path 未复原"
+    assert "pip install astrbot" in capsys.readouterr().err
+
+
+def test_denylist_gaps_reports_moved_dangerous_tool_module(
+    monkeypatch: pytest.MonkeyPatch,
+    compat: ModuleType,
+) -> None:
+    """宿主危险工具模块被搬走：报漂移，而不是当成"这片没有危险工具"放过。
+
+    未守卫时 ``importlib.import_module`` 直接抛，latest 腿上的
+    ``continue-on-error`` 会把 traceback 整段吞掉，denylist 少一片覆盖面而无
+    人知道；把缺失当成空集合，缺口同样静默消失。
+    """
+    moved = "astrbot.core.tools.cron_tools"
+    monkeypatch.setattr(compat, "_enumerate_tool_names", lambda: {moved: None})
+    # _denylist_gaps 先从插件包取 denylist：本条走的是"模块缺失"分支，那份清单
+    # 根本读不到，但 import 仍须成功（未装插件包时给个空壳即可）。
+    fake_models = ModuleType("astrbot_plugin_self_initiated_reply.models")
+    fake_models.HOST_DANGEROUS_TOOL_IDS = frozenset()
+    monkeypatch.setitem(sys.modules, "astrbot_plugin_self_initiated_reply.models", fake_models)
+
+    assert compat._denylist_gaps() == [f"{moved} 缺失，宿主私有 API 漂移"]

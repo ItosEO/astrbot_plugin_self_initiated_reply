@@ -5,8 +5,10 @@
 ## 发布产物
 
 发布主路径是 AstrBot 插件市场（git 仓库）。手工部署包（VPS 直投 zip）用
-`git archive --format=zip -o <name>.zip HEAD` 导出：排除规则单点声明在仓库根
-`.gitattributes` 的 `export-ignore`，未跟踪/被 .gitignore 排除的文件天然不进包。
+`git archive --format=zip -o <name>.zip HEAD` 导出（`HEAD` 取的是提交而非工作树，
+发布前须先 commit 或 stash，也可 `git archive $(git stash create)`，否则打出的
+是上次提交的旧代码）：排除规则单点声明在仓库根 `.gitattributes` 的
+`export-ignore`，未跟踪/被 .gitignore 排除的文件天然不进包。
 
 不从 wheel 派生部署 zip：那条路要 pyproject exclude 列表、检查脚本禁运名单与
 pathspec 交叉核验三份名单同步，任一处漏改就静默失守，而分发主路径不产生 wheel。
@@ -89,7 +91,7 @@ GET `/config` 是 panel 视图：只回 panel 键加 `runtime_enabled` / `decisi
 
 `recorder_bridge` 按平台消息 ID 查本地图片时，多图记录里 URL 未命中必须拒绝
 盲取首图（首图属于另一张图，错配会让 Vision 描述错图）；单图消息宽容取用
-唯一组件是安全的。处理器数量上限 `EXPECTED_HANDLER_COUNT` 以
+唯一组件是安全的。处理器名单 `EXPECTED_HANDLER_NAMES` 以
 `scripts/compat_check.py` 为单一事实源，`tests/test_runtime_adapter.py` 经
 import 引用。
 
@@ -163,7 +165,10 @@ timeout 只覆盖单次操作，慢速滴流与无响应 DNS 不得无限拖住�
 **`POST /ui/theme` 关停门有行为断言**（`tests/test_webapi.py::test_api_post_ui_theme_paths`）：
 teardown 之后落盘的偏好会在下次启动被读回，用户看到「已被丢弃」却仍然生效的旧设置。
 该门在生产里是**两层**（锁外预检 + 锁内复查），只删一层另一层兜住，行为断言
-锁住两层并存，与本仓库其余端点（config / image-cache）的口径一致。
+锁住两层并存。**另两个端点刻意不是这个形状**，改它们之前先读各自的理由：
+`POST /config` 只有锁内一道（请求体读取与纯函数校验都在锁外，持锁等客户端上传会
+连坐 `terminate()`），`image-cache/cleanup` 只有锁外一道预检且根本没有锁
+（它没有可回滚的写路径，加锁会让一次慢清理连坐 `terminate()`）。
 
 ## 刻意保留的现状
 
@@ -184,9 +189,8 @@ teardown 之后落盘的偏好会在下次启动被读回，用户看到「已�
 - **双层防护中的冗余层**：例如图片端口白名单与传输层地址校验重叠，去掉任一层都有
   另一层兜住，行为等价；这是刻意的纵深，不是重复实现。
 - **`compat_check._runtime_api_gaps` 用签名枚举，不做行为冒烟**：签名枚举只依赖
-  httpx/httpcore，`_bootstrap()` 的假包路径（本地未装宿主时）也能跑；冒烟形态要 import
-  `ImageParser`，净代码更长。它守的是「本仓库直接使用的第三方 API 形态」，依赖上界只挡
-  大版本，挡不住小版本的签名变化。
+  httpx/httpcore，且不 import `ImageParser`，比冒烟形态短。它守的是「本仓库直接使用的
+  第三方 API 形态」，依赖上界只挡大版本，挡不住小版本的签名变化。
 - **ruff 规则集止于 `RUF100`**：`S110`+`SIM105` 的差集是多 except 子句（取消/超时处理与
   日志并存，`contextlib.suppress` 表达不了）；`ASYNC` 只认固定列表的阻塞调用，本仓真实
   出现过的阻塞缺陷（`rglob` 遍历、`write_json_atomic`）它都抓不到；`PTH` 会改行为
@@ -276,7 +280,8 @@ teardown 之后落盘的偏好会在下次启动被读回，用户看到「已�
 
 ## `--topbar-h` 由运行时写回，不违反上面的防抖动约束
 
-`--topbar-h` 的三个静态值（`:110` / `@1024` / `@720`）与顶栏在各断点的真实高度都不相等，
+`--topbar-h` 的三个静态值（88 / 64 / 62，分别位于 `:root` / `@1024` / `@720`）与顶栏在
+各断点的真实高度都不相等，
 侧栏让位与锚点偏移会差一截，故由 `chrome.mjs` 的 `syncTopbarHeight` 用 `ResizeObserver`
 观测 `.topbar` 实测高度写回，静态值降为无 JS 时的兜底。
 
@@ -321,21 +326,42 @@ key 长度因此有上界，预算不会从键上逃出。
 KB 级估算（`sys.getsizeof` 深度求和）不写成文档也不补公式测试：它随 CPython 版本与
 平台变，没有可维护的口径。
 
-## 已知边界：命令路径回滚不覆盖调度器侧的三张表
+## 已知边界：命令路径回滚不覆盖调度器侧的四张表
 
 `whitelist.commit_change` 的双写失败回滚只恢复**它自己拥有的状态**：白名单集合、
-`sessions`（含 `pruned` 快照）、`_runtime_umos`。调度器侧由引用持有的三张表
-（`main._last_events` / `main._delay_tasks` / `SessionGate._running_sessions`，对外经
-`running_sessions_view`）不在其中：
+`sessions`（含 `pruned` 快照）、`_runtime_umos`。调度器侧由引用持有的四张表
+（`main._last_events` / `main._delay_tasks` / `main._last_decisions` /
+`SessionGate._running_sessions`，后者对外经 `running_sessions_view`）不在其中：
 它们由 `scheduler` 通过构造期注入的引用直接操作，`whitelist.py` 拿不到，也不该
 反向依赖。
 
-后果：`/selfreply remove` 遇到「内存剪枝成功、磁盘双写失败」时，该会话在
-`whitelist` 侧已复活，但调度器的在途检查/延迟任务可能已被取消 → 该会话**静默停摆
-一次**（巡检不再访问它），下一条消息到达时自愈（消息路径会重建在途状态）。
+后果分两档。`_last_decisions` 是轻的一档：该会话的「最近裁决」一行丢到下次判断
+为止，`/selfreply status` 与 `GET /status` 少显示一条，不涉及停摆。
+`_last_events` / `_delay_tasks` / `_running_sessions` 是重的一档：`/selfreply remove`
+遇到「内存剪枝成功、磁盘双写失败」时，该会话在 `whitelist` 侧已复活，但调度器的
+在途检查/延迟任务已被取消、事件缓存已清 → 该会话**停摆到下一条消息到达**
+（消息路径会重建在途状态）。巡检救不了它：`_patrol_one_session` 见到空事件缓存
+直接返回，所以 `enabled_patrol_trigger` 开与不开一个样。
 
-**为什么不在 `whitelist.commit_change` 里补**：那要求把三张表的回滚钩子注入
+运营侧不再是黑盒：`main._handle_inline_command` 捕获落盘异常并回显「执行失败
+（配置或状态写入未成功），内存已回滚，请查看 AstrBot 日志后重试」，同时照常
+`stop_event()`。所以管理员看得见失败，只是不会自动恢复在途状态。
+
+**为什么不在 `whitelist.commit_change` 里补**：那要求把这四张表的回滚钩子注入
 白名单层，形成「存储层反向编排调度层」的耦合，而收益只是消掉一次**有自愈路径**的
-静默期。webapi 路径（配置保存）不受影响：它走的是 `plugin_state` 侧的快照-回滚，
-不经过 `_prune`。**这是刻意的取舍，不是遗漏**：若将来调度器改为事件驱动重建在途
-状态，此处可一并消除。
+静默期（以及一行裁决回显）。webapi 路径（配置保存）不受影响：它走的是
+`plugin_state` 侧的快照-回滚，四张表都在快照里。**这是刻意的取舍，不是遗漏**：
+若将来调度器改为事件驱动重建在途状态，此处可一并消除。
+
+## 已知边界：识图上下文不受决策/生成超时约束
+
+`build_decision_prompt` 与 `build_context_text` 都在各自的超时**之外**拼装识图
+上下文，每张图自带 `vision_timeout_sec` 预算。Vision 提供商挂死时，一次检查会从
+"广告上的 `decision_timeout_sec` / `generation_timeout_sec`"拉长到约
+`2 × vision_timeout_sec`（默认 40s），该会话的检查锁与运行标记也一并持有这么久。
+
+不把调用方剩余预算透传下去，是因为那要给 `build_decision_prompt` /
+`build_context_text` / `parse_batch` / `parse` 四层各加一个 deadline 参数，而收益
+只是把一次**有界、已记 INFO（`image parsing timed out`）、且自动降级为纯文本**的
+慢查缩短。真要做的话，最小切口是给 `parse_batch` 加一个整批 deadline——它现在只有
+单图超时，没有整批上限。

@@ -179,6 +179,10 @@ async def _api_providers(plugin: SelfInitiatedReplyPlugin) -> dict[str, Any]:
 
 async def _api_cleanup_image_cache(plugin: SelfInitiatedReplyPlugin) -> dict[str, Any]:
     """手动清理过期图片缓存；不删除有效窗口内仍受保护的源。"""
+    # 只有一道预检，没有锁内复查：本端点没有可回滚的写路径（run_image_cleanup
+    # 只在 to_thread 里 unlink 过期文件，且被 not_before 保护窗口挡在冻结中的
+    # 文件之外），teardown 与它并发的最坏结果是多删几个本就要过期的文件。
+    # 为它引入 _config_lock 反而会让一次慢清理连坐 terminate()。
     if plugin._stopping:
         return {"ok": False, "error": "插件正在关闭"}
     try:
@@ -329,19 +333,39 @@ async def _request_json() -> Any:
 
 async def _api_post_config(plugin: SelfInitiatedReplyPlugin) -> dict[str, Any]:
     """更新配置，并在锁内执行可选的 revision 前置条件。"""
+    # 请求体读取与全部纯函数校验留在锁外：等待客户端上传的时长由客户端
+    # 决定，持锁等待会连坐 terminate() 与一切 /selfreply 写指令（它们同一把
+    # _config_lock）。§7 的「在 _config_lock 内比较 revision」不受影响——比较
+    # 仍在锁内、且是在任何变更之前。
+    try:
+        data = await _request_json()
+        if not isinstance(data, dict):
+            raise ValueError("请求体必须是 JSON 对象")
+        base_revision = data.get("base_revision")
+        if base_revision is not None and (
+            not isinstance(base_revision, str) or not base_revision.strip()
+        ):
+            raise ValueError("base_revision 必须是非空字符串")
+        config_data = {key: value for key, value in data.items() if key != "base_revision"}
+        updates = _parse_config_updates(config_data)
+    except ValueError as exc:
+        # 校验失败的文案要回显：由本模块构造，只含字段名与规则，前端表单
+        # 依赖它定位出错字段。
+        logger.warning("[%s] api post config rejected: %s", PLUGIN_ID, redact_exc_text(exc))
+        return {"ok": False, "error": str(exc)}
+    except RuntimeError as exc:
+        # 宿主不具备 JSON 请求读取能力是宿主问题，不是客户端的坏请求体：
+        # 回「请求体不是合法 JSON」会把排障方向指错。
+        logger.warning("[%s] api post config unsupported host: %s", PLUGIN_ID, redact_exc_text(exc))
+        return {"ok": False, "error": "配置保存失败，请查看 AstrBot 日志"}
+    except Exception as exc:
+        logger.warning("[%s] api post config rejected: %s", PLUGIN_ID, redact_exc_text(exc))
+        return {"ok": False, "error": "请求体不是合法 JSON"}
+
     async with plugin._config_lock:
         if plugin._stopping:
             return {"ok": False, "error": "插件正在关闭"}
         try:
-            data = await _request_json()
-            if not isinstance(data, dict):
-                raise ValueError("请求体必须是 JSON 对象")
-            base_revision = data.get("base_revision")
-            if base_revision is not None and (
-                not isinstance(base_revision, str) or not base_revision.strip()
-            ):
-                raise ValueError("base_revision 必须是非空字符串")
-            config_data = {key: value for key, value in data.items() if key != "base_revision"}
             current_revision = config_revision(plugin.settings)
             # 比较前 strip：与入参校验（非空字符串）同口径，避免仅因首尾空白
             # 被判 STALE_WRITE，让用户看到一次无意义的刷新要求。
@@ -352,7 +376,6 @@ async def _api_post_config(plugin: SelfInitiatedReplyPlugin) -> dict[str, Any]:
                     "error": "配置已被其他请求修改",
                     "config_revision": current_revision,
                 }
-            updates = _parse_config_updates(config_data)
             return await _apply_config_updates(
                 plugin,
                 updates,
@@ -450,10 +473,18 @@ _AUDITED_CONFIG_KEYS = tuple(spec.key for spec in CONFIG_SPECS if spec.audited)
 def _snapshot_plugin_state(plugin: SelfInitiatedReplyPlugin) -> dict[str, Any]:
     """对应配置前会变更的全部运行态做快照，供回滚恢复。
 
-    ``sessions`` 只深保护 ``recent``：它是唯一会被窗口内消息入口不可逆裁剪
-    的字段。本快照不足以独立完成回滚：被白名单变更 pop 掉的会话状态不在
-    这里，那部分由 ``_apply_config_updates`` 捕获 ``replace`` 的 ``pruned``
-    并在恢复时先回填（见 ``_restore_plugin_state``）。
+    ``sessions`` 只深保护 ``recent``：它是唯一会被窗口内消息入口**不可逆裁剪**
+    的字段（有界 deque 挤掉的旧记录无法从别处还原）。
+
+    其余会话字段（``last_active_at`` / ``daily_count`` / ``last_proactive_at`` /
+    ``last_proactive_observed_at``）刻意**不**回滚：它们在窗口内可能被一次真实
+    已发出的回复推进过，回滚等于「撤销一次已发送的回复」——会让日配额与冷却倒流，
+    该会话随后可能再发一条。两害相权取不回滚：代价是失败保存之后偶发一次
+    「今日主动回复次数已达上限」，次日自愈，且日志已说明保存失败。
+
+    本快照也不足以独立完成回滚：被白名单变更 pop 掉的会话状态不在这里，那部分由
+    ``_apply_config_updates`` 捕获 ``replace`` 的 ``pruned`` 并在恢复时先回填
+    （见 ``_restore_plugin_state``）。
     """
     return {
         "settings": copy.deepcopy(plugin.settings),
@@ -464,6 +495,10 @@ def _snapshot_plugin_state(plugin: SelfInitiatedReplyPlugin) -> dict[str, Any]:
         },
         "gate": plugin._gate.snapshot(),
         "sessions": {key: list(state.recent) for key, state in plugin.sessions.items()},
+        # 与 whitelist_runtime_umos 同理：白名单变更经 _prune_session 会 pop 掉
+        # 非白名单会话的裁决条目，不同样快照的话回滚补不回来。
+        # record_decision 是整体替换而非原地改，浅拷贝即够。
+        "last_decisions": dict(plugin._last_decisions),
         "delay_umos": set(plugin._delay_tasks),
     }
 
@@ -507,17 +542,36 @@ async def _restore_plugin_state(
     plugin.runtime_enabled = snapshot["runtime_enabled"]
     plugin._coordinator.restore_inplace(snapshot)
     restore_container_inplace(plugin._whitelist_runtime_umos, snapshot["whitelist_runtime_umos"])
+    # 原地 clear+update：scheduler 与 pipeline 持同一个 dict 引用，重绑定会让
+    # janitor 继续回收旧容器里的条目，回滚内容对不上。
+    restore_container_inplace(plugin._last_decisions, snapshot["last_decisions"])
     plugin._gate.restore(snapshot["gate"])
     if pruned:
         plugin.sessions.update(pruned)
     _restore_session_history(plugin, snapshot["sessions"])
-    # 回滚后重新调度被白名单变更取消的延迟检查（已取消的任务对象
-    # 不可复用，只能按默认 message_delay 语义重建）。
+    # 重新调度快照时刻的全部在途延迟检查（已取消的任务对象不可复用，只能按默认
+    # ``message_delay`` 语义重建）。
+    #
+    # 刻意**整表**重调度而不是只补「被白名单变更取消的」那些：apply 窗口里
+    # 谁被取消没有记录，要区分就得再加一张差分表，而代价只是——未被取消的
+    # 会话静默计时从头起算，且可能多跑一次检查。后者被会话自身的去重闸挡住
+    # （刚回复过的会话有冷却，或观察窗口已推进到该消息之后），最坏是多花一次
+    # 判断模型调用。配置保存失败是低频路径，用这点代价换掉一张新表和它的
+    # 新不变量。快照里已消失的会话（白名单收缩后未回填）跳过。
     for umo in snapshot["delay_umos"]:
         if umo in plugin.sessions and not plugin._stopping:
             try:
+                # 必须带快照代次：``schedule_delayed_check`` 在 generation 为 None
+                # 时会 advance 一次，而上面刚把 gate 恢复成快照态。跳过这半步，
+                # 并发在途检查持有的代次会被这次 advance 判为过期，其回复被静默
+                # 丢弃——回滚因此部分抵消了自己刚恢复的代次。取不到（该会话从未
+                # 有过代次）才回落 None，由调度器自行 advance。
                 plugin._scheduler.schedule_delayed_check(
-                    umo, delay_sec=None, trigger=CheckTrigger.MESSAGE_DELAY, force=False
+                    umo,
+                    delay_sec=None,
+                    trigger=CheckTrigger.MESSAGE_DELAY,
+                    force=False,
+                    generation=snapshot["gate"]["generation"].get(umo),
                 )
             except Exception as re_exc:
                 logger.debug(
@@ -574,6 +628,12 @@ async def _apply_config_updates(
         if vision_changed:
             plugin._vision.clear_parsers()
         if updates:
+            # 锁内复查停止态：_mark_degraded 不经 _config_lock 就置位 _stopping
+            # （它由生成/判断的隔离回调触发），入口处那一次检查会被横跨 DEGRADED
+            # 迁移的请求绕过。此处抛异常走下方 except 的完整回滚，不留下
+            # 「磁盘已写新值、内存半应用」的中间态。
+            if plugin._stopping:
+                raise RuntimeError("插件正在关闭")
             await plugin._persist_config()
             await plugin._save_storage()
 
@@ -617,15 +677,22 @@ async def _apply_config_updates(
         # 取消也要回滚：CancelledError 不落 except Exception，而此前的应用
         # 步骤可能已完成，留下"磁盘已写新值、内存未回滚"的半应用态。
         # 回滚自带 await，用 shield 防止二次取消打断它。
-        rollback = asyncio.ensure_future(_restore_plugin_state(plugin, snapshot, pruned=pruned))
+        restore = asyncio.ensure_future(_restore_plugin_state(plugin, snapshot, pruned=pruned))
         try:
-            await asyncio.shield(rollback)
+            await asyncio.shield(restore)
         except asyncio.CancelledError:
             # 二次取消不再等待：回滚任务已在跑，由主循环收敛
             pass
         raise
     except Exception:
-        await _restore_plugin_state(plugin, snapshot, pruned=pruned)
+        # 与上同一形状：_restore_plugin_state 自带 await（_persist_config /
+        # _save_storage / ensure_patrol），被二次取消打断会留下内存半恢复、
+        # 磁盘仍是新值的中间态，而原异常又被 CancelledError 顶掉、逃到 Quart。
+        restore = asyncio.ensure_future(_restore_plugin_state(plugin, snapshot, pruned=pruned))
+        try:
+            await asyncio.shield(restore)
+        except asyncio.CancelledError:
+            pass
         raise
 
 
@@ -690,7 +757,7 @@ async def _api_status(plugin: SelfInitiatedReplyPlugin) -> dict[str, Any]:
         }
     except Exception as exc:
         # 同 _api_get_config：详情只进服务端日志，不回显给调用方。
-        logger.warning("[%s] api status failed: %s", PLUGIN_ID, exc)
+        logger.warning("[%s] api status failed: %s", PLUGIN_ID, redact_exc_text(exc))
         return {"ok": False, "error": "状态读取失败"}
 
 

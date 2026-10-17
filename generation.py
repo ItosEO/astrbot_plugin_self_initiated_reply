@@ -34,6 +34,7 @@ from .models import (
     ReadHistoryCallback,
     SessionState,
     Settings,
+    as_int,
 )
 from .outbound import OutboundGateway
 from .utils import (
@@ -41,6 +42,7 @@ from .utils import (
     cap_context_text,
     clean_reply,
     consume_task_result,
+    redact_exc_text,
     response_text,
 )
 
@@ -65,9 +67,12 @@ _TOOL_HINT_RESTRICTED = (
 # 结构上不可能不一致。
 _ENVELOPE_TAG = "recent_chat"
 
-# 匹配伪造的信封标签，容忍空白与大小写变形；只针对信封自身标签名，不动
-# 其他尖括号（聊天记录里的代码片段应原样进入模型）。
-_ENVELOPE_TAG_RE = re.compile(rf"<\s*/?\s*{_ENVELOPE_TAG}\s*>", re.IGNORECASE)
+# 匹配伪造的信封标签，容忍空白、大小写、自闭合与属性变形；只针对信封自身
+# 标签名，不动其他尖括号（聊天记录里的代码片段应原样进入模型）。
+# 属性段刻意要求以空白开头：这是 HTML 标签语法的硬前提，既能吃掉
+# ``<recent_chat foo="bar">`` 与 ``<recent_chat/>``，又不会把 ``<recent_chatty>``
+# 这类同名前缀的不同标签误判成信封标签。
+_ENVELOPE_TAG_RE = re.compile(rf"<\s*/?\s*{_ENVELOPE_TAG}(?:\s[^<>]*)?/?\s*>", re.IGNORECASE)
 
 
 def neutralize_envelope_tags(text: str) -> str:
@@ -207,6 +212,12 @@ class GenerationRunner:
         def quarantine(task: asyncio.Task[Any], reason: str) -> None:
             if task.done():
                 return
+            # 先回调再谈隔离登记：``on_quarantine`` 置 run.quarantined=True，
+            # _cleanup_generation_state 靠它决定是否保留 send tracker。把两者
+            # 绑在一起会让"没有注入隔离表"（构造默认值）退化成 fail-open——
+            # 存活 agent 的工具直发变成裸发，绕过预算与代次闸门（契约 §5）。
+            if on_quarantine is not None:
+                on_quarantine()
             if self._quarantine_task is None:
                 # 任务吞掉取消又没被隔离登记是一条零日志的泄漏路径。
                 logger.warning(
@@ -216,8 +227,6 @@ class GenerationRunner:
                 )
                 return
             self._quarantine_task(task, reason)
-            if on_quarantine is not None:
-                on_quarantine()
 
         request_stop = getattr(agent_runner, "request_stop", None)
         if callable(request_stop):
@@ -345,13 +354,14 @@ class GenerationRunner:
             )
             return run.partial_reply()
         except Exception as exc:
+            # 异常文本常带请求 URL（含凭证），与 decision/webapi 同一脱敏口径；
+            # 不开 exc_info：traceback 帧里常持有整个 request 对象，是同类泄漏面。
             logger.warning(
                 "[%s] main-agent generation failed ledger_id=%s session=%s error=%s",
                 PLUGIN_ID,
                 ledger.ledger_id,
                 umo,
-                exc,
-                exc_info=True,
+                redact_exc_text(exc),
             )
             return run.partial_reply()
         finally:
@@ -506,6 +516,21 @@ class GenerationRunner:
                 build_result.agent_runner,
                 cancel_first=True,
                 on_quarantine=mark_quarantined,
+            )
+            # 取消落在生成中途时，回复已被生成但既不会提交也不会记账。此处必须
+            # 留一行 INFO：CancelledError 是 BaseException，``generate`` 的
+            # ``except Exception`` 接不到，scheduler 的 delayed_check 又静默
+            # 吞掉，于是整条链路无痕。运营者看到的是「最近裁决: 接话」+ 什么都没
+            # 发生 + 今日已回复 0，无从判断是没生成、被丢还是没发。
+            # 直发计数一并打出：工具可能已经提交过消息，那时"before submission"
+            # 是假的，只写原因会让排障者以为一条都没发出去。
+            logger.info(
+                "[%s] reply discarded during generation session=%s ledger_id=%s "
+                "reason=cancelled direct_sends=%d",
+                PLUGIN_ID,
+                run.umo,
+                run.ledger.ledger_id,
+                run.ledger.direct_send_count,
             )
             raise
         except TimeoutError:
@@ -704,7 +729,12 @@ class GenerationRunner:
             # 不是 Mapping 时降级为宿主默认行为。
             pass
         return self._runtime().new_build_config(
-            tool_call_timeout=int(provider_settings.get("tool_call_timeout", 60) or 60),
+            # 夹取必须能防抛：provider_settings 是宿主配置里可手改的外部输入，
+            # "60s" 之类的非数字串若在 try 之外 int() 抛出，会让所有主动生成
+            # 整体失败，本方法承诺的"拿不到会话配置就退化到宿主默认"随之失效。
+            tool_call_timeout=as_int(
+                provider_settings.get("tool_call_timeout") or 60, 60, minimum=1, maximum=86400
+            ),
             # 强制 full：skills_like 会进入 raw/light 双工具集路径，策略清理只覆盖
             # light 集，边界不可见；主动回复工具集很小，full 无额外成本。
             tool_schema_mode="full",

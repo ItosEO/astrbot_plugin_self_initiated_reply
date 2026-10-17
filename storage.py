@@ -215,18 +215,22 @@ def _read_state_document(path: Path) -> dict[Any, Any]:
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
-        if isinstance(data, dict):
-            file_version = data.get("version")
-            if file_version is not None and file_version != STATE_VERSION:
-                logger.error(
-                    "[%s] state version mismatch: file=%s expected=%s; backing up",
-                    PLUGIN_ID,
-                    file_version,
-                    STATE_VERSION,
-                )
-                _backup_state_file(path)
-            raw_sessions = data.get("sessions", {})
-            return raw_sessions if isinstance(raw_sessions, dict) else {}
+        if not isinstance(data, dict):
+            # 解析成功但不是对象（顶层数组/null/裸标量）同样是被外部改坏的文件：
+            # 不备份不记录的话，下一次状态落盘会静默覆盖它，用户无从查证。
+            # 空对象 {} 是合法空状态，必须继续走下方解析而不是备份。
+            raise json.JSONDecodeError("state document is not a JSON object", str(path), 0)
+        file_version = data.get("version")
+        if file_version is not None and file_version != STATE_VERSION:
+            logger.error(
+                "[%s] state version mismatch: file=%s expected=%s; backing up",
+                PLUGIN_ID,
+                file_version,
+                STATE_VERSION,
+            )
+            _backup_state_file(path)
+        raw_sessions = data.get("sessions", {})
+        return raw_sessions if isinstance(raw_sessions, dict) else {}
     except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
         logger.error("[%s] failed to load state (backing up): %s", PLUGIN_ID, exc)
         _backup_state_file(path)

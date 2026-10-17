@@ -111,6 +111,32 @@ def test_cq_at_requires_identifier_boundary() -> None:
     assert events.is_explicit_direct_call(event, "[At:456123]") is False
 
 
+def test_at_component_alone_marks_a_direct_call() -> None:
+    """At **组件**（而不是文本）单独就足以判定点名。
+
+    缺陷形态：OneBotv11 类适配器的 @ 到达时是 `At` 组件，不一定会同时
+    出现在 `message_str` 里。`utils.is_explicit_direct_call` 的组件分支
+    （`event_components` → `isinstance(comp, At)`）是唯一覆盖它的路径。
+
+    这条分支在整个套件里从未被驱动：`FakeEvent` 没有 `get_messages()`
+    也没有 `message_obj`，`event_components` 恒返回 `[]`。变异证据：把分支条件
+    改成 `False and isinstance(comp, At)` 后整个套件仍然全绿——即破坏它不会被发现，
+    而用户可见的后果是机器人开始回复那些 @ 它的消息。
+
+    变异锚定：删掉组件分支本用例红。
+    """
+    from astrbot.api import message_components as components
+
+    events = _events_module()
+    event = _FakeEvent(self_id="123")
+    event.get_messages = lambda: [components.At(qq="123")]
+    assert events.is_explicit_direct_call(event, "在吗") is True
+    # 对照：At 的是别人，不得判为点名
+    other = _FakeEvent(self_id="123")
+    other.get_messages = lambda: [components.At(qq="456")]
+    assert events.is_explicit_direct_call(other, "在吗") is False
+
+
 def test_handle_incoming_message_skips_events_the_command_path_already_took(tmp_path) -> None:
     """extra 里的 COMMAND_HANDLED_KEY 是入口的第一道闸：已接住的事件不再进主动链。
 

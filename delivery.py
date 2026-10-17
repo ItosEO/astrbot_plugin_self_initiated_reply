@@ -38,7 +38,12 @@ from .models import (
     now_ts,
 )
 from .outbound import OutboundGateway
-from .utils import event_message_id, event_self_id, event_sender_id, safe_exc_text
+from .utils import (
+    event_message_id,
+    event_self_id,
+    event_sender_id,
+    redact_exc_text,
+)
 
 # 注入回调的类型别名：这四个全按位置调用故用 Callable；models.py 的三个
 # Protocol 有关键字形参，Callable 表达不了。
@@ -151,11 +156,16 @@ class DeliveryRunner:
         )
 
     @staticmethod
-    def _attach_chain_prefix(chain_owner: Any, component: Any, *, kind: str) -> bool:
-        """把装饰性组件插到消息链首。失败静默降级为普通发送：引用与 @ 都是
-        装饰性组件，宿主链不可写或平台不支持都不该让整次回复失败。"""
+    def _attach_chain_prefix(chain_owner: Any, factory: Any, *, kind: str) -> bool:
+        """构造并插入装饰组件；任一步失败都静默降级为普通发送。
+
+        ``factory`` 必须是本方法的参数而不是``在调用处求值好的组件``：构造在
+        try 之外时，宿主/平台不支持该组件引发的异常会绕过这里，落到
+        ``_send_via_event`` 的外层 except，整条回复被判 FAILED_BEFORE_SUBMIT
+        ——与「装饰性组件不得影响投递结果」的契约正好相反。
+        """
         try:
-            chain_owner.chain.insert(0, component)
+            chain_owner.chain.insert(0, factory())
             return True
         except Exception as exc:
             logger.debug("[%s] %s component skipped: %s", PLUGIN_ID, kind, exc)
@@ -255,12 +265,16 @@ class DeliveryRunner:
                     # 可能已提交：不自动重试；仍消耗冷却与日配额并推进观察
                     # 窗口，防止巡检或新消息立刻对同一事件重复处理。
                     return "主动发送状态未知，未自动重试。"
-                if not self._gate.is_current(umo, expected_generation):
-                    return STALE_REPLY_MESSAGE
+                # SUPPRESSED 的成因判定必须先于代次复核：装饰 hook 是一次 await，
+                # 期间插件重载会同时置 _stopping 并推进代次。先判代次会把
+                # "因停止而抑制"误报成"会话已更新"，把排障方向指错（DECISIONS.md
+                # 的 SUPPRESSED 文案按成因分流一节）。
                 if sent.status is SendStatus.SUPPRESSED:
                     # 判据取 code 而非 detail 文案：改措辞不该改变控制流。
                     if sent.code is SuppressCode.STOPPING:
                         return STOPPING_REPLY_TEXT
+                    return STALE_REPLY_MESSAGE
+                if not self._gate.is_current(umo, expected_generation):
                     return STALE_REPLY_MESSAGE
                 return "主动发送失败。"
         # reply 为空（仅剩工具直发）时无需再发文本；真正的把关在 OutboundGateway：
@@ -410,12 +424,12 @@ class DeliveryRunner:
                 )
             if quote_id:
                 # 引用组件在装饰钩子之后插入：钩子改的是链内容，引用是外层标注。
-                self._attach_chain_prefix(result, Reply(id=quote_id), kind="quote")
+                self._attach_chain_prefix(result, lambda: Reply(id=quote_id), kind="quote")
             if mention_id:
                 # @ 组件同样插在装饰钩子之后，且必须插在 quote 之后：
                 # ``insert(0)`` 让后插者位于更前，先 Reply 后 At 才能得到
                 # [At, Reply, ...正文]。两步同步，不新增 await 点。
-                self._attach_chain_prefix(result, At(qq=mention_id), kind="mention")
+                self._attach_chain_prefix(result, lambda: At(qq=mention_id), kind="mention")
             logger.debug(
                 "[%s] event send begin ledger_id=%s session=%s chars=%d chain_items=%d",
                 PLUGIN_ID,
@@ -465,14 +479,15 @@ class DeliveryRunner:
             self._clear_result(last_event)
             raise
         except Exception as exc:
-            safe_detail = safe_exc_text(exc)
+            # 脱敏口径同 decision：detail 只进日志（_send_via_context 与 generation
+            # 的 UNKNOWN 分支）。不开 exc_info（traceback 帧常持有 request）。
+            safe_detail = redact_exc_text(exc)
             logger.warning(
                 "[%s] event send reply failed ledger_id=%s session=%s error=%s",
                 PLUGIN_ID,
                 ledger_id,
                 umo,
                 safe_detail,
-                exc_info=True,
             )
             self._clear_result(last_event)
             if send_started:
@@ -530,7 +545,7 @@ class DeliveryRunner:
                 )
             return send_result.outcome
         except Exception as exc:
-            safe_detail = safe_exc_text(exc)
+            safe_detail = redact_exc_text(exc)
             logger.warning(
                 "[%s] send reply failed ledger_id=%s session=%s error=%s",
                 PLUGIN_ID,
@@ -583,5 +598,7 @@ class DeliveryRunner:
             await self._save_storage()
             return True
         except Exception as exc:
-            logger.warning("[%s] proactive state save failed: %s", PLUGIN_ID, exc)
+            # 脱敏后进日志：落盘失败的异常文本含 state.json 绝对路径，
+            # 与 §7.1「内部异常细节只进服务端日志、不回显客户端」同一口径。
+            logger.warning("[%s] proactive state save failed: %s", PLUGIN_ID, redact_exc_text(exc))
             return False

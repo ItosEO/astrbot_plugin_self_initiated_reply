@@ -34,7 +34,7 @@ from .models import (
     now_ts,
 )
 from .session_gate import SessionGate
-from .utils import is_full_umo, session_is_private
+from .utils import is_full_umo, redact_exc_text, session_is_private
 
 
 class CheckSessionCallback(Protocol):
@@ -73,6 +73,7 @@ class SessionScheduler:
         drop_older_images: Callable[[float], None],
         last_events: dict[str, Any],
         last_event_at: dict[str, float],
+        last_decisions: dict[str, Any],
         recent_image_events: dict[str, Any],
         whitelist_runtime_umos: dict[str, set[str]],
         delay_tasks: dict[str, asyncio.Task[Any]],
@@ -93,6 +94,7 @@ class SessionScheduler:
         # 按属性名枚举）不必跟着改。
         self._last_events = last_events
         self._last_event_at = last_event_at
+        self._last_decisions = last_decisions
         self._recent_image_events = recent_image_events
         self._whitelist_runtime_umos = whitelist_runtime_umos
         self._delay_tasks = delay_tasks
@@ -319,7 +321,13 @@ class SessionScheduler:
             result = await self._run_registered_check(
                 umo, trigger=trigger, force=force, generation=generation
             )
-            logger.info(
+            # 与巡检侧的同名日志（_patrol_one_session）同级：两者包的是同一次检查、
+            # 打的是同一种结果串，级别必须一致，否则同一信息在一条路径上可见、
+            # 另一条上不可见。取 DEBUG：result 绝大多数是跳过理由（冷却中/观察窗
+            # 已推进/静默不足），属高频成功路径；要诊断"为什么不接话"看的是
+            # session_pipeline 的 decision 行（INFO，含 should_reply 与理由），
+            # README 排障步骤引用的就是那一行。
+            logger.debug(
                 "[%s] check result session=%s trigger=%s result=%s", PLUGIN_ID, umo, trigger, result
             )
         except asyncio.CancelledError:
@@ -329,7 +337,7 @@ class SessionScheduler:
                 "[%s] delayed check failed session=%s error=%s",
                 PLUGIN_ID,
                 umo,
-                exc,
+                redact_exc_text(exc),
                 exc_info=True,
             )
 
@@ -341,19 +349,26 @@ class SessionScheduler:
         """图片保留窗口；规格表已按同一下限夹取，这里兜住直写 ``settings`` 的路径。"""
         return max(float(MIN_VISION_IMAGE_AGE_SEC), float(self.settings.vision_image_age_sec))
 
-    def _prune_image_index(self, current: float) -> tuple[float, set[str]]:
-        """回收过期图片索引（纯内存，无磁盘 IO），返回 (保留窗口, 受保护源)。"""
+    def _expire_image_index(self, current: float) -> float:
+        """回收过期图片索引（纯内存，无磁盘 IO），返回保留窗口。"""
         image_age = self._image_age_sec()
         self._drop_older_images(current - image_age)
+        return image_age
 
-        protected_sources = {
+    def _protected_image_sources(self) -> set[str]:
+        """仍在索引里的图片源：磁盘清理不得删掉它们。"""
+        return {
             image.prepared_source
             for events in self._recent_image_events.values()
             for _, images in events
             for image in images
             if image.prepared_source
         }
-        return image_age, protected_sources
+
+    def _prune_image_index(self, current: float) -> tuple[float, set[str]]:
+        """过期回收 + 受保护源，供要清磁盘的两条路径一次取全。"""
+        image_age = self._expire_image_index(current)
+        return image_age, self._protected_image_sources()
 
     def cleanup_image_sources(self, *, now: float | None = None) -> int:
         """同步清理过期图片索引与磁盘缓存。
@@ -413,13 +428,18 @@ class SessionScheduler:
         stale = [item for item in removable if now - item[0] >= EVENT_CLEANUP_INTERVAL_SEC]
         for active_at, umo in stale:
             self._clear_event(umo, active_at)
+            # 裁决条目与事件缓存同生命周期：不同步回收，静默会话的条目只增不减
+            # （上限只是白名单规模 1000），并被 GET /status 整表回显。
+            self._last_decisions.pop(umo, None)
 
         # 只做纯内存的图片索引回收：本方法由 on_message（协程）同步调用，
         # 磁盘遍历会阻塞消息热路径，磁盘侧由 _image_cleanup_loop 独立承担
         # （其周期严于本方法的 1h 节流，回收不会延后）。
         # 此处不得调用 ensure_image_cleanup：它经 create_task 起循环，而本
         # 方法在无事件循环的同步上下文也会被调用。
-        self._prune_image_index(now)
+        # 也不建受保护源集合：那要遍历全部会话的全部图片（≤1000×20×5），
+        # 而本路径只做内存过期，集合建了没人用。
+        self._expire_image_index(now)
 
         if len(self._last_events) > MAX_CACHED_EVENTS:
             excess = len(self._last_events) - MAX_CACHED_EVENTS
@@ -429,6 +449,9 @@ class SessionScheduler:
                     break
                 if umo in self._last_events and umo not in live_sessions:
                     self._clear_event(umo, active_at)
+                    # 溢出通道也必须同步：被这里摘掉的会话此后不再出现在
+                    # removable 里，只靠上面的陈旧通道就永远回收不到它的裁决。
+                    self._last_decisions.pop(umo, None)
                     removed += 1
             if removed:
                 logger.info(
@@ -440,7 +463,7 @@ class SessionScheduler:
 
         # 回收长期无活动的运行时 UMO 映射，避免对白名单内会话只增不减。
         # 起点复用 live_sessions：本方法是同步的（无 await），中间只调
-        # _clear_event 与 _prune_image_index，都不碰运行中会话与延迟任务表。
+        # _clear_event 与 _expire_image_index，都不碰运行中会话与延迟任务表。
         active_umos = set(live_sessions)
         active_umos.update(
             umo for umo, at in self._last_event_at.items() if now - at < EVENT_CLEANUP_INTERVAL_SEC
@@ -507,7 +530,9 @@ class SessionScheduler:
                     return
                 await self.run_image_cleanup()
             except Exception as exc:
-                logger.warning("[%s] image cleanup loop failed: %s", PLUGIN_ID, exc)
+                logger.warning(
+                    "[%s] image cleanup loop failed: %s", PLUGIN_ID, redact_exc_text(exc)
+                )
                 # 清理失败后按巡检退避同量级重试，不空转也不久拖。
                 await asyncio.sleep(float(PATROL_BACKOFF_DELAY_SEC))
 
@@ -547,7 +572,12 @@ class SessionScheduler:
                         seen_patrol_umos.add(umo)
                         await self._patrol_one_session(umo, now)
             except Exception as exc:
-                logger.warning("[%s] patrol loop failed error=%s", PLUGIN_ID, exc, exc_info=True)
+                logger.warning(
+                    "[%s] patrol loop failed error=%s",
+                    PLUGIN_ID,
+                    redact_exc_text(exc),
+                    exc_info=True,
+                )
                 # 添加退避延迟，避免错误循环
                 await asyncio.sleep(min(PATROL_BACKOFF_DELAY_SEC, self.settings.check_interval_sec))
 
@@ -584,7 +614,7 @@ class SessionScheduler:
                 "[%s] patrol session failed session=%s error=%s",
                 PLUGIN_ID,
                 umo,
-                exc,
+                redact_exc_text(exc),
                 exc_info=True,
             )
 
@@ -608,4 +638,6 @@ class SessionScheduler:
                 except asyncio.CancelledError:
                     pass
                 except Exception as exc:
-                    logger.warning("[%s] patrol task failed during stop: %s", PLUGIN_ID, exc)
+                    logger.warning(
+                        "[%s] patrol task failed during stop: %s", PLUGIN_ID, redact_exc_text(exc)
+                    )

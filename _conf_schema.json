@@ -51,7 +51,7 @@
   "decision_history_min_messages": {
     "type": "int",
     "description": "最少上下文消息数",
-    "hint": "生成主动回复前至少参考多少条当前会话上下文；缓存不足时会读取 AstrBot 当前会话历史补齐。0 表示只用本插件缓存。",
+    "hint": "判断是否接话前至少参考多少条当前会话上下文；缓存不足时会读取 AstrBot 当前会话历史补齐。0 表示只用本插件缓存。",
     "default": 5,
     "slider": {
       "min": 0,

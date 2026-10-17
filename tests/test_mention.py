@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from .host_stubs import FakeContextSend, FakeEvent, FlipGate
 from .test_delivery_runner import _make_runner
@@ -169,30 +170,70 @@ async def test_mention_skipped_when_generation_changed_before_send(tmp_path: Pat
 
 
 async def test_mention_component_failure_degrades_to_plain_send(tmp_path: Path) -> None:
-    """@ 组件构造失败（宿主/平台不支持）静默降级：投递结果与记账不受影响。"""
-    from . import host_stubs
+    """@ 组件构造失败（宿主/平台不支持）静默降级：投递结果与记账不受影响。
 
-    host_stubs.install_astrbot_stubs()
-    import astrbot.api.message_components as components
+    必须替换 **delivery 模块自己绑定的** ``At``：``delivery.py`` 顶部是
+    ``from astrbot.api.message_components import At, Reply``，改
+    ``components.At`` 动不了它，那条用例会恒绿（组件照常构造成功，
+    "降级"从未被触发）。
+    """
+    _mod, models, runner, last_events = _make_runner(tmp_path, config={"mention_mode": "always"})
 
     class _BoomAt:
         def __init__(self, *args: object, **kwargs: object) -> None:
             raise RuntimeError("platform has no at component")
 
-    _mod, models, runner, last_events = _make_runner(tmp_path, config={"mention_mode": "always"})
     event = _ChainRecordingEvent(umo="s1", sender_id="u1")
     last_events["s1"] = event
-    original = components.At
-    components.At = _BoomAt
+    original = _mod.At
+    _mod.At = _BoomAt
     try:
         outcome = await runner.send_reply("s1", "hello", expected_generation=None)
     finally:
-        components.At = original
+        _mod.At = original
     assert outcome.status is models.SendStatus.DELIVERED
     assert event.sent_chains, "@ 失败不应阻止发送"
+    assert not _at_items(event.sent_chains[0]), "构造失败的 @ 不得进链"
 
 
-def test_mention_host_at_stub_accepts_qq(tmp_path: Path) -> None:
+async def test_quote_component_failure_degrades_to_plain_send(tmp_path: Path) -> None:
+    """引用组件构造失败同样静默降级（与 @ 完全同一套纪律）。
+
+    配置必须是 ``quote_mode="random"`` + 概率拉满：``quote_mode`` 的取值只有
+    off/model/random，写 ``"always"`` 会被 ``choice()`` 静默映射成 ``off``，
+    于是 ``quote_id`` 为空、``if quote_id:`` 分支根本不进，替换 ``_mod.Reply``
+    也永远不会被调用——那样这条用例恒绿，什么都没验。
+    """
+    _mod, models, runner, last_events = _make_runner(
+        tmp_path, config={"quote_mode": "random", "quote_probability": 100}
+    )
+
+    class _BoomReply:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise RuntimeError("platform has no reply component")
+
+    event = _ChainRecordingEvent(umo="s1", sender_id="u1")
+    # 引用 ID 取自 message_obj.message_id：给裸字符串会被当成"取不到 ID"而降级，
+    # 那样本条用例根本不进 if quote_id 分支（恒绿）。
+    event.message_obj = SimpleNamespace(message_id="msg-42")
+    last_events["s1"] = event
+    original = _mod.Reply
+    _mod.Reply = _BoomReply
+    try:
+        outcome = await runner.send_reply("s1", "hello", expected_generation=None)
+    finally:
+        _mod.Reply = original
+    assert outcome.status is models.SendStatus.DELIVERED
+    assert event.sent_chains, "引用失败不应阻止发送"
+    assert not _at_items(event.sent_chains[0]), "quote 降级不应误插 @"
+    # 失败的 Reply 不得以半成品形态留在链里：插上去就是平台收到一个坏组件，
+    # 而降级契约要求"装饰性组件不得影响投递结果与记账"（契约 §14.1）。
+    assert not [
+        item for item in event.sent_chains[0] if type(item).__name__ in {"Reply", "_FakeReply"}
+    ], "quote 构造失败后链里仍留有 Reply 组件"
+
+
+async def test_mention_host_at_stub_accepts_qq(tmp_path: Path) -> None:
     """守卫：``At`` 桩必须接受 ``qq=`` 关键字，否则上面全部用例都是假绿。
 
     空壳 ``type("At", (), {})`` 会让 ``At(qq=...)`` 抛 TypeError，被

@@ -122,7 +122,12 @@ function showToast(message, isError = false) {
 }
 
 async function getBridge() {
-	if (!window.AstrBotPluginPage) return null;
+	// 两个条件都查：宿主可能给出一个缺 ``ready`` 的残缺/旧版 SDK 对象。只查对象
+	// 存在时，下一行的 ``.ready()`` 会抛裸 TypeError，被 normalizeApiError 原样当
+	// 作用户可见的 toast 弹出来，而文档里承诺的 fetch 兜底根本不会触发。
+	// 判据取「可调用」而非「真值」：ready 为 "yes" / 1 / {} 同样过得了真值检查，
+	// 调到时照样抛那个 TypeError，兜底仍不触发。
+	if (typeof window.AstrBotPluginPage?.ready !== "function") return null;
 	// ready() 的结论必须被读出来：requestPluginApi 靠本函数的返回值决定走 bridge
 	// 还是走 fetch，握手失败却仍返回对象，等于宣称 bridge 可用，兜底路径永不触发。
 	// 映射成布尔而不是直接取真值，避免「握手成功但解析为 falsy」被误判成失败。
@@ -281,6 +286,8 @@ async function loadProviders() {
 let loadInFlight = false;
 
 async function loadAll({ force = false } = {}) {
+	// 布尔而非计数的前提：第二个入口只有刷新按钮，而 #boot 遮罩（style.css
+	// z-index:90）盖住 .topbar（25）与窄屏下的更多操作菜单（50），在途时点不到它。
 	loadInFlight = true;
 	try {
 		await loadProviders();
@@ -411,11 +418,11 @@ if (els.themeToggle) {
 		const next = nextTheme();
 		markThemeTouched();
 		applyTheme(next, els.themeToggle);
-		persistTheme(next, apiPost);
+		persistTheme(next, apiPost, showToast);
 	});
 }
 
-bindDimBoldButtons(() => persistTheme(null, apiPost));
+bindDimBoldButtons(() => persistTheme(null, apiPost, showToast));
 restoreDimBold();
 try {
 	const saved = normalizeTheme(localStorage.getItem(THEME_KEY));

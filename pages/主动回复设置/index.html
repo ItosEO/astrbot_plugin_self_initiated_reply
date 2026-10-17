@@ -493,7 +493,7 @@
                 <span class="readout-label"
                   ><i class="stat-dot" aria-hidden="true"></i>生效会话</span
                 >
-                <strong id="whitelistCount" aria-live="polite">-</strong>
+                <strong id="whitelistCount">-</strong>
               </div>
             </div>
           </section>
@@ -506,7 +506,7 @@
                   <use href="#i-scope" /></svg
                 >生效范围
               </h2>
-              <span class="muted">只在这些会话里主动开口</span>
+              <span class="muted">只在这些会话里主动开口（保存后按字典序重排）</span>
             </div>
             <div class="field">
               <div class="field-label-row">
@@ -528,13 +528,22 @@
                 data-config-transform="whitelist"
                 rows="5"
                 spellcheck="false"
-                aria-describedby="whitelistError"
-                placeholder="留空则任何会话都不会主动回复&#10;群聊可填完整 UMO，也可直接填 QQ 群号"
+                aria-describedby="whitelistError whitelistSummary"
+                placeholder="留空则任何会话都不会主动回复&#10;群聊可填完整 UMO，也可直接填 QQ 群号（也支持逗号分隔）"
               ></textarea>
               <div class="whitelist-bar">
                 <!-- 文案由 config-form.mjs 的 summarizeWhitelist 单源写入：这里再抄一份
-                     会在加载完成后立刻被覆盖，两处各自演化就是漂移。 -->
-                <span class="whitelist-summary" id="whitelistSummary"></span>
+                     会在加载完成后立刻被覆盖，两处各自演化就是漂移。
+                     aria-describedby（上方 textarea）已在聚焦时给出这两句，故
+                     role/aria-live 不是必需的：它只额外提供「变了」的即时播报，
+                     且只有在 config-io.mjs 逐字相同就不写的前提下才是净收益
+                     （否则每敲一键都会把整句摘要重新排进播报队列）。 -->
+                <span
+                  class="whitelist-summary"
+                  id="whitelistSummary"
+                  role="status"
+                  aria-live="polite"
+                ></span>
               </div>
               <span class="field-error" id="whitelistError" role="alert"></span>
             </div>
@@ -811,7 +820,7 @@
               <summary>提示词变量帮助</summary>
               <div class="details-body">
                 <p class="muted">
-                  预览窗口使用下方变量的示例值；真实运行时，插件会按当前会话、触发方式和最近消息替换。
+                  预览窗口只展示你写的模板本体（用示例值替换变量）。真实运行时插件还会按当前会话与触发方式替换变量，并在模板没有相应内容时附加三段：最近消息列表（模板既无 {recent_messages} 也无 {latest_message} 时）、JSON 输出约定（模板缺 should_reply 或 reason 任一即附加）、以及引用提示（quote_mode 为 model 且模板无 quote 时）。所以预览比模型实际收到的内容短。
                 </p>
                 <dl class="variable-list">
                   <div>
@@ -1099,7 +1108,7 @@
                   class="muted"
                   id="cleanupImageCacheState"
                   aria-live="polite"
-                  >自动清理运行中</span
+                  >过期图片由后台定时清理（插件暂停时不清理）</span
                 >
               </div>
 

@@ -180,6 +180,8 @@ export function syncTopbarHeight(els) {
     if (root.style.getPropertyValue("--topbar-h") === `${height}px`) return;
     root.style.setProperty("--topbar-h", `${height}px`);
   };
+  // 不存引用也不 disconnect 是刻意的：observer 随页面生命周期存续，本页没有
+  // 会重建 topbar 的局部重渲染，拆卸由整页卸载负责。
   new window.ResizeObserver(write).observe(els.topbar);
   write();
 }
