@@ -300,16 +300,42 @@ def test_api_providers_happy_and_error(tmp_path) -> None:
 
 
 def test_api_status(tmp_path) -> None:
+    """状态端点的字段级读数必须与插件实况一致，不能是恒真的 ``is`` 比较。
+
+    缺陷形态：宿主桩默认 ``enabled=True`` / ``decision_model_enabled=False``，而
+    场景从不翻面运行态，``status["runtime_enabled"] is plugin.runtime_enabled``
+    退化成 ``True is True``；gate 段两条只是键存在性断言。把这些字段换成硬编码
+    常量，旧用例全绿——而 ``runtime_enabled`` 正是排障时判断"插件是不是还活着"
+    的承重字段（持久配置在 DEGRADED 下仍显示 True），字段级谎报直接指向错误方向。
+
+    变异锚定：把 ``_api_status`` 里的 ``plugin.runtime_enabled`` 换成硬编码
+    ``True``、``decision_model_enabled`` 换成硬编码 ``False``、或把 gate 两张表
+    换成 ``{}`` / ``[]``，本用例红。
+    """
+
     async def scenario(plugin, main):
         webapi = sys.modules[f"{PACKAGE}.webapi"]
+        # 翻面：不翻的话 `is` 比较恒真，硬编码常量也能全绿
+        plugin.runtime_enabled = False
+        plugin.settings.decision_model_enabled = True
         status = await webapi._api_status(plugin)
         assert status["ok"] is True
-        assert status["runtime_enabled"] is plugin.runtime_enabled
+        assert status["runtime_enabled"] is False, status["runtime_enabled"]
         assert status["whitelist_count"] == len(plugin.settings.whitelist)
-        assert status["decision_model_enabled"] is plugin.settings.decision_model_enabled
+        assert status["decision_model_enabled"] is True, status["decision_model_enabled"]
         assert "pipeline_mode" not in status
-        # 调试面板导出：代次/运行中/任务数/缓存规模/最近裁决
-        assert "gate" in status and "generation" in status["gate"]
+        # 代次与运行集按内容断言：键存在性放不掉硬编码空表
+        plugin._gate.advance(UMO)
+        plugin._gate.mark_running(UMO)
+        status = await webapi._api_status(plugin)
+        assert status["gate"]["generation"].get(UMO) == plugin._gate.current(UMO), (
+            f"代次表内容与实况不符：{status['gate']['generation']}"
+        )
+        assert status["gate"]["running"] == sorted(plugin._gate.running_sessions_view), (
+            f"运行集内容与实况不符：{status['gate']['running']}"
+        )
+        assert UMO in status["gate"]["running"], status["gate"]["running"]
+        # 调试面板导出：任务数/缓存规模/最近裁决
         assert set(status["tasks"]) == {"delay", "running_check", "background"}
         assert set(status["caches"]) == {"events", "image_events", "sessions"}
         assert isinstance(status["last_decisions"], dict)

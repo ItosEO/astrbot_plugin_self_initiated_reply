@@ -247,11 +247,33 @@ class GenerationRunner:
         if cancel_first:
             run_task.cancel()
         grace_sec = max(0.0, self._grace_stop_sec())
+        # 宽限窗口的统一截止时刻：被取消后重入等待时只能用剩余额度，否则一次
+        # 取消就把总停止时间放大一倍。
+        deadline = asyncio.get_running_loop().time() + grace_sec
         try:
             done, _ = await asyncio.wait({run_task}, timeout=grace_sec)
         except asyncio.CancelledError:
+            # 宽限窗口内又收到取消（一条写指令、/off、POST /config、terminate）。
+            # 不能据此判定"run task 吞掉了取消"：超时路径下它可能正在自行收敛，
+            # 而隔离登记 → _mark_degraded 是**单向永久**的——一次例行指令、或在
+            # 面板点一下禁用、或插件 reload，就能把主动回复永久停摆到重载为止
+            # （契约 §5 把 DEGRADED 留给真的超出硬停止窗口的任务）。与下方超时
+            # 路径用同一判据：把剩余宽限用完再决定。
             run_task.cancel()
-            quarantine(run_task, "generation stop interrupted")
+            try:
+                done, _ = await asyncio.wait(
+                    {run_task},
+                    timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
+                )
+            except asyncio.CancelledError:
+                # 二次取消：停止意图明确，按原行为隔离后原样重放。仓库其余取消
+                # 点都带 cancelling() 守卫，这条路基本不可达；真到达时保守隔离
+                # 优于留下可能绕过闸门的存活 agent。
+                run_task.cancel()
+                quarantine(run_task, "generation stop interrupted")
+                raise
+            if not done:
+                quarantine(run_task, "agent runner ignored cancellation")
             raise
         if done:
             # 收敛成功也必须取回结果：以异常收尾时若不读，asyncio 会在事件

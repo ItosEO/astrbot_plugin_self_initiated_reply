@@ -2307,21 +2307,24 @@ def test_download_preflight_policy_refusal_warns(tmp_path: Path, monkeypatch, ca
 
     与 ``test_download_warns_when_address_policy_blocks`` 分工：那个 monkeypatch
     ``_resolve_global_address`` 让它返回内网地址，只走到传输层；本用例让预检自己
-    拒绝（scheme/端口），覆盖前面那一截。
+    拒绝（scheme/端口/主机），覆盖前面那一截。
 
-    变异锚定：删掉三处 ``_warn_policy_refusal`` 调用，本用例红。
+    变异锚定：删掉**任意一处** ``_warn_policy_refusal`` 调用，本用例红——判据是
+    逐 case 核对 reason 文案，漏掉任一支都对应不上。
     """
     import logging
 
     _, image, _ = _load_modules()
     parser_mod = _parser_module()
     parser = make_parser(image, tmp_path)
+    # 三个 case 必须分别命中三处预检：scheme 一支此前从未被触发过（https 本就
+    # 合法，旧用例里那条 URL 实际落的是"解析不到公网地址"），漏掉它全绿。
     cases = {
-        "https://cdn.example/x.png": "scheme not allowed",
+        "ftp://cdn.example/x.png": "scheme not allowed",
         "http://10.0.0.5/x.png": "no global address for host",
         "http://example.com:8080/x.png": "port 8080 not in allowlist",
     }
-    for url, _reason in cases.items():
+    for url, reason in cases.items():
         with capture_logs(caplog, parser_mod.logger, logging.DEBUG):
             assert asyncio.run(parser._download_image_data_url(url)) is None
         refused = [
@@ -2330,6 +2333,10 @@ def test_download_preflight_policy_refusal_warns(tmp_path: Path, monkeypatch, ca
             if record.levelno == logging.WARNING and "address policy" in record.getMessage()
         ]
         assert len(refused) == 1, f"{url} 的策略拒绝未记 WARNING：{caplog.records}"
+        # 逐 case 核对 reason：只数条数时，三处里漏掉任何一处都仍是 1 条
+        assert reason in refused[0].getMessage(), (
+            f"{url} 的拒绝原因不对（预期 {reason}）：{refused[0].getMessage()}"
+        )
         assert "example" in refused[0].getMessage() or "10.0.0.5" in refused[0].getMessage()
         caplog.clear()
 
@@ -2834,35 +2841,58 @@ def test_cleanup_missing_root_returns_zero(tmp_path: Path) -> None:
 
 
 def test_cleanup_ignores_data_url_and_outside_protected(tmp_path: Path) -> None:
+    """protected_sources 的**内容**必须承重：命中的过期文件不得被删。
+
+    缺陷形态：两个受保护条目（data: URL 与缓存外路径）都匹配不到任何被扫文件，
+    ``protected`` 的内容对结果没有任何影响——把整个 protected 解析换成 ``set()``
+    用例仍绿，守住的只是「解析抛不抛异常」。放进一个真会被扫到的过期文件，
+    让集合内容进入断言。
+
+    变异锚定：把 ``_resolve_protected_cache_sources`` 的结果换成 ``set()``，
+    本用例红。
+    """
     _, image, _ = _load_modules()
     root = tmp_path / "cache"
     root.mkdir()
     expired = root / "expired.png"
     expired.write_bytes(b"old")
     os.utime(expired, (100.0, 100.0))
+    guarded = root / "guarded.png"
+    guarded.write_bytes(b"keep")
+    os.utime(guarded, (100.0, 100.0))
     outside = tmp_path / "outside.png"
     outside.write_bytes(b"outside")
 
     removed = image.ImageParser.cleanup_source_cache(
         root,
-        protected_sources={"data:image/png;base64,AA==", str(outside)},
+        protected_sources={"data:image/png;base64,AA==", str(outside), str(guarded)},
         max_age_sec=60,
         now=5000.0,
     )
-    assert removed == 1
+    assert removed == 1, f"受保护文件被删了：removed={removed}"
     assert not expired.exists()
+    assert guarded.exists(), "protected_sources 命中的过期文件被清理删掉了"
 
 
 def test_cleanup_skips_symlinks(tmp_path: Path) -> None:
+    """缓存内的符号链接自身不得被清理删掉（``is_symlink()`` 早退是承重判据）。
+
+    缺陷形态：链接指向缓存**外**时，归属校验（``resolve().relative_to(root)``）
+    已经把它挡掉，``is_symlink()`` 那条早退永远走不到——删掉它用例仍绿，守住的
+    其实是"不越出缓存根"。把链接指向**缓存内**的过期文件，两条判据才分别承重。
+
+    变异锚定：把 ``_scan_source_cache`` 的 ``if path.is_symlink(): continue``
+    改成恒假，本用例红。
+    """
     _, image, _ = _load_modules()
     root = tmp_path / "cache"
     root.mkdir()
-    target = tmp_path / "real.png"
-    target.write_bytes(b"x")
-    os.utime(target, (100.0, 100.0))
+    real = root / "real.png"
+    real.write_bytes(b"x")
+    os.utime(real, (100.0, 100.0))
     link = root / "link.png"
     try:
-        link.symlink_to(target)
+        link.symlink_to(real)
     except (OSError, NotImplementedError) as exc:
         # Windows 非开发者模式下 symlink_to 恒抛 OSError：必须显式 skip，
         # 否则该用例静默空转而报告显示 PASSED。
@@ -2870,8 +2900,11 @@ def test_cleanup_skips_symlinks(tmp_path: Path) -> None:
     os.utime(link, (100.0, 100.0))
 
     removed = image.ImageParser.cleanup_source_cache(root, max_age_sec=60, now=5000.0)
-    assert removed == 0
-    assert target.exists()
+    # 只删真实文件：链接自身不被 unlink（删了等于让 rglob 下一轮再解析一次）
+    assert removed == 1, f"符号链接被一起删了：removed={removed}"
+    assert not real.exists()
+    # is_symlink() 不跟随链接：目标已删，exists() 会恒假，只能用 lstat 语义
+    assert link.is_symlink(), "符号链接自身被清理删掉了"
 
 
 def test_cleanup_unlink_failure_is_ignored(tmp_path: Path, monkeypatch) -> None:

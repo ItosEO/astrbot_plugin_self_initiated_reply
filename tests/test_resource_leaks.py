@@ -137,6 +137,10 @@ def test_spared_critical_task_abandons_later_state_writes(tmp_path: Path) -> Non
     变异锚定：删掉 ``_wait_background_tasks`` 里 critical 分支的
     ``self._spared_critical_tasks.add(task)``，或让 ``save_storage`` 的
     ``abandoned()`` 不再看该集合，本用例红。
+
+    注意 ``release.set()`` 之前必须**再造一处内存变更**：被豁免任务的 payload
+    若与磁盘逐字相同，``save_storage`` 的跳写判据会代为满足"没有发布"，放弃
+    机制从未被执行——那条 mtime 断言绿得空洞（实测只删 spare 注册仍全绿）。
     """
 
     async def scenario(plugin, main):
@@ -169,6 +173,9 @@ def test_spared_critical_task_abandons_later_state_writes(tmp_path: Path) -> Non
             )
             # 被豁免任务自己的慢写仍不得发布（覆盖新实例状态的那个 hazard）
             published_at = state_path.stat().st_mtime_ns
+            # 再造一处变更：让被豁免任务的 payload 与磁盘不同。否则跳写判据
+            # 会先返回，放弃机制根本走不到，mtime 断言恒真。
+            plugin._state_for(UMO).last_active_at += 2.0
             release.set()
             await asyncio.wait_for(critical, timeout=1.0)
             await until(lambda: critical.done())

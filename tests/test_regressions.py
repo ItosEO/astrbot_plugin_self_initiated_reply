@@ -1561,6 +1561,117 @@ def test_off_during_slow_unwinding_generation_stays_running(tmp_path: Path) -> N
     with_plugin(tmp_path, scenario, generation_timeout_sec=60)
 
 
+def test_write_command_in_grace_window_does_not_degrade(tmp_path: Path) -> None:
+    """慢生成超时后的宽限窗口内，一条普通写指令不得把插件永久打成 DEGRADED。
+
+    缺陷形态：agent 超过 ``generation_timeout_sec`` → ``_graceful_stop`` 进宽限
+    等待；这 3s 内任意写指令（add/remove/check/on/off、面板点禁用、插件 reload）
+    取消在途检查，取消落进宽限等待的 ``except CancelledError``，旧实现据此判定
+    "run task 吞掉了取消"并隔离登记 → ``_mark_degraded`` 单向永久：巡检/消息触发/
+    手动检查全被拒，``/selfreply on`` 回报"插件已降级"，只能重载插件。而 run_task
+    其实正在自行收敛——对照组（无指令、或指令晚到）都保持 RUNNING，证明没有任何
+    东西真的超出硬停止窗口，契约 §5 的 DEGRADED 不该由一条例行指令触发。
+
+    变异锚定：把 ``_graceful_stop`` 的 ``except CancelledError`` 分支改回「立即
+    quarantine(..., "generation stop interrupted")」本用例红。
+    """
+
+    # 每个动作各起一个插件实例：写指令会清事件缓存、off 还翻运行态，共用实例会让
+    # 后一个动作撞上完全不同的前置状态（第二条检查会直接 "no last event"）。
+    # with_plugin 只按 (plugin, main) 调用 scenario，故用单元格传动作名。
+    current = {"action": "add"}
+
+    async def scenario(plugin, main):
+        from types import SimpleNamespace
+
+        from .host_stubs import FakeBuildResult, _FakeResetCoro
+
+        action = current["action"]
+        agent_sec = 2.0  # > generation_timeout_sec(1s)，< 宽限窗口(3s)
+        state: dict[str, object] = {}
+
+        class _Runner:
+            def reset(self, **_):
+                return _FakeResetCoro()
+
+            def request_stop(self):
+                pass
+
+            def get_final_llm_resp(self):
+                return SimpleNamespace(completion_text="你好呀", result_chain=None)
+
+            def close(self):
+                pass
+
+        async def build_effect(kwargs, result):
+            return FakeBuildResult(
+                agent_runner=_Runner(),
+                provider_request=kwargs["req"],
+                provider=None,
+                reset_coro=_Runner().reset(),
+            )
+
+        def run_effect(_runner, **_kw):
+            async def gen():
+                state["started"] = True
+                try:
+                    await asyncio.sleep(agent_sec)
+                    state["converged"] = True
+                except asyncio.CancelledError:
+                    state["cancelled"] = True
+                    raise
+                yield None
+
+            return gen()
+
+        original_runtime = main._AGENT_RUNTIME
+        main._AGENT_RUNTIME = PipelineTestAdapter(
+            original_runtime, build_effect=build_effect, run_effect=run_effect
+        )
+
+        async def fake_decide(*_a, **_kw):
+            return {"should_reply": True, "reason": "probe", "elapsed_sec": 0.0}
+
+        plugin._decision.decide = fake_decide
+        event = make_event()
+        plugin._last_events[UMO] = event
+        plugin._last_event_at[UMO] = main.now_ts()
+        plugin._state_for(UMO).last_active_at = main.now_ts() - 300
+        plugin._scheduler.schedule_delayed_check(
+            UMO, delay_sec=0, trigger="message_delay", force=False
+        )
+        await asyncio.wait_for(until(lambda: state.get("started")), timeout=10)
+        # 必须落在**超时之后**的宽限窗口里：generation_timeout_sec=1s，agent 总耗时
+        # 2s。睡 1.4s 让超时先发生（_graceful_stop 的 cancel_first=False 分支），
+        # 指令才落进那个宽限等待的 except CancelledError——早于超时到达的话走的
+        # 是 cancel_first=True 分支，那条路由上一轮修复守着，本用例会假绿。
+        await asyncio.sleep(1.4)
+
+        try:
+            command = FakeEvent(umo=UMO, message_str=f"/selfreply {action}")
+            command.role = "admin"
+            await plugin.on_message(command)
+            await asyncio.sleep(0.1)
+
+            assert plugin.lifecycle_state == "RUNNING", (
+                f"/selfreply {action} 落在宽限窗口内把插件打成了 "
+                f"{plugin.lifecycle_state}：例行指令不该永久降级"
+            )
+            assert not plugin._quarantined_tasks, (
+                f"/selfreply {action} 之后出现隔离任务：{plugin._quarantined_tasks}"
+            )
+            # agent 仍自行收敛：证明没有任何东西真的超出硬停止窗口
+            await asyncio.wait_for(
+                until(lambda: state.get("converged") or state.get("cancelled")), timeout=5
+            )
+        finally:
+            main._AGENT_RUNTIME = original_runtime
+
+    for action in ("add", "off"):
+        current["action"] = action
+        with_plugin(tmp_path / action, scenario, generation_timeout_sec=1)
+
+
 def test_delayed_check_waits_for_running_session_release(tmp_path: Path) -> None:
     """延迟检查须等待前一个 check 结束（事件驱动，非轮询）。"""
 

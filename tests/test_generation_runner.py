@@ -690,7 +690,20 @@ async def test_reply_discarded_log_survives_graceful_stop_reraise(
     )
 
 
-async def test_graceful_stop_cancellation_quarantines_runner(tmp_path: Path) -> None:
+async def test_graceful_stop_cancellation_quarantines_only_unconverged_runner(
+    tmp_path: Path,
+) -> None:
+    """宽限窗口内收到取消：先用完剩余宽限，仍不收敛才隔离登记。
+
+    旧实现在 ``except CancelledError`` 里立即隔离，注释的理由是"没人等它收敛"。
+    但超时路径下 run_task 可能正在自行收敛，而隔离 → ``_mark_degraded`` 是
+    **单向永久**的：一次例行写指令、在面板点一下禁用、或插件 reload，都能把主动
+    回复永久停摆到重载为止（契约 §5 把 DEGRADED 留给真的超出硬停止窗口的任务）。
+    现在与超时路径用同一判据——剩余宽限用完仍不收敛才隔离，理由串也统一。
+
+    变异锚定：把 ``except CancelledError`` 分支改回「立即 quarantine(...,
+    "generation stop interrupted")」本用例红。
+    """
     _, _, runner, _, _, _ = _make_runner(tmp_path, grace_sec=0.05)
     release = asyncio.Event()
     quarantined: dict[str, object] = {}
@@ -717,10 +730,50 @@ async def test_graceful_stop_cancellation_quarantines_runner(tmp_path: Path) -> 
     except asyncio.CancelledError:
         pass
 
+    # 仍不收敛 → 隔离，但判据与理由串都和超时路径一致
     assert quarantined["task"] is run_task
-    assert quarantined["reason"] == "generation stop interrupted"
+    assert quarantined["reason"] == "agent runner ignored cancellation", quarantined
     release.set()
     await asyncio.wait_for(run_task, timeout=1)
+
+
+async def test_graceful_stop_cancellation_lets_slow_runner_converge(tmp_path: Path) -> None:
+    """宽限窗口内收到取消，而 run_task 正在自行收敛：不得隔离登记。
+
+    这条守本轮修复真正要保的结果：一次超时的慢生成之后，一条普通写指令不该把
+    插件永久打成 DEGRADED（对照组证明没有任何东西超出硬停止窗口）。
+
+    变异锚定：把 ``except CancelledError`` 分支改回「立即 quarantine」本用例红。
+    """
+    _, _, runner, _, _, _ = _make_runner(tmp_path, grace_sec=1.0)
+    quarantined: dict[str, object] = {}
+    unwound = asyncio.Event()
+
+    async def slow_unwind() -> None:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.2)  # 仍在宽限窗口内自行收敛
+            unwound.set()
+            raise
+
+    def quarantine(task: asyncio.Task, reason: str) -> None:
+        quarantined["task"] = task
+        quarantined["reason"] = reason
+
+    run_task = asyncio.create_task(slow_unwind())
+    runner._quarantine_task = quarantine
+    stopping = asyncio.create_task(runner._graceful_stop(run_task, object(), cancel_first=False))
+    await asyncio.sleep(0)
+    stopping.cancel()
+    try:
+        await stopping
+        raise AssertionError("expected CancelledError")
+    except asyncio.CancelledError:
+        pass
+
+    assert not quarantined, f"自行收敛的 run_task 被隔离登记了：{quarantined}"
+    await asyncio.wait_for(unwound.wait(), timeout=1)
 
 
 async def test_cancel_during_generation_logs_the_discarded_reply(

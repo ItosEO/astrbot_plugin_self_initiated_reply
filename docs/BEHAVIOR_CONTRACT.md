@@ -89,7 +89,12 @@
 - 移出白名单：代次 prune、会话锁/运行标记回收、内存会话状态清除、磁盘条目
   过滤（重启不复活）。
 - 越权拒绝先行：非管理员写指令不得取消在途回复；只读指令永不打断进行中的
-  检查；写指令（add/remove/check/on/off）通过权限校验后才取消。
+  检查；写指令（add/remove/check/on/off）通过权限校验后才取消。本条说的是
+  **内联入口**（`on_message` 里的 `_handle_inline_command`）的纪律；宿主指令组
+  出口（装饰器注册的那些子命令）不做这次统一取消，只由各动作自身的效果生效——
+  remove 经白名单替换、check 自带 invalidate、off 经 `apply_enabled_topology`，
+  而 add 与 on 不取消在途检查（add 只在会话已有精确条目时才可能有在途检查，
+  on 的在途回复照常发完）。两个出口都是注册在案的，去重靠 `COMMAND_HANDLED_KEY`。
 
 ## 6.1 `/on` `/off` 的持久语义
 
@@ -237,7 +242,7 @@ whitelist），协作者各自存私有引用：`frozen` 视图层不存在，�
 
 手工部署包由 `git archive --format=zip` 导出，排除规则单点声明在仓库根
 `.gitattributes` 的 `export-ignore`；未跟踪与被 `.gitignore` 排除的开发物（覆盖率、
-缓存、虚拟环境、`output/`、`dist/`、`data/`）在结构上不可能进包：
+缓存、虚拟环境、`output/playwright/`、`dist/`、`data/`）在结构上不可能进包：
 `git archive` 只导出 tracked 文件，不存在“漏排除”这一失败模式。理由见
 `docs/DECISIONS.md` 的「发布产物」一节。
 
