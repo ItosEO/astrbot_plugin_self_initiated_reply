@@ -1,30 +1,26 @@
-"""管线持锁复核与投递取不到目标时的降级：三处被变异扫描确认为无守卫的路径。
+"""管线持锁复核与投递降级：被变异扫描确认为无守卫的路径。
 
-这三处删掉后全量套件仍全绿，而各自的后果都是用户可见的：判断期间代次变化
-照样烧一次 LLM、排队等锁的协程拿着锁前的过期结论开跑、事件被回收后引用一个
-不存在的消息 ID。
+这些路径删掉后全量套件仍全绿，而各自的后果都是用户可见的：判断期间代次变化
+照样烧一次 LLM 且状态显示过期结论、排队等锁的协程拿着锁前的过期结论开跑、
+事件被回收后引用一个不存在的消息 ID、decision 违约时把「不该回」的消息静默发
+出去、工具直发后同一条内容被发两遍、空生成产出一条成功的假消息。
 """
 
 from __future__ import annotations
 
 import logging
 
+import pytest
+
 from .host_stubs import FakeEvent, capture_logs, load_package
 
 PACKAGE_NAME = "selfreply_pipeline_guards_test_package"
 
 
-def _install():
+def _install() -> None:
     from .host_stubs import install_astrbot_stubs
 
     install_astrbot_stubs()
-
-
-def _make_pipeline(package: str):
-    pipeline_mod = load_package(package, "session_pipeline")
-    models = load_package(package, "models")
-    gate_mod = load_package(package, "session_gate")
-    return pipeline_mod, models, gate_mod
 
 
 def _closing_tracker(coro):
@@ -41,6 +37,45 @@ def _closing_tracker(coro):
     return _noop()
 
 
+def _wire_pipeline(package, *, umo, decision, generation=None, delivery=None):
+    """装配一个只接必要依赖的 ``SessionPipeline``。
+
+    本文件所有用例都只走「持锁门卫 → 判断 → 代次复核」这一段，不碰账本封账，
+    因此 ``_track_critical_task`` 统一用关协程的替身。各用例之间只有
+    decision/generation/delivery 三处差异，抽成工厂避免改一次接线契约要同步
+    改五处。
+    """
+    pipeline_mod = load_package(package, "session_pipeline")
+    models = load_package(package, "models")
+    gate_mod = load_package(package, "session_gate")
+    state = models.SessionState()
+
+    pipeline = object.__new__(pipeline_mod.SessionPipeline)
+    pipeline._gate = gate_mod.SessionGate()
+    pipeline._state_for = lambda _umo: state
+    pipeline._decision = decision
+    pipeline._generation = generation
+    pipeline._delivery = delivery
+    pipeline._last_decisions = {}
+    pipeline._is_stopping = lambda: False
+    pipeline._is_enabled = lambda: True
+    pipeline._settings = models.Settings.from_config({"whitelist_sessions": [umo]})
+    pipeline._last_events = {umo: object()}
+    pipeline._track_critical_task = _closing_tracker
+    return pipeline, models
+
+
+def _reply_decision(should_reply: bool = True, reason: str = "该接话"):
+    class _Decision:
+        def local_gate(self, _state, *, force):
+            return ""
+
+        async def decide(self, _umo, _state, *, trigger, force):
+            return {"should_reply": should_reply, "reason": reason, "elapsed_sec": 0.1}
+
+    return _Decision()
+
+
 async def test_duplicate_final_text_after_tool_direct_send_is_suppressed(tmp_path) -> None:
     """工具直发后，结论文本与已发内容相同时必须抑制，不得同一条内容发两遍。
 
@@ -53,19 +88,8 @@ async def test_duplicate_final_text_after_tool_direct_send_is_suppressed(tmp_pat
     变异锚定：把该 ``==`` 改成 ``!=``，本用例红。
     """
     _install()
-    package = f"{PACKAGE_NAME}_dup_suppress"
-    pipeline_mod, models, gate_mod = _make_pipeline(package)
-
     umo = "qq:GroupMessage:12345"
-    state = models.SessionState()
     seen: dict[str, object] = {}
-
-    class ReplyDecision:
-        def local_gate(self, _state, *, force):
-            return ""
-
-        async def decide(self, _umo, _state, *, trigger, force):
-            return {"should_reply": True, "reason": "该接话", "elapsed_sec": 0.1}
 
     class DupGeneration:
         async def generate(
@@ -85,18 +109,13 @@ async def test_duplicate_final_text_after_tool_direct_send_is_suppressed(tmp_pat
             seen["count"] = direct_send_count
             return "已发送"
 
-    pipeline = object.__new__(pipeline_mod.SessionPipeline)
-    pipeline._gate = gate_mod.SessionGate()
-    pipeline._state_for = lambda _umo: state
-    pipeline._decision = ReplyDecision()
-    pipeline._generation = DupGeneration()
-    pipeline._delivery = RecordingDelivery()
-    pipeline._last_decisions = {}
-    pipeline._is_stopping = lambda: False
-    pipeline._is_enabled = lambda: True
-    pipeline._settings = models.Settings.from_config({"whitelist_sessions": [umo]})
-    pipeline._last_events = {umo: object()}
-    pipeline._track_critical_task = _closing_tracker
+    pipeline, _models = _wire_pipeline(
+        f"{PACKAGE_NAME}_dup_suppress",
+        umo=umo,
+        decision=_reply_decision(),
+        generation=DupGeneration(),
+        delivery=RecordingDelivery(),
+    )
 
     baseline = pipeline._gate.advance(umo)
     result = await pipeline.check_session_locked(
@@ -106,6 +125,39 @@ async def test_duplicate_final_text_after_tool_direct_send_is_suppressed(tmp_pat
     assert result == "已发送", result
     assert seen["reply"] == "", "结论文本与工具直发相同，却又发了一遍"
     assert seen["count"] == 1
+
+
+async def test_degenerate_decision_dict_is_rejected_not_silently_sent(tmp_path) -> None:
+    """decision 违约返回 dict（而不是把 should_reply=False 转成字符串）必须炸。
+
+    缺陷形态：``_decide_session_reply`` 末尾的
+    ``raise RuntimeError("decide() must convert should_reply=False into a string")``。
+    判断模型明确说「不接话」时，契约要求 ``decide()`` 转成字符串返回；拿到 dict
+    意味着被注入的实现退化——不拦这一道，会话会继续走到生成与发送，把一条模型
+    判定「不该回」的消息发出去，且全程无日志。此前这道 raise **没有任何用例
+    守护**：改坏它全量套件仍全绿，等于一条没人验证的声明。
+
+    变异锚定：把该 ``raise`` 改成 ``return result``，本用例红。
+    """
+    _install()
+    umo = "qq:GroupMessage:12345"
+
+    class ExplodingGeneration:
+        async def generate(self, *_args, **_kwargs):
+            raise AssertionError("should_reply=False 的会话走到了生成：会被静默发送")
+
+    pipeline, _models = _wire_pipeline(
+        f"{PACKAGE_NAME}_degenerate_decide",
+        umo=umo,
+        decision=_reply_decision(should_reply=False, reason="模型说不接话"),
+        generation=ExplodingGeneration(),
+    )
+
+    baseline = pipeline._gate.advance(umo)
+    with pytest.raises(RuntimeError, match="should_reply=False"):
+        await pipeline.check_session_locked(
+            umo, trigger="message_delay", force=False, expected_generation=baseline
+        )
 
 
 async def test_stale_generation_after_decision_records_stale_reason(
@@ -122,11 +174,7 @@ async def test_stale_generation_after_decision_records_stale_reason(
     变异锚定：把该条件改成恒假，本用例红。
     """
     _install()
-    package = f"{PACKAGE_NAME}_stale_after_decide"
-    pipeline_mod, models, gate_mod = _make_pipeline(package)
-
     umo = "qq:GroupMessage:12345"
-    state = models.SessionState()
 
     class AdvancingDecision:
         def local_gate(self, _state, *, force):
@@ -137,20 +185,13 @@ async def test_stale_generation_after_decision_records_stale_reason(
             pipeline._gate.advance(umo)
             return {"should_reply": True, "reason": "模型说该接话", "elapsed_sec": 0.1}
 
-    pipeline = object.__new__(pipeline_mod.SessionPipeline)
-    pipeline._gate = gate_mod.SessionGate()
-    pipeline._state_for = lambda _umo: state
-    pipeline._decision = AdvancingDecision()
-    pipeline._last_decisions = {}
-    pipeline._is_stopping = lambda: False
-    pipeline._is_enabled = lambda: True
-    pipeline._settings = models.Settings.from_config({"whitelist_sessions": [umo]})
-    pipeline._last_events = {umo: object()}
-    # finally 里的封账协程本测试不关心：关掉它，避免为一条早退路径装配整套账本依赖
-    pipeline._track_critical_task = _closing_tracker
+    pipeline, models = _wire_pipeline(
+        f"{PACKAGE_NAME}_stale_after_decide", umo=umo, decision=AdvancingDecision()
+    )
 
     baseline = pipeline._gate.advance(umo)
-    with capture_logs(caplog, pipeline_mod.logger, logging.DEBUG):
+    pipeline_logger = logging.getLogger(type(pipeline).__module__)
+    with capture_logs(caplog, pipeline_logger, logging.DEBUG):
         result = await pipeline.check_session_locked(
             umo, trigger="message_delay", force=False, expected_generation=baseline
         )
@@ -177,11 +218,7 @@ async def test_lock_wait_does_not_bypass_the_in_lock_guard(tmp_path) -> None:
     本用例红。
     """
     _install()
-    package = f"{PACKAGE_NAME}_in_lock_guard"
-    pipeline_mod, models, gate_mod = _make_pipeline(package)
-
     umo = "qq:GroupMessage:12345"
-    state = models.SessionState()
 
     class NoopDecision:
         def local_gate(self, _state, *, force):
@@ -190,15 +227,9 @@ async def test_lock_wait_does_not_bypass_the_in_lock_guard(tmp_path) -> None:
         async def decide(self, _umo, _state, *, trigger, force):
             raise AssertionError("持锁复核没挡住：过期会话继续跑到了判断")
 
-    pipeline = object.__new__(pipeline_mod.SessionPipeline)
-    pipeline._gate = gate_mod.SessionGate()
-    pipeline._state_for = lambda _umo: state
-    pipeline._decision = NoopDecision()
-    pipeline._last_decisions = {}
-    pipeline._is_stopping = lambda: False
-    pipeline._is_enabled = lambda: True
-    pipeline._settings = models.Settings.from_config({"whitelist_sessions": [umo]})
-    pipeline._last_events = {umo: object()}
+    pipeline, models = _wire_pipeline(
+        f"{PACKAGE_NAME}_in_lock_guard", umo=umo, decision=NoopDecision()
+    )
 
     # 锁前预检通过之后才推进代次：模拟"等锁期间有新消息到达"
     real_guard = pipeline.session_check_guard
@@ -234,11 +265,10 @@ def test_quote_target_id_is_empty_when_event_was_evicted(tmp_path) -> None:
     变异锚定：把 ``return ""`` 改成 ``return "0"``，本用例红。
     """
     _install()
-    package = f"{PACKAGE_NAME}_quote_target"
-    delivery_mod = load_package(package, "delivery")
+    umo = "qq:GroupMessage:12345"
+    delivery_mod = load_package(f"{PACKAGE_NAME}_quote_target", "delivery")
 
     runner = object.__new__(delivery_mod.DeliveryRunner)
-    umo = "qq:GroupMessage:12345"
     runner._last_events = {}
     assert runner._quote_target_id(umo) == "", "事件已回收却仍返回了引用 ID"
 
@@ -261,18 +291,7 @@ async def test_empty_generation_short_circuits_before_delivery(tmp_path) -> None
     变异锚定：把该条件改成恒假，本用例红。
     """
     _install()
-    package = f"{PACKAGE_NAME}_empty_generation"
-    pipeline_mod, models, gate_mod = _make_pipeline(package)
-
     umo = "qq:GroupMessage:12345"
-    state = models.SessionState()
-
-    class ReplyDecision:
-        def local_gate(self, _state, *, force):
-            return ""
-
-        async def decide(self, _umo, _state, *, trigger, force):
-            return {"should_reply": True, "reason": "该接话", "elapsed_sec": 0.1}
 
     class EmptyGeneration:
         async def generate(
@@ -284,18 +303,13 @@ async def test_empty_generation_short_circuits_before_delivery(tmp_path) -> None
         async def deliver_reply(self, *_args, **_kwargs):
             raise AssertionError("空生成走进了投递路径：会产出一条成功的假消息")
 
-    pipeline = object.__new__(pipeline_mod.SessionPipeline)
-    pipeline._gate = gate_mod.SessionGate()
-    pipeline._state_for = lambda _umo: state
-    pipeline._decision = ReplyDecision()
-    pipeline._generation = EmptyGeneration()
-    pipeline._delivery = ExplodingDelivery()
-    pipeline._last_decisions = {}
-    pipeline._is_stopping = lambda: False
-    pipeline._is_enabled = lambda: True
-    pipeline._settings = models.Settings.from_config({"whitelist_sessions": [umo]})
-    pipeline._last_events = {umo: object()}
-    pipeline._track_critical_task = lambda coro: coro
+    pipeline, _models = _wire_pipeline(
+        f"{PACKAGE_NAME}_empty_generation",
+        umo=umo,
+        decision=_reply_decision(),
+        generation=EmptyGeneration(),
+        delivery=ExplodingDelivery(),
+    )
 
     baseline = pipeline._gate.advance(umo)
     result = await pipeline.check_session_locked(

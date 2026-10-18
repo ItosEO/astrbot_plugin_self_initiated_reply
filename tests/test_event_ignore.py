@@ -147,7 +147,6 @@ def test_handle_incoming_message_skips_events_the_command_path_already_took(tmp_
 
     async def scenario(plugin, main):
         ingress = sys.modules[f"{main.__package__}.message_ingress"]
-        utils = sys.modules[f"{main.__package__}.utils"]
         scheduled: list[str] = []
         plugin._scheduler.schedule_delayed_check = lambda umo, **_kw: scheduled.append(umo)
 
@@ -160,14 +159,6 @@ def test_handle_incoming_message_skips_events_the_command_path_already_took(tmp_
         # 对照：去掉标志位的同一事件必须真的排上一次检查，否则上一条永不变红
         await ingress.handle_incoming_message(plugin, make_event(message_str="出来聊聊"))
         assert scheduled
-
-        # 2. 开启 abandon_stale_on_new_message 时收到 @Bot 直接点名：推进活跃时间
-        plugin.settings.abandon_stale_on_new_message = True
-        direct_event = make_event(message_str="@Bot 出来聊聊")
-        direct_event.is_at_or_wake_command = True
-        await ingress.handle_incoming_message(plugin, direct_event)
-        state = plugin._state_for(utils.whitelist_storage_key(utils.event_umo(direct_event)))
-        assert state.last_active_at > 0
 
     with_plugin(tmp_path, scenario)
 

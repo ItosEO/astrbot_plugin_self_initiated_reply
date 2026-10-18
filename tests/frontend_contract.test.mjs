@@ -90,6 +90,75 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const pageDir = join(root, "pages", "主动回复设置");
 const TEST_REVISION = `sha256:${"a".repeat(64)}`;
 
+// 三条保存路径用例共享的表单夹具。可写键清单在本文件只有这一份镜像（页面事实是
+// index.html 的 data-config-key，原先这里手抄了三遍）；三处差异收敛成白名单文本、
+// 额外字段与 form.inert 三个入参。requiresConfigRefresh 传 undefined 表示故意
+// 不预置，用来观察保存路径自己把它立起来。
+const makeSaveFixture = ({
+  whitelist = "group:a",
+  extraFields = [],
+  inert = true,
+  requiresConfigRefresh = false,
+  extraElements = {},
+} = {}) => {
+  const classList = { add() {}, remove() {}, toggle() {} };
+  const fields = [
+    checkbox("enabled", true),
+    checkbox("enabled_private_sessions", true),
+    checkbox("abandon_stale_on_new_message", false),
+    checkbox("decision_model_enabled", true),
+    providerField("judge_provider_id", "judge"),
+    number("decision_temperature", "0.3"),
+    number("decision_timeout_sec", "21"),
+    field("decision_prompt_template", "prompt", { configTransform: "trim" }),
+    number("decision_history_min_messages", "6"),
+    number("message_delay_sec", "61"),
+    number("min_silence_sec", "46"),
+    number("cooldown_sec", "901"),
+    checkbox("vision_judge_enabled", true),
+    checkbox("vision_main_enabled", true),
+    checkbox("vision_skip_stickers", true),
+    providerField("vision_provider_id", "vision"),
+    providerField("vision_judge_provider_id", "visionJudge"),
+    number("vision_max_images", "3"),
+    number("vision_image_age_sec", "301"),
+    number("vision_timeout_sec", "22"),
+    checkbox("proactive_inherit_tools", true),
+    ...extraFields,
+    field("whitelist_sessions", whitelist, { configTransform: "whitelist" }),
+  ];
+  const form = {
+    classList,
+    inert,
+    querySelector: () => null,
+    querySelectorAll: () => fields,
+  };
+  const elements = {
+    configForm: form,
+    whitelistInput: fields.at(-1),
+    whitelistCount: { textContent: "" },
+    decisionPromptInput: { dataset: {}, value: "prompt" },
+    selfStatus: { textContent: "" },
+    decisionModelStatus: { textContent: "" },
+    configSaveState: { textContent: "", classList },
+    ...extraElements,
+  };
+  const state = {
+    configLoaded: true,
+    savingConfig: false,
+    configRevision: TEST_REVISION,
+    isDirty: true,
+    ...(requiresConfigRefresh === undefined ? {} : { requiresConfigRefresh }),
+  };
+  const provider = (value) => ({ value: () => value, sync() {} });
+  const controls = {
+    judge: provider("judge"),
+    vision: provider("vision"),
+    visionJudge: provider("vision-judge"),
+  };
+  return { classList, fields, form, elements, state, controls, provider };
+};
+
 test("bridge rejection is normalized by the shared API request", async () => {
   const bridge = {
     apiGet: async () => {
@@ -793,61 +862,20 @@ test("config save path follows the form-declared writable keys", async () => {
   const html = await readFile(join(pageDir, "index.html"), "utf8");
   const htmlKeys = [...html.matchAll(/data-config-key="([a-z0-9_]+)"/g)].map((match) => match[1]);
 
-  const classList = { add() {}, remove() {}, toggle() {} };
-  const fields = [
-    checkbox("enabled", true),
-    checkbox("enabled_private_sessions", true),
-    checkbox("abandon_stale_on_new_message", false),
-    checkbox("decision_model_enabled", true),
-    checkbox("skip_after_direct_call", true),
-    providerField("judge_provider_id", "judge"),
-    number("decision_temperature", "0.3"),
-    number("decision_timeout_sec", "21"),
-    field("decision_prompt_template", " prompt ", { configTransform: "trim" }),
-    field("quote_mode", "random"),
-    number("quote_probability", "60"),
-    field("mention_mode", "always"),
-    number("mention_probability", "70"),
-    number("decision_history_min_messages", "6"),
-    number("message_delay_sec", "61"),
-    number("min_silence_sec", "46"),
-    number("cooldown_sec", "901"),
-    checkbox("vision_judge_enabled", true),
-    checkbox("vision_main_enabled", true),
-    checkbox("vision_skip_stickers", true),
-    providerField("vision_provider_id", "vision"),
-    providerField("vision_judge_provider_id", "visionJudge"),
-    number("vision_max_images", "3"),
-    number("vision_image_age_sec", "301"),
-    number("vision_timeout_sec", "22"),
-    checkbox("proactive_inherit_tools", true),
-    field("whitelist_sessions", "group:a\ngroup:b", { configTransform: "whitelist" }),
-  ];
-  const form = {
-    classList,
+  const { fields, form, elements, state, controls } = makeSaveFixture({
+    whitelist: "group:a\ngroup:b",
     inert: false,
-    querySelector: () => null,
-    querySelectorAll: () => fields,
-  };
-  const elements = {
-    configForm: form,
-    whitelistInput: fields.at(-1),
-    whitelistCount: { textContent: "" },
-  };
-  const state = {
-    configLoaded: true,
-    savingConfig: false,
-    configRevision: TEST_REVISION,
-    isDirty: true,
-  };
+    requiresConfigRefresh: undefined,
+    extraFields: [
+      checkbox("skip_after_direct_call", true),
+      field("quote_mode", "random"),
+      number("quote_probability", "60"),
+      field("mention_mode", "always"),
+      number("mention_probability", "70"),
+    ],
+  });
   const posts = [];
   let lastToast = "";
-  const provider = (value) => ({ value: () => value, sync() {} });
-  const controls = {
-    judge: provider("judge"),
-    vision: provider("vision"),
-    visionJudge: provider("vision-judge"),
-  };
   assert.deepEqual(configSaveKeys(form).sort(), htmlKeys.sort());
   assert.deepEqual(buildConfigSaveBody(form, controls).whitelist_sessions, ["group:a", "group:b"]);
   const io = makeConfigIo({
@@ -887,59 +915,7 @@ test("config save path follows the form-declared writable keys", async () => {
 });
 
 test("successful save applies the returned config and clears dirty state", async () => {
-  const classList = { add() {}, remove() {}, toggle() {} };
-  const fields = [
-    checkbox("enabled", true),
-    checkbox("enabled_private_sessions", true),
-    checkbox("abandon_stale_on_new_message", false),
-    checkbox("decision_model_enabled", true),
-    providerField("judge_provider_id", "judge"),
-    number("decision_temperature", "0.3"),
-    number("decision_timeout_sec", "21"),
-    field("decision_prompt_template", "prompt", { configTransform: "trim" }),
-    number("decision_history_min_messages", "6"),
-    number("message_delay_sec", "61"),
-    number("min_silence_sec", "46"),
-    number("cooldown_sec", "901"),
-    checkbox("vision_judge_enabled", true),
-    checkbox("vision_main_enabled", true),
-    checkbox("vision_skip_stickers", true),
-    providerField("vision_provider_id", "vision"),
-    providerField("vision_judge_provider_id", "visionJudge"),
-    number("vision_max_images", "3"),
-    number("vision_image_age_sec", "301"),
-    number("vision_timeout_sec", "22"),
-    checkbox("proactive_inherit_tools", true),
-    field("whitelist_sessions", "group:a", { configTransform: "whitelist" }),
-  ];
-  const form = {
-    classList,
-    inert: true,
-    querySelector: () => null,
-    querySelectorAll: () => fields,
-  };
-  const elements = {
-    configForm: form,
-    whitelistInput: fields.at(-1),
-    whitelistCount: { textContent: "" },
-    decisionPromptInput: { dataset: {}, value: "prompt" },
-    selfStatus: { textContent: "" },
-    decisionModelStatus: { textContent: "" },
-    configSaveState: { textContent: "", classList },
-  };
-  const state = {
-    configLoaded: true,
-    savingConfig: false,
-    configRevision: TEST_REVISION,
-    isDirty: true,
-    requiresConfigRefresh: false,
-  };
-  const provider = (value) => ({ value: () => value, sync() {} });
-  const controls = {
-    judge: provider("judge"),
-    vision: provider("vision"),
-    visionJudge: provider("vision-judge"),
-  };
+  const { form, elements, state, controls } = makeSaveFixture();
   const savedKeys = Object.fromEntries(configSaveKeys(form).map((key) => [key, true]));
   const io = makeConfigIo({
     elements,
@@ -975,59 +951,7 @@ test("saved whitelist count reflects the server-normalized payload", async () =>
   // 服务端归一化（去重/裁剪）后计数以返回值为准：applyConfigPayload 已按
   // 归一化白名单刷新过计数，保存分支若再用提交时的 body 长度覆盖，会展示
   // 与实际生效不一致的数字。
-  const classList = { add() {}, remove() {}, toggle() {} };
-  const fields = [
-    checkbox("enabled", true),
-    checkbox("enabled_private_sessions", true),
-    checkbox("abandon_stale_on_new_message", false),
-    checkbox("decision_model_enabled", true),
-    providerField("judge_provider_id", "judge"),
-    number("decision_temperature", "0.3"),
-    number("decision_timeout_sec", "21"),
-    field("decision_prompt_template", "prompt", { configTransform: "trim" }),
-    number("decision_history_min_messages", "6"),
-    number("message_delay_sec", "61"),
-    number("min_silence_sec", "46"),
-    number("cooldown_sec", "901"),
-    checkbox("vision_judge_enabled", true),
-    checkbox("vision_main_enabled", true),
-    checkbox("vision_skip_stickers", true),
-    providerField("vision_provider_id", "vision"),
-    providerField("vision_judge_provider_id", "visionJudge"),
-    number("vision_max_images", "3"),
-    number("vision_image_age_sec", "301"),
-    number("vision_timeout_sec", "22"),
-    checkbox("proactive_inherit_tools", true),
-    field("whitelist_sessions", "group:a\ngroup:b", { configTransform: "whitelist" }),
-  ];
-  const form = {
-    classList,
-    inert: true,
-    querySelector: () => null,
-    querySelectorAll: () => fields,
-  };
-  const elements = {
-    configForm: form,
-    whitelistInput: fields.at(-1),
-    whitelistCount: { textContent: "" },
-    decisionPromptInput: { dataset: {}, value: "prompt" },
-    selfStatus: { textContent: "" },
-    decisionModelStatus: { textContent: "" },
-    configSaveState: { textContent: "", classList },
-  };
-  const state = {
-    configLoaded: true,
-    savingConfig: false,
-    configRevision: TEST_REVISION,
-    isDirty: true,
-    requiresConfigRefresh: false,
-  };
-  const provider = (value) => ({ value: () => value, sync() {} });
-  const controls = {
-    judge: provider("judge"),
-    vision: provider("vision"),
-    visionJudge: provider("vision-judge"),
-  };
+  const { form, elements, state, controls } = makeSaveFixture({ whitelist: "group:a\ngroup:b" });
   const savedKeys = Object.fromEntries(configSaveKeys(form).map((key) => [key, true]));
   const io = makeConfigIo({
     elements,

@@ -163,7 +163,10 @@ def test_method_call_options_signature_unavailable(bridge) -> None:
             raise TypeError("no signature")
 
     options = bridge._method_call_options(NoSignature(), "umo1")
-    assert options == [((), {"umo": "umo1"}), (("umo1",), {}), ((), {})]
+    # 只断言第一个候选：签名不可探测时 ``first_bindable_args`` 直接取首个，
+    # 后两个按语义永不被选中。把它们写进等式等于让一条用例去钉死代码的形状
+    # （生产侧删掉这两个候选时，本条会以「行为没变」为由误红）。
+    assert options[0] == ((), {"umo": "umo1"})
 
 
 def test_method_call_options_varkw(bridge) -> None:
