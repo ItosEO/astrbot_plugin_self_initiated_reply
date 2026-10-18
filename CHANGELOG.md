@@ -4,14 +4,13 @@
 
 ## [1.5.0]
 
-- 补齐 19 处「没有任何测试守卫」的生产分支（变异扫描确认：改坏后全量套件仍全绿）。
-  集中在三个此前只被间接覆盖的模块：`message_ingress.py` 六道入口闸门首次有了
+- 补齐 20 处「没有任何测试守卫」的生产分支（变异扫描确认：改坏后全量套件仍全绿）。  集中在三个此前只被间接覆盖的模块：`message_ingress.py` 六道入口闸门首次有了
   专属用例文件，`models.py` 的四个配置 coercions，`session_pipeline` /
   `delivery` / `runtime_adapter` 的四处持锁复核与降级。删掉它们的后果分别是：
   「消息触发开关空转」「内存只涨不落」「过期上下文接话」「对空气回复」
   「与别的插件重复回应」「非白名单会话占状态」「`enabled: null` 静默关停」
   「白烧一次 LLM 且状态显示过期结论」「引用不存在的消息 ID」「加载期契约红
-  被 `or`→`and` 抵消」。
+  被 `or`→`and` 抵消」，以及工具直发后同一条内容被发两遍。
 - 修复被取消的 `POST /config` 把**已被驳回**的配置留在磁盘上：
   `storage.apersist_settings_config` 把 `write_json_atomic` 丢进
   `asyncio.to_thread` 后裸 await，取消立刻抛错而写盘线程照跑，`os.replace`

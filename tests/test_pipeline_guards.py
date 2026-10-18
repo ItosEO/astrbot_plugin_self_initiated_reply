@@ -41,6 +41,73 @@ def _closing_tracker(coro):
     return _noop()
 
 
+async def test_duplicate_final_text_after_tool_direct_send_is_suppressed(tmp_path) -> None:
+    """工具直发后，结论文本与已发内容相同时必须抑制，不得同一条内容发两遍。
+
+    缺陷形态：``check_session_locked`` 里
+    ``if any(normalized_reply == collapse_whitespace(text) for text in
+    ledger.direct_texts): effective_reply = ""``。反向（文本不同时照发）有守卫，
+    「相同时要抑制」这一侧没有：Agent 既调了发送工具又产出同样的结论文本时，
+    同一条内容会被发两遍（工具一次 + final_reply 一次）。
+
+    变异锚定：把该 ``==`` 改成 ``!=``，本用例红。
+    """
+    _install()
+    package = f"{PACKAGE_NAME}_dup_suppress"
+    pipeline_mod, models, gate_mod = _make_pipeline(package)
+
+    umo = "qq:GroupMessage:12345"
+    state = models.SessionState()
+    seen: dict[str, object] = {}
+
+    class ReplyDecision:
+        def local_gate(self, _state, *, force):
+            return ""
+
+        async def decide(self, _umo, _state, *, trigger, force):
+            return {"should_reply": True, "reason": "该接话", "elapsed_sec": 0.1}
+
+    class DupGeneration:
+        async def generate(
+            self, _umo, _state, *, expected_generation, ledger, force, silence_active_at
+        ):
+            # 管线自己建账本并经 kwargs 传进来：工具直发必须记到**这一本**上，
+            # 外挂一本 ledger 不会被抑制逻辑看到。
+            attempt = ledger.reserve("tool_direct", "同一句话")
+            ledger.mark_in_flight(attempt)
+            ledger.seal()
+            assert ledger.direct_texts == ("同一句话",)
+            return "同一句话", ledger
+
+    class RecordingDelivery:
+        async def deliver_reply(self, _umo, _state, reply, direct_send_count, **_kwargs):
+            seen["reply"] = reply
+            seen["count"] = direct_send_count
+            return "已发送"
+
+    pipeline = object.__new__(pipeline_mod.SessionPipeline)
+    pipeline._gate = gate_mod.SessionGate()
+    pipeline._state_for = lambda _umo: state
+    pipeline._decision = ReplyDecision()
+    pipeline._generation = DupGeneration()
+    pipeline._delivery = RecordingDelivery()
+    pipeline._last_decisions = {}
+    pipeline._is_stopping = lambda: False
+    pipeline._is_enabled = lambda: True
+    pipeline._settings = models.Settings.from_config({"whitelist_sessions": [umo]})
+    pipeline._last_events = {umo: object()}
+    pipeline._track_critical_task = _closing_tracker
+
+    baseline = pipeline._gate.advance(umo)
+    result = await pipeline.check_session_locked(
+        umo, trigger="message_delay", force=False, expected_generation=baseline
+    )
+
+    assert result == "已发送", result
+    assert seen["reply"] == "", "结论文本与工具直发相同，却又发了一遍"
+    assert seen["count"] == 1
+
+
 async def test_stale_generation_after_decision_records_stale_reason(
     tmp_path, caplog: object
 ) -> None:
