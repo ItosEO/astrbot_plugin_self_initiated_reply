@@ -1956,6 +1956,48 @@ def test_command_check_still_runs_private_when_disabled(tmp_path: Path) -> None:
     with_plugin(tmp_path, scenario)
 
 
+def test_command_reply_is_capped(tmp_path: Path) -> None:
+    """指令回显必须带上限：超长回执会让宿主一条都收不到，消息还被吞。
+
+    缺陷形态：回显面没有任何长度预算。`/selfreply debug` 把整条用户消息原文拼进
+    回显，`/selfreply list` 在规格上限下约 20 万字符；而 `_send_command_text` 的
+    `event.send` 抛错后，兜底 `set_result` 又把**同一段**超长文本再发一次——管理员
+    什么都收不到，`stop_event()` 却照旧执行，消息被吞。同文件里 reason 有 60 字
+    上限、提示词变量有 200/500/2000 字预算，只有回显这一面是裸的。
+
+    变异锚定：去掉 `main._command_text` 里的 `cap_command_reply` 调用，本用例红。
+    """
+
+    async def scenario(plugin, main):
+        long_message = "超" * 20000
+        event = make_event(message_str=long_message)
+        text = await plugin._command_text(event, "debug")
+
+        assert len(text) <= main.MAX_COMMAND_REPLY_CHARS, (
+            f"回显 {len(text)} 字符，超出预算 {main.MAX_COMMAND_REPLY_CHARS}"
+        )
+        assert long_message not in text, "超长用户消息被原样拼进回显"
+        assert "已省略末尾" in text, "超限时必须说明丢了多少字符"
+        # 保头裁剪：第一屏的诊断标识必须保住，被裁掉的只是超长的 message_str 行
+        assert "主动回复调试信息" in text
+        assert "原始 UMO:" in text
+        assert "self_id:" in text
+
+        # list 在规格上限下同样必须被裁（1000 × 200 字约 20 万字符）
+        models = importlib.import_module(main.__package__ + ".models")
+        plugin.settings.whitelist = {
+            f"qq:GroupMessage:{index:04d}" for index in range(models.MAX_WHITELIST_SIZE)
+        }
+        list_reply = await plugin._command_text(make_event(message_str="/selfreply list"), "list")
+        assert len(list_reply) <= main.MAX_COMMAND_REPLY_CHARS
+        assert "已省略末尾" in list_reply
+        # 短回显不得被无谓改动：预算内原样返回
+        short = await plugin._command_text(make_event(message_str="/selfreply debug"), "debug")
+        assert "主动回复调试信息" in short and "已省略" not in short
+
+    with_plugin(tmp_path, scenario)
+
+
 def test_command_debug_returns_diagnostic_info(tmp_path: Path) -> None:
     """/selfreply debug 指令输出诊断文本，覆盖 commands.debug_text 分支。"""
 

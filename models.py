@@ -71,6 +71,12 @@ MAX_RECENT_MESSAGE_LIMIT = 100
 MAX_GENERATION_CONTEXT_CHARS = 6000
 # 保尾裁剪时插在最前的省略提示。判断与生成两条路径必须展示同一句话。
 CONTEXT_CAP_MARKER = "…(更早历史因长度预算省略)"
+# 指令回显的字符预算。宿主单条消息上限同样不在插件控制内，而回显超限时
+# ``event.send`` 抛错、兜底 ``set_result`` 又把同一段超长文本再发一次——管理员
+# 一条回执都收不到，``stop_event()`` 却照旧执行，消息被吞。真实可达的超长形状：
+# ``/selfreply debug`` 把整条用户消息原文拼进回显；``/selfreply list`` 在
+# MAX_WHITELIST_SIZE × MAX_STRING_LIST_ITEM_LEN 的规格上限下约 20 万字符。
+MAX_COMMAND_REPLY_CHARS = 2000
 MAX_DAILY_REPLIES_LIMIT = 1000
 MAX_VISION_IMAGES = 5
 MIN_VISION_IMAGE_AGE_SEC = 60  # 短于此的清理窗口会让图片上下文抖动

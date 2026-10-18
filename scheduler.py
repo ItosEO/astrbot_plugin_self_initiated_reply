@@ -166,6 +166,25 @@ class SessionScheduler:
         task.add_done_callback(lambda done: self._discard_delay_task(umo, done))
 
     def cancel_delay(self, umo: str, *, force: bool = False) -> None:
+        def _cancel_once(pending: asyncio.Task[Any]) -> None:
+            """取消一个未结束的任务；已在停止路径上的不再补第二次。
+
+            第二次取消会落进被取消方**自己的**有界收敛等待——``generation``
+            的 ``_graceful_stop`` 与 ``decision`` 的 ``_converge_provider_task``
+            都把「宽限窗口内又收到取消」判成"run task 吞掉了取消"并隔离登记，
+            于是 ``_mark_degraded`` 把插件永久打成 DEGRADED：``/selfreply on``
+            与 force check 全被拒，只能重载插件。``/selfreply off`` 正是这个
+            形状——先经 ``_cancel_event_session`` 取消一次，落盘让出事件循环后
+            ``apply_enabled_topology`` 再取消一次，而真实 LLM 调用完全落在那个
+            让出窗口里。
+
+            跳过是安全的：被取消方自带「宽限 → 兜底取消 → 再宽限 → 隔离」的
+            有界收敛，不需要外部补第二次取消；``cancelling()>0`` 即"取消已
+            投递且它还没uncancel"，本仓库从不调用 ``uncancel()``。
+            """
+            if not pending.cancelling():
+                pending.cancel()
+
         task = self._delay_tasks.get(umo)
         running_task = self._running_check_tasks.get(umo)
         keep_running = (
@@ -186,9 +205,9 @@ class SessionScheduler:
         self._delay_tasks.pop(umo, None)
         self._silence_events.pop(umo, None)
         if task and not task.done() and (force or task is not running_task):
-            task.cancel()
+            _cancel_once(task)
         if force and running_task and not running_task.done() and running_task is not task:
-            running_task.cancel()
+            _cancel_once(running_task)
 
     def _discard_delay_task(self, umo: str, task: asyncio.Future[Any]) -> None:
         """``add_done_callback`` 回调：形参收 ``Future``，写窄成 ``Task`` 只能靠

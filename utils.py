@@ -622,6 +622,34 @@ def cap_context_text(text: str, max_chars: int, *, marker: str) -> str:
     return "\n".join([marker, *kept])
 
 
+def cap_command_reply(text: str, max_chars: int) -> str:
+    """指令回显的字符预算：超限时保头裁尾，并说明丢了多少字符。
+
+    与 ``cap_context_text`` 方向相反——回显的第一行是结论（是否运行中、是否
+    已加入白名单），裁掉它比裁掉尾部明细更糟。按行边界裁，避免吐出半行；
+    一行都放不下时按字符保头，至少让预算不为空转。
+
+    ``max_chars <= 0`` 表示关闭裁剪。
+    """
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    marker = f"…(回显过长，已省略末尾 {len(text) - max_chars} 字符)"
+    budget = max_chars - len(marker) - 1  # -1 为 marker 与正文间的换行
+    if budget <= 0:
+        return marker
+    kept: list[str] = []
+    used = 0
+    for line in text.splitlines():
+        addition = len(line) + (1 if kept else 0)
+        if used + addition > budget:
+            break
+        kept.append(line)
+        used += addition
+    if not kept:
+        kept = [text[:budget]]
+    return "\n".join([*kept, marker])
+
+
 def count_text_records(records: list[MessageRecord]) -> int:
     return sum(1 for item in records if str(item.text or "").strip())
 

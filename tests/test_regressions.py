@@ -21,6 +21,7 @@ import pytest
 
 from ._support import UMO, command_surface_loader, make_event
 from .host_stubs import (
+    FakeEvent,
     PipelineTestAdapter,
     install_astrbot_stubs,
     load_package,
@@ -1416,6 +1417,148 @@ def test_force_cancel_kills_running_check_task(tmp_path: Path) -> None:
         await asyncio.gather(running, delay_task, return_exceptions=True)
 
     with_plugin(tmp_path, scenario)
+
+
+def test_force_cancel_does_not_reach_a_check_already_unwinding(tmp_path: Path) -> None:
+    """已在停止路径上的检查不得再收到第二次取消。
+
+    缺陷形态：``/selfreply off`` 先经 ``_cancel_event_session`` 取消在途检查
+    （取消 #1），落盘让出事件循环后 ``apply_enabled_topology(enabled=False)``
+    的 ``_cancel_delay_tasks`` 再取消一次（取消 #2）。取消 #2 落进被取消方
+    **自己的**有界收敛等待（``generation._graceful_stop`` /
+    ``decision._converge_provider_task`` 的 ``except CancelledError``），被
+    误判成"run task 吞掉了取消"而隔离登记 → ``_mark_degraded`` 把插件永久
+    打成 DEGRADED：``/selfreply on`` 与 force check 全被拒，只能重载插件。
+    真实 LLM 调用完全落在那个让出窗口里，所以这不是理论路径。
+
+    变异锚定：去掉 ``scheduler._cancel_once`` 里的 ``cancelling()`` 守卫
+    （恢复成无条件 cancel）后本测试必须变红。
+    """
+
+    async def scenario(plugin, main):
+        started = asyncio.Event()
+
+        async def slow_unwind():
+            started.set()
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                # 真实 SDK 的形状：收到停止请求后开始收尾，需要一点时间才返回
+                await asyncio.sleep(0.2)
+                raise
+
+        running = asyncio.create_task(slow_unwind())
+        await started.wait()
+        plugin._running_check_tasks[UMO] = running
+        delay_task = asyncio.create_task(asyncio.sleep(3600))
+        plugin._delay_tasks[UMO] = delay_task
+
+        plugin._scheduler.cancel_delay(UMO, force=True)  # 取消 #1
+        await until(lambda: running.cancelling() > 0)
+        plugin._scheduler.cancel_delay(UMO, force=True)  # 取消 #2：必须被跳过
+
+        # 只允许一次取消：cancelling() 计数不因第二次调用增加
+        assert running.cancelling() == 1, (
+            f"对已在停止路径上的检查补了第二次取消（cancelling={running.cancelling()}），"
+            "它会落进对方的收敛等待并被误判成吞取消 → 永久 DEGRADED"
+        )
+        # 跳过第二次不等于放弃停止：任务仍自行收敛
+        await until(lambda: running.done())
+        assert running.cancelled()
+        for t in (running, delay_task):
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(running, delay_task, return_exceptions=True)
+
+    with_plugin(tmp_path, scenario)
+
+
+def test_off_during_slow_unwinding_generation_stays_running(tmp_path: Path) -> None:
+    """/selfreply off 不得把插件永久打成 DEGRADED（上一条的端到端形态）。
+
+    单元层守住了"不补第二次取消"，这条守它真正要保的结果：一次例行 /off
+    之后 ``/selfreply on`` 与 force check 仍可用。隔离登记只应留给真的超出
+    宽限窗口不收敛的任务（契约 §5）。
+    """
+
+    async def scenario(plugin, main):
+        from types import SimpleNamespace
+
+        from .host_stubs import FakeBuildResult, _FakeResetCoro
+
+        class _Runner:
+            def reset(self, **_):
+                return _FakeResetCoro()
+
+            def request_stop(self):
+                pass
+
+            def get_final_llm_resp(self):
+                return SimpleNamespace(completion_text="", result_chain=None)
+
+            def close(self):
+                pass
+
+        entered = asyncio.Event()
+
+        async def build_effect(kwargs, result):
+            return FakeBuildResult(
+                agent_runner=_Runner(),
+                provider_request=kwargs["req"],
+                provider=None,
+                reset_coro=_Runner().reset(),
+            )
+
+        def run_effect(_runner, **_kw):
+            async def gen():
+                entered.set()
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    await asyncio.sleep(0.2)  # 慢收敛：仍在 3s 宽限内
+                    raise
+
+                yield None
+
+            return gen()
+
+        original_runtime = main._AGENT_RUNTIME
+        main._AGENT_RUNTIME = PipelineTestAdapter(
+            original_runtime, build_effect=build_effect, run_effect=run_effect
+        )
+
+        async def fake_decide(*_a, **_kw):
+            return {"should_reply": True, "reason": "probe", "elapsed_sec": 0.0}
+
+        plugin._decision.decide = fake_decide
+        event = make_event()
+        plugin._last_events[UMO] = event
+        plugin._last_event_at[UMO] = main.now_ts()
+        plugin._state_for(UMO).last_active_at = main.now_ts() - 300
+        plugin._scheduler.schedule_delayed_check(
+            UMO, delay_sec=0, trigger="message_delay", force=False
+        )
+        await asyncio.wait_for(entered.wait(), timeout=5)
+
+        try:
+            off = FakeEvent(umo=UMO, message_str="/selfreply off")
+            off.role = "admin"
+            await plugin.on_message(off)
+            await asyncio.sleep(0.6)  # 过完慢收敛窗口
+
+            assert plugin.lifecycle_state == "RUNNING", (
+                f"/off 把插件打成了 {plugin.lifecycle_state}：例行暂停指令不应永久降级"
+            )
+            assert not plugin._quarantined_tasks, f"被隔离的任务：{plugin._quarantined_tasks}"
+
+            on = FakeEvent(umo=UMO, message_str="/selfreply on")
+            on.role = "admin"
+            reply = await plugin._command_text(on, "on")
+            assert "降级" not in reply, f"/selfreply on 被拒：{reply}"
+        finally:
+            main._AGENT_RUNTIME = original_runtime
+
+    with_plugin(tmp_path, scenario, generation_timeout_sec=60)
 
 
 def test_delayed_check_waits_for_running_session_release(tmp_path: Path) -> None:

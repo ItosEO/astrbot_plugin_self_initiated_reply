@@ -15,7 +15,9 @@ from typing import Any
 
 import pytest
 
+from ._support import make_event
 from .host_stubs import (
+    until,
     webapi_module,
     with_plugin,
 )
@@ -930,6 +932,69 @@ def test_apply_vision_change_clears_parser_cache(tmp_path, payload) -> None:
         assert plugin._vision.get_image_parser() is not parser_before
 
     with_plugin(tmp_path, scenario)
+
+
+def test_rollback_reschedules_check_scheduled_inside_the_window(tmp_path) -> None:
+    """apply 窗口内新排的延迟检查，回滚后必须被重排而不是静默丢掉。
+
+    缺陷形态：快照只记 ``delay_umos``（快照**时刻**的集合）。消息若落在 apply
+    窗口内（``await _persist_config()`` / ``_save_storage()``）会排出一条**新的**
+    延迟检查；保存随后失败，禁用路径把它取消，而回滚只重排快照集合——那条检查
+    既不复活也不重排，其代次又被 ``SessionGate.restore`` 退回，最终在
+    ``_wait_initial_delay_and_validate`` 静默出局：无日志、无裁决，只能等该会话
+    下一条消息或巡检轮次才恢复。
+
+    变异锚定：去掉 ``_apply_config_updates`` 里 ``window_delay_umos`` 的采集或
+    ``extra_delay_umos`` 的传递，本用例红。
+    """
+
+    async def scenario(plugin, main):
+        # 1) 先让延迟表空着：快照的 delay_umos 因此不含本会话
+        await plugin.on_message(make_event(umo=UMO, message_str="先来一条"))
+        await until(lambda: not plugin._delay_tasks, timeout=10)
+        decisions_before = dict(plugin._last_decisions)
+
+        # 2) 让应用在拓扑切换**之后**失败：禁用路径已经取消过延迟检查
+        original_stop = plugin._scheduler.stop_patrol
+
+        async def failing_stop():
+            await original_stop()
+            raise OSError("stop patrol failed")
+
+        plugin._scheduler.stop_patrol = failing_stop
+
+        # 3) 在 apply 窗口内投递一条消息 → 排出一条快照里没有的延迟检查
+        original_save = plugin._save_storage
+        delivered = asyncio.Event()
+
+        async def window_save():
+            if not delivered.is_set():
+                await plugin.on_message(make_event(umo=UMO, message_str="窗口内的消息"))
+                delivered.set()
+            await original_save()
+
+        plugin._save_storage = window_save
+
+        web = sys.modules["astrbot.api.web"]
+        web.request.payload = {"enabled": False}
+        try:
+            result = await webapi_module(main)._api_post_config(plugin)
+        finally:
+            plugin._save_storage = original_save
+            plugin._scheduler.stop_patrol = original_stop
+
+        assert result.get("ok") is False, "场景没走到回滚路径"
+        assert delivered.is_set(), "窗口内的消息没投递出去"
+        assert plugin.runtime_enabled is True, "回滚没把运行态恢复成启用"
+
+        # 4) 那条检查必须仍在（被回滚重排），并最终产出一次新裁决
+        await until(lambda: not plugin._delay_tasks, timeout=10)
+        new_decision = plugin._last_decisions.get(UMO)
+        assert new_decision is not None and new_decision != decisions_before.get(UMO), (
+            "窗口内消息的延迟检查被回滚静默丢掉：没有新裁决、也没有日志"
+        )
+
+    with_plugin(tmp_path, scenario, message_delay_sec=0)
 
 
 def test_rollback_drops_unknown_delay_umo(tmp_path) -> None:

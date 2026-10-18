@@ -549,6 +549,7 @@ async def _restore_plugin_state(
     snapshot: dict[str, Any],
     *,
     pruned: dict[str, Any] | None = None,
+    extra_delay_umos: set[str] | None = None,
 ) -> None:
     """恢复配置应用前快照，重建被取消的延迟检查并恢复任务拓扑。
 
@@ -556,6 +557,10 @@ async def _restore_plugin_state(
     必须在 ``_restore_session_history`` **之前**回填：不填则这些键走新建
     分支，日配额与冷却清零且对象身份丢失；顺序反了则回填会被随后的删键
     抹掉。``replace`` 全程同步且紧跟快照，``pruned`` 的键必然都在快照里。
+
+    ``extra_delay_umos`` 是 apply 窗口内新排、随后被禁用路径取消的延迟检查
+    （快照时刻还不存在）。少了它，那条检查既不复活也不重排，代次又被
+    ``SessionGate.restore`` 退回，最终静默出局。
     """
     # 原地恢复（保持 Settings 与容器对象身份）：组件构造时捕获的是这些
     # 对象本身的引用，属性重绑定会让它们继续写孤儿容器，回滚后该会话
@@ -580,7 +585,9 @@ async def _restore_plugin_state(
     # （刚回复过的会话有冷却，或观察窗口已推进到该消息之后），最坏是多花一次
     # 判断模型调用。配置保存失败是低频路径，用这点代价换掉一张新表和它的
     # 新不变量。快照里已消失的会话（白名单收缩后未回填）跳过。
-    for umo in snapshot["delay_umos"]:
+    # extra_delay_umos 是窗口内新排的那批：它们不在快照里，却同样被禁用路径
+    # 取消过，一并重排才不会静默丢掉一次主动回复评估。
+    for umo in snapshot["delay_umos"] | (extra_delay_umos or set()):
         if umo in plugin.sessions and not plugin._stopping:
             try:
                 # 必须带快照代次：``schedule_delayed_check`` 在 generation 为 None
@@ -629,6 +636,11 @@ async def _apply_config_updates(
     # 被白名单变更摘下的会话状态（键 → 原对象）。必须在回滚路径可见，
     # 故声明在 try 之外；见 _restore_plugin_state 的 pruned 参数。
     pruned: dict[str, Any] = {}
+    # apply 窗口内新排的延迟检查（快照时刻还不存在，故不在 snapshot["delay_umos"]）。
+    # 禁用路径会取消它们，而回滚只重排快照集合——不记下来这条检查就既不被取消
+    # 复活也不被重排，其代次又被 gate 回滚掉，最终在 _wait_initial_delay_and_validate
+    # 静默出局：无日志、无裁决，只能等该会话下一条消息或巡检轮次才恢复。
+    window_delay_umos: set[str] = set()
     try:
         candidate = plugin.settings.to_config_dict()
         # 三层分工：_strict_value 拒绝类型错误（400），normalize_config_updates
@@ -666,6 +678,10 @@ async def _apply_config_updates(
         )
         if enabled_persisted_changed:
             plugin.runtime_enabled = new_settings.enabled
+            if not new_settings.enabled:
+                # 必须在 apply_enabled_topology **之前**取：它经 _cancel_delay_tasks
+                # 取消并把条目 pop 出 _delay_tasks，之后再也拿不到取消前的集合。
+                window_delay_umos = set(plugin._delay_tasks)
             await apply_enabled_topology(plugin, enabled=new_settings.enabled)
         elif plugin.runtime_enabled:
             plugin._scheduler.ensure_image_cleanup()
@@ -699,7 +715,11 @@ async def _apply_config_updates(
         # 取消也要回滚：CancelledError 不落 except Exception，而此前的应用
         # 步骤可能已完成，留下"磁盘已写新值、内存未回滚"的半应用态。
         # 回滚自带 await，用 shield 防止二次取消打断它。
-        restore = asyncio.ensure_future(_restore_plugin_state(plugin, snapshot, pruned=pruned))
+        restore = asyncio.ensure_future(
+            _restore_plugin_state(
+                plugin, snapshot, pruned=pruned, extra_delay_umos=window_delay_umos
+            )
+        )
         try:
             await asyncio.shield(restore)
         except asyncio.CancelledError:
@@ -710,7 +730,11 @@ async def _apply_config_updates(
         # 与上同一形状：_restore_plugin_state 自带 await（_persist_config /
         # _save_storage / ensure_patrol），被二次取消打断会留下内存半恢复、
         # 磁盘仍是新值的中间态，而原异常又被 CancelledError 顶掉、逃到 Quart。
-        restore = asyncio.ensure_future(_restore_plugin_state(plugin, snapshot, pruned=pruned))
+        restore = asyncio.ensure_future(
+            _restore_plugin_state(
+                plugin, snapshot, pruned=pruned, extra_delay_umos=window_delay_umos
+            )
+        )
         try:
             await asyncio.shield(restore)
         except asyncio.CancelledError:

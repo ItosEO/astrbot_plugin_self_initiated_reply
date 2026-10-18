@@ -59,6 +59,7 @@ from .models import (
     ADMIN_COMMAND_ACTIONS,
     COMMAND_HANDLED_KEY,
     GRACEFUL_STOP_GRACE_SEC,
+    MAX_COMMAND_REPLY_CHARS,
     PLUGIN_ID,
     PLUGIN_VERSION,
     SESSION_CANCEL_COMMAND_ACTIONS,
@@ -89,6 +90,7 @@ from .storage import (
     persist_settings_config,
 )
 from .utils import (
+    cap_command_reply,
     consume_task_result,
     event_umo,
     is_admin_event,
@@ -616,7 +618,11 @@ class SelfInitiatedReplyPlugin(Star):
         await self._send_command_text(event, text)
 
     async def _command_text(self, event: AstrMessageEvent, action: str, arg: str = "") -> str:
-        return await dispatch_command_action(self, event, action, arg)
+        # 回显预算的单点：内联路径（_send_command_text）与装饰器路径
+        # （plain_result）都经这里，裁一次两侧同时生效。裁在文本侧而不是发送侧，
+        # 是因为兜底 set_result 会把同一段超长文本原样再发一次。
+        text = await dispatch_command_action(self, event, action, arg)
+        return cap_command_reply(text, MAX_COMMAND_REPLY_CHARS)
 
     async def _send_command_text(self, event: AstrMessageEvent, text: str) -> None:
         try:
@@ -727,6 +733,14 @@ class SelfInitiatedReplyPlugin(Star):
                 or task in self._critical_tasks
                 or task in self._quarantined_tasks
             ):
+                continue
+            # 同 scheduler._cancel_once：已在停止路径上的任务不再补第二次取消。
+            # ``_cancel_delay_tasks`` 先经 ``invalidate(force_cancel=True)`` 取消了
+            # 在途检查，紧接着的这一步会把它再取消一次——第二次落进它**自己的**
+            # 有界收敛等待（generation._graceful_stop / decision 的 except
+            # CancelledError），被误判成"run task 吞掉了取消"而隔离登记，
+            # ``_mark_degraded`` 随即把插件永久打成 DEGRADED。
+            if task.cancelling():
                 continue
             task.cancel()
 
