@@ -351,6 +351,38 @@ def test_validate_missing_capability_branches() -> None:
     assert "ProviderRequest" in joined
 
 
+def test_validate_result_content_type_without_llm_result() -> None:
+    """ResultContentType 存在但缺 ``LLM_RESULT`` 成员也必须报契约红。
+
+    缺陷形态：``if caps.result_content_type is None or not hasattr(...,
+    "LLM_RESULT")``。把 ``or`` 改成 ``and`` 后，``None is None`` 与
+    ``hasattr`` 永不同真，这一类缺失不再上报——插件正常加载，第一次主动生成时
+    ``result_llm_type`` 属性抛 RuntimeError，加载期「缺符号即报」的隔离设计被
+    绕开，故障点从加载期挪到运行期深处，且没有任何一条主动回复能产出。
+
+    变异锚定：把该 ``or`` 改成 ``and``，本用例红。
+    """
+    runtime = _load_adapter()
+
+    class _NoLLMResult:
+        pass
+
+    adapter = _adapter(runtime, result_content_type=_NoLLMResult)
+    problems = adapter.validate(soft=True)
+    assert any("ResultContentType" in item for item in problems), (
+        f"ResultContentType 缺 LLM_RESULT 未上报：{problems}"
+    )
+    with pytest.raises(RuntimeError):
+        adapter.validate()
+
+    # 对照：成员齐备时不得误报
+    class _WithLLMResult:
+        LLM_RESULT = "llm_result"
+
+    ok = _adapter(runtime, result_content_type=_WithLLMResult)
+    assert not any("ResultContentType" in item for item in ok.validate(soft=True))
+
+
 def test_validate_uninstantiable_result_and_request_classes() -> None:
     """事件结果类/请求类不可实例化分支。"""
     runtime = _load_adapter()

@@ -1,0 +1,237 @@
+"""管线持锁复核与投递取不到目标时的降级：三处被变异扫描确认为无守卫的路径。
+
+这三处删掉后全量套件仍全绿，而各自的后果都是用户可见的：判断期间代次变化
+照样烧一次 LLM、排队等锁的协程拿着锁前的过期结论开跑、事件被回收后引用一个
+不存在的消息 ID。
+"""
+
+from __future__ import annotations
+
+import logging
+
+from .host_stubs import FakeEvent, capture_logs, load_package
+
+PACKAGE_NAME = "selfreply_pipeline_guards_test_package"
+
+
+def _install():
+    from .host_stubs import install_astrbot_stubs
+
+    install_astrbot_stubs()
+
+
+def _make_pipeline(package: str):
+    pipeline_mod = load_package(package, "session_pipeline")
+    models = load_package(package, "models")
+    gate_mod = load_package(package, "session_gate")
+    return pipeline_mod, models, gate_mod
+
+
+def _closing_tracker(coro):
+    """``_track_critical_task`` 的最小替身：关掉协程并返回可 await 的空结果。
+
+    早退路径的 finally 仍会调它；不关协程会留下一条从未运行的
+    ``_finalize_ledger`` 协程对象并触发 RuntimeWarning。
+    """
+
+    async def _noop() -> None:
+        return None
+
+    coro.close()
+    return _noop()
+
+
+async def test_stale_generation_after_decision_records_stale_reason(
+    tmp_path, caplog: object
+) -> None:
+    """判断期间代次变化必须中止，且裁决登记成丢弃理由而不是模型的结论。
+
+    缺陷形态：``_decide_session_reply`` 里判断之后的
+    ``if not self._gate.is_current(...)``。判断是一次秒级 LLM 调用，期间用户发
+    新消息会推进代次；删掉这道复核，过期会话照旧跑完整生成（白烧一次 LLM 与
+    token），而 ``/selfreply status`` 的「最近裁决」显示模型说"该回"、实际什么都
+    没发生——正是 112-113 行注释要防的反向误导。
+
+    变异锚定：把该条件改成恒假，本用例红。
+    """
+    _install()
+    package = f"{PACKAGE_NAME}_stale_after_decide"
+    pipeline_mod, models, gate_mod = _make_pipeline(package)
+
+    umo = "qq:GroupMessage:12345"
+    state = models.SessionState()
+
+    class AdvancingDecision:
+        def local_gate(self, _state, *, force):
+            return ""
+
+        async def decide(self, _umo, _state, *, trigger, force):
+            # 判断这次 LLM 调用期间有新消息到达：推进代次
+            pipeline._gate.advance(umo)
+            return {"should_reply": True, "reason": "模型说该接话", "elapsed_sec": 0.1}
+
+    pipeline = object.__new__(pipeline_mod.SessionPipeline)
+    pipeline._gate = gate_mod.SessionGate()
+    pipeline._state_for = lambda _umo: state
+    pipeline._decision = AdvancingDecision()
+    pipeline._last_decisions = {}
+    pipeline._is_stopping = lambda: False
+    pipeline._is_enabled = lambda: True
+    pipeline._settings = models.Settings.from_config({"whitelist_sessions": [umo]})
+    pipeline._last_events = {umo: object()}
+    # finally 里的封账协程本测试不关心：关掉它，避免为一条早退路径装配整套账本依赖
+    pipeline._track_critical_task = _closing_tracker
+
+    baseline = pipeline._gate.advance(umo)
+    with capture_logs(caplog, pipeline_mod.logger, logging.DEBUG):
+        result = await pipeline.check_session_locked(
+            umo, trigger="message_delay", force=False, expected_generation=baseline
+        )
+
+    assert result == models.STALE_TASK_MESSAGE, f"过期会话没有中止：{result}"
+    recorded = pipeline._last_decisions.get(umo)
+    assert recorded is not None, "过期会话未登记裁决"
+    assert recorded["reason"] == models.STALE_TASK_MESSAGE, (
+        f"裁决登记的是模型的结论而非丢弃理由：{recorded['reason']}"
+    )
+    assert recorded["should_reply"] is False
+
+
+async def test_lock_wait_does_not_bypass_the_in_lock_guard(tmp_path) -> None:
+    """排队等锁期间状态变化，必须由持锁复核挡住。
+
+    缺陷形态：``check_session_locked`` 开头那道与锁前同一形状的门卫。
+    ``check_session`` 先做预检再 ``async with lock``：排队等锁的协程在锁外被
+    挂起，这期间插件可能被停用、白名单被改、代次被推进、事件被回收。等它拿到锁
+    时锁前预检的结论已经过期——只有这一道复核能挡住。删掉后为注定作废的会话白
+    跑一次判断+生成，排障时 ``/selfreply status`` 显示的是过期结论。
+
+    变异锚定：把该门卫的 ``if guard is not None: return guard`` 改成恒假，
+    本用例红。
+    """
+    _install()
+    package = f"{PACKAGE_NAME}_in_lock_guard"
+    pipeline_mod, models, gate_mod = _make_pipeline(package)
+
+    umo = "qq:GroupMessage:12345"
+    state = models.SessionState()
+
+    class NoopDecision:
+        def local_gate(self, _state, *, force):
+            return ""
+
+        async def decide(self, _umo, _state, *, trigger, force):
+            raise AssertionError("持锁复核没挡住：过期会话继续跑到了判断")
+
+    pipeline = object.__new__(pipeline_mod.SessionPipeline)
+    pipeline._gate = gate_mod.SessionGate()
+    pipeline._state_for = lambda _umo: state
+    pipeline._decision = NoopDecision()
+    pipeline._last_decisions = {}
+    pipeline._is_stopping = lambda: False
+    pipeline._is_enabled = lambda: True
+    pipeline._settings = models.Settings.from_config({"whitelist_sessions": [umo]})
+    pipeline._last_events = {umo: object()}
+
+    # 锁前预检通过之后才推进代次：模拟"等锁期间有新消息到达"
+    real_guard = pipeline.session_check_guard
+    calls = {"n": 0}
+
+    def guard(umo_, *, force, expected_generation):
+        nonlocal real_guard
+        result = real_guard(umo_, force=force, expected_generation=expected_generation)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            pipeline._gate.advance(umo_)
+        return result
+
+    pipeline.session_check_guard = guard
+
+    baseline = pipeline._gate.advance(umo)
+    result = await pipeline.check_session(
+        umo, trigger="message_delay", force=False, expected_generation=baseline
+    )
+    assert result == models.STALE_TASK_MESSAGE, f"持锁复核没挡住过期会话：{result}"
+    assert calls["n"] == 2, f"门卫调用次数异常：{calls['n']}"
+
+
+def test_quote_target_id_is_empty_when_event_was_evicted(tmp_path) -> None:
+    """事件被回收后引用目标必须降级成空串，不得编一个 ID。
+
+    缺陷形态：``_quote_target_id`` 的 ``if last_event is None: return ""``。
+    ``_last_events`` 会按陈旧度与容量上限淘汰，而淘汰后 ``force=True`` 的手动
+    检查仍会走到投递（"没有可用的最近消息事件"那道门卫在 force 下被跳过）。
+    改成返回 "0" 之类，主动回复会带上一个指向不存在消息的引用 ID，平台侧要么
+    报错要么引用到错误的消息。
+
+    变异锚定：把 ``return ""`` 改成 ``return "0"``，本用例红。
+    """
+    _install()
+    package = f"{PACKAGE_NAME}_quote_target"
+    delivery_mod = load_package(package, "delivery")
+
+    runner = object.__new__(delivery_mod.DeliveryRunner)
+    umo = "qq:GroupMessage:12345"
+    runner._last_events = {}
+    assert runner._quote_target_id(umo) == "", "事件已回收却仍返回了引用 ID"
+
+    # 对照组：有事件时取的是该事件的消息 ID
+    event = FakeEvent(umo=umo)
+    runner._last_events = {umo: event}
+    expected = delivery_mod.event_message_id(event)
+    assert runner._quote_target_id(umo) == expected
+
+
+async def test_empty_generation_short_circuits_before_delivery(tmp_path) -> None:
+    """LLM 返回空文本且无工具直发时必须短路，不得走进投递路径。
+
+    缺陷形态：``check_session_locked`` 的
+    ``if not effective_reply and not direct_send_count: return "管线未生成内容。"``。
+    删掉后空生成继续走到 ``deliver_reply("")``，实际发送被 ``if reply:`` 挡住，
+    但返回的是"已发送"路径的文案与 ``chars=0`` 的 DEBUG 日志——排障时看到的是一条
+    成功的假消息。
+
+    变异锚定：把该条件改成恒假，本用例红。
+    """
+    _install()
+    package = f"{PACKAGE_NAME}_empty_generation"
+    pipeline_mod, models, gate_mod = _make_pipeline(package)
+
+    umo = "qq:GroupMessage:12345"
+    state = models.SessionState()
+
+    class ReplyDecision:
+        def local_gate(self, _state, *, force):
+            return ""
+
+        async def decide(self, _umo, _state, *, trigger, force):
+            return {"should_reply": True, "reason": "该接话", "elapsed_sec": 0.1}
+
+    class EmptyGeneration:
+        async def generate(
+            self, _umo, _state, *, expected_generation, ledger, force, silence_active_at
+        ):
+            return "", ledger
+
+    class ExplodingDelivery:
+        async def deliver_reply(self, *_args, **_kwargs):
+            raise AssertionError("空生成走进了投递路径：会产出一条成功的假消息")
+
+    pipeline = object.__new__(pipeline_mod.SessionPipeline)
+    pipeline._gate = gate_mod.SessionGate()
+    pipeline._state_for = lambda _umo: state
+    pipeline._decision = ReplyDecision()
+    pipeline._generation = EmptyGeneration()
+    pipeline._delivery = ExplodingDelivery()
+    pipeline._last_decisions = {}
+    pipeline._is_stopping = lambda: False
+    pipeline._is_enabled = lambda: True
+    pipeline._settings = models.Settings.from_config({"whitelist_sessions": [umo]})
+    pipeline._last_events = {umo: object()}
+    pipeline._track_critical_task = lambda coro: coro
+
+    baseline = pipeline._gate.advance(umo)
+    result = await pipeline.check_session_locked(
+        umo, trigger="message_delay", force=False, expected_generation=baseline
+    )
+    assert result == "管线未生成内容。", f"空生成没有短路：{result}"
