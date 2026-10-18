@@ -214,7 +214,18 @@ def load_ui_prefs(plugin: SelfInitiatedReplyPlugin) -> tuple[str, bool, bool]:
         theme = str(raw.get("theme", "auto")).strip()
         dim = raw.get("dim", False)
         bold = raw.get("bold", False)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError, TypeError):
+    except FileNotFoundError:
+        # 首次运行：文件本来就不存在，不是损坏，无需留痕。
+        return "auto", False, False
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError, TypeError) as exc:
+        # 必须留痕：静默回退 + 随后任何一次 POST 整块三字段覆写，会把原偏好永久
+        # 抹掉，而运维在日志里看不到任何一行（契约 §9「不记则无从定位」；同仓库
+        # 的 state.json 损坏路径记了两条 ERROR，这边一条都没有）。
+        logger.warning(
+            "[%s] ui prefs unreadable, falling back to auto/off/off: %s",
+            PLUGIN_ID,
+            redact_exc_text(exc),
+        )
         return "auto", False, False
     if theme not in UI_THEME_VALUES:
         theme = "auto"
@@ -346,6 +357,11 @@ async def _request_json() -> Any:
         return data
     get_json = getattr(request, "get_json", None)
     if callable(get_json):
+        # 注意：silent=True 把「坏请求体」与「合法 JSON null」都折成 None，两者
+        # 在调用方那个 not isinstance(data, dict) 分支上拿不到可区分的信号，只能
+        # 统一回「请求体必须是 JSON 对象」。request.json 分支有 _BODY_UNREADABLE
+        # 哨兵才分得开（见上）。旧宿主形态下这条歧义无法消除，除非再探一次
+        # silent=False——那要求宿主允许重复读 body，未经验证，不做。
         return await get_json(silent=True)
     raise RuntimeError("当前 AstrBot Web API 不支持 JSON 请求读取")
 
@@ -711,34 +727,29 @@ async def _apply_config_updates(
             "runtime_enabled": plugin.runtime_enabled,
             "adjusted_fields": adjusted_fields,
         }
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, Exception):
         # 取消也要回滚：CancelledError 不落 except Exception，而此前的应用
-        # 步骤可能已完成，留下"磁盘已写新值、内存未回滚"的半应用态。
-        # 回滚自带 await，用 shield 防止二次取消打断它。
+        # 步骤可能已完成，留下"磁盘已写新值、内存未回滚"的半应用态。普通异常
+        # 同理。两个分支形状完全相同，合并只为不养两份逐字重复的实现。
+        #
+        # 回滚必须**跑完**才能放锁：它经 ensure_future 成游离任务后不持
+        # _config_lock（_api_post_config 的 async with 随本异常释放锁），于是一
+        # 次后来的 POST /config（或 /selfreply add|remove，同一把锁）能拿到锁并
+        # 完整落盘，随后这个回滚用它开服时取的旧快照再写一次盘，把那次**成功**
+        # 的保存静默撤销——重启后丢失，且全程无告警。
+        #
+        # 等待继续经 shield：第二次取消不能又把我们打回"立刻放弃等待"。
         restore = asyncio.ensure_future(
             _restore_plugin_state(
                 plugin, snapshot, pruned=pruned, extra_delay_umos=window_delay_umos
             )
         )
-        try:
-            await asyncio.shield(restore)
-        except asyncio.CancelledError:
-            # 二次取消不再等待：回滚任务已在跑，由主循环收敛
-            pass
-        raise
-    except Exception:
-        # 与上同一形状：_restore_plugin_state 自带 await（_persist_config /
-        # _save_storage / ensure_patrol），被二次取消打断会留下内存半恢复、
-        # 磁盘仍是新值的中间态，而原异常又被 CancelledError 顶掉、逃到 Quart。
-        restore = asyncio.ensure_future(
-            _restore_plugin_state(
-                plugin, snapshot, pruned=pruned, extra_delay_umos=window_delay_umos
-            )
-        )
-        try:
-            await asyncio.shield(restore)
-        except asyncio.CancelledError:
-            pass
+        while True:
+            try:
+                await asyncio.shield(restore)
+                break
+            except asyncio.CancelledError:
+                continue
         raise
 
 

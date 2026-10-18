@@ -415,8 +415,26 @@ async def apersist_settings_config(path: Path, config_obj: Any, settings: Settin
     """``persist_settings_config`` 的 async 版：只有文件写盘进线程。
 
     宿主 ``save_config`` 的线程安全性未知，仍在事件循环内同步执行。
+
+    取消时必须等这一次写盘真正落地再重放，理由同 ``save_storage``：裸 await 下
+    取消立刻抛错而写盘线程照跑，它随后的 ``os.replace`` 会落到回滚的写盘**之后**
+    ——磁盘留下的是已被驳回的新配置，而内存已回滚成旧值，且不会自愈（重启加载
+    到这份被驳回的配置，``config_revision`` 由内存算也与磁盘脱节）。
     """
     data = settings.to_config_dict()
-    if not await asyncio.to_thread(write_json_atomic, path, data):
+    write_task = asyncio.ensure_future(asyncio.to_thread(write_json_atomic, path, data))
+    try:
+        success = await asyncio.shield(write_task)
+    except asyncio.CancelledError:
+        # 等待必须继续经 shield：第二次 cancel() 会落到写盘任务上，CancelledError
+        # 从本块穿出 → 又回到"立刻抛错而线程照跑"的老问题。
+        while True:
+            try:
+                success = await asyncio.shield(write_task)
+                break
+            except asyncio.CancelledError:
+                continue
+        raise
+    if not success:
         return False
     return _update_config_obj(config_obj, data) and _persist_config_obj(config_obj, data)

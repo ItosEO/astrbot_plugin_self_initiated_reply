@@ -13,8 +13,10 @@ import {
 	applyBold,
 	applyDim,
 	bindDimBoldButtons,
+	boldWasTouched,
 	createScrollHandler,
 	dimBoldWasTouched,
+	dimWasTouched,
 	hideBoot,
 	markThemeTouched,
 	restoreDimBold,
@@ -518,8 +520,10 @@ restoreTheme(apiGet).then((prefs) => {
 	// 同值也要走一次 applyTheme：按钮的「当前：」朗读名只由它写入，短路掉之后
 	// 首屏（尤其 auto，本地没缓存可补）只剩 index.html 的静态 aria-label。
 	if (!themeWasTouched()) applyTheme(prefs.theme, els.themeToggle);
-	if (!dimBoldWasTouched()) {
-		applyDim(prefs.dim);
-		applyBold(prefs.bold);
-	}
+	// 逐个字段判"用户动过没有"，不能合成一个总判据：GET 在途期间点过 dim 时，
+	// DOM 里的 bold 还是本地默认（或 localStorage 旧值），此时跳过 applyBold
+	// 会让 persistTheme 把那个来路不明的值一并提交，静默抹掉服务端上没动过的
+	// 开关。分开判才能保证「未动的那个一定被服务端值补齐」。
+	if (!dimWasTouched()) applyDim(prefs.dim);
+	if (!boldWasTouched()) applyBold(prefs.bold);
 });

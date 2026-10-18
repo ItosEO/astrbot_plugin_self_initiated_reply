@@ -352,12 +352,14 @@ class SessionScheduler:
         except asyncio.CancelledError:
             return
         except Exception as exc:
+            # 不开 exc_info：traceback 末尾是 str(exc) 原文，会把 redact_exc_text
+            # 刚脱掉的凭证原样带回同一条日志（provider SDK 的异常串标准形态就带
+            # 签名 URL）。口径同 delivery/generation 的失败分支。
             logger.warning(
                 "[%s] delayed check failed session=%s error=%s",
                 PLUGIN_ID,
                 umo,
                 redact_exc_text(exc),
-                exc_info=True,
             )
 
     # ------------------------------------------------------------------
@@ -598,11 +600,11 @@ class SessionScheduler:
                         seen_patrol_umos.add(umo)
                         await self._patrol_one_session(umo, now)
             except Exception as exc:
+                # 不开 exc_info：理由同 delayed_check（traceback 原文带回凭证）
                 logger.warning(
                     "[%s] patrol loop failed error=%s",
                     PLUGIN_ID,
                     redact_exc_text(exc),
-                    exc_info=True,
                 )
                 # 添加退避延迟，避免错误循环
                 await asyncio.sleep(min(PATROL_BACKOFF_DELAY_SEC, self.settings.check_interval_sec))
@@ -636,12 +638,12 @@ class SessionScheduler:
                 result,
             )
         except Exception as exc:
+            # 不开 exc_info：理由同 delayed_check（traceback 原文带回凭证）
             logger.warning(
                 "[%s] patrol session failed session=%s error=%s",
                 PLUGIN_ID,
                 umo,
                 redact_exc_text(exc),
-                exc_info=True,
             )
 
     async def stop_patrol(self) -> None:

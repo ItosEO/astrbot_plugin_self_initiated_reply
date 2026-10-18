@@ -7,9 +7,11 @@ cleanup/status/theme API、回滚 dropped 分支与 _request_json 回退。
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import re
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -17,6 +19,7 @@ import pytest
 
 from ._support import make_event
 from .host_stubs import (
+    capture_logs,
     until,
     webapi_module,
     with_plugin,
@@ -408,6 +411,34 @@ def test_api_cleanup_image_cache_paths(tmp_path) -> None:
         plugin._scheduler.run_image_cleanup = cancelled
         with pytest.raises(asyncio.CancelledError):
             await webapi._api_cleanup_image_cache(plugin)
+
+    with_plugin(tmp_path, scenario)
+
+
+def test_ui_prefs_corrupt_logs_warning(tmp_path, caplog) -> None:
+    """ui_prefs.json 损坏必须留痕：静默回退 + 后续整块覆写会永久抹掉原偏好。
+
+    缺陷形态：``load_ui_prefs`` 的 except 分支裸 ``return "auto", False, False``。
+    回退本身是对的，但下一次 POST /ui/theme 会整块写 theme/dim/bold 三个字段，
+    原本存着的偏好于是被静默改掉，而日志里没有任何一行——排障者只看到「主题变
+    回去了」，无从判断是文件坏了还是用户改的（契约 §9「不记则无从定位」；同仓库
+    state.json 的损坏路径记了两条 ERROR，这边一条都没有）。
+
+    变异锚定：删掉那条 ``logger.warning``，本用例红。
+    """
+    import logging
+
+    async def scenario(plugin, main):
+        webapi = sys.modules[f"{PACKAGE}.webapi"]
+        plugin._ui_prefs_path.write_text("{bad json", encoding="utf-8")
+        with capture_logs(caplog, webapi_module(main).logger, logging.WARNING):
+            assert webapi.load_ui_prefs(plugin) == ("auto", False, False)
+        warnings = [
+            record.getMessage() for record in caplog.records if record.levelno == logging.WARNING
+        ]
+        assert any("ui prefs unreadable" in msg for msg in warnings), (
+            f"ui_prefs 损坏未记 warning，原偏好会被静默抹掉且无从定位：{warnings}"
+        )
 
     with_plugin(tmp_path, scenario)
 
@@ -807,6 +838,183 @@ def test_api_post_config_returns_normalized_values(tmp_path) -> None:
         # 运行态必须回传：前端徽标按 result.runtime_enabled 刷新（缺失时 ?? 链会
         # 静默回退到保存前的旧值，切换总开关后徽标不更新）。
         assert "runtime_enabled" in result
+
+    with_plugin(tmp_path, scenario)
+
+
+def test_cancelled_post_config_write_does_not_land_after_rollback(tmp_path) -> None:
+    """被取消的 POST /config 的写盘线程，不得在回滚之后才落地。
+
+    缺陷形态：``storage.apersist_settings_config`` 把 ``write_json_atomic`` 丢进
+    ``asyncio.to_thread`` 后裸 await。任务在此被取消时 await 立刻抛
+    ``CancelledError``，而**写盘线程不会被取消**，``os.replace`` 仍会在稍后落地。
+    随后回滚把内存恢复成旧值并再次写盘，两次 ``os.replace`` 的先后只由线程调度
+    决定：旧值先落、新值后落时，磁盘留下的是**已被驳回**的新配置，而内存已是旧值
+    ——磁盘与运行期 Settings 持久不一致且不会自愈（重启加载到这份被驳回的配置，
+    ``config_revision`` 由内存算也与磁盘脱节）。同一 hazard 在
+    ``plugin_state.save_storage`` 有显式防护，配置写盘这条路径没有。
+
+    变异锚定：把 ``apersist_settings_config`` 的 shield 等待改回裸
+    ``await asyncio.to_thread(...)``，本用例红。
+    """
+    import threading
+    import time
+
+    async def scenario(plugin, main):
+        storage = importlib.import_module(main.__package__ + ".storage")
+        original_write = storage.write_json_atomic
+        entered = threading.Event()
+        calls = {"n": 0}
+
+        def held_write(path: Path, data: dict[str, Any], *, abandoned: Any = None) -> bool:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # 让写盘线程确实进入 os.replace 之前的临界区，调用方再取消——
+                # 这正是"取消落在 to_thread 上"的真实形态
+                entered.set()
+                time.sleep(0.3)
+            return original_write(path, data, abandoned=abandoned)
+
+        storage.write_json_atomic = held_write
+        original_persist = plugin._persist_config
+        cancelled = {"done": False}
+
+        async def cancelling_persist() -> bool:
+            if not cancelled["done"]:
+                cancelled["done"] = True
+                task = asyncio.ensure_future(original_persist())
+                while not entered.is_set():
+                    await asyncio.sleep(0.001)
+                task.cancel()
+                raise await task
+            return await original_persist()
+
+        plugin._persist_config = cancelling_persist
+        web = sys.modules["astrbot.api.web"]
+        web.request.payload = {"cooldown_sec": 777}
+        try:
+            try:
+                await webapi_module(main)._api_post_config(plugin)
+            except asyncio.CancelledError:
+                pass
+            # 等回滚的写盘与被取消的那次都落地，再比对
+            for _ in range(600):
+                await asyncio.sleep(0.01)
+                pending = [
+                    t
+                    for t in asyncio.all_tasks()
+                    if not t.done() and t is not asyncio.current_task()
+                ]
+                if not pending:
+                    break
+        finally:
+            plugin._persist_config = original_persist
+            storage.write_json_atomic = original_write
+
+        disk = json.loads(plugin._config_path.read_text(encoding="utf-8"))
+        memory = plugin.settings.to_config_dict()
+        assert disk == memory, (
+            f"磁盘与内存不一致：磁盘 cooldown_sec={disk.get('cooldown_sec')} "
+            f"内存={memory.get('cooldown_sec')}——被驳回的配置落到了磁盘上"
+        )
+        assert memory["cooldown_sec"] != 777, "回滚没把内存恢复成旧值"
+
+    with_plugin(tmp_path, scenario)
+
+
+def test_rollback_completes_before_the_config_lock_is_released(tmp_path) -> None:
+    """回滚必须跑完才能放锁，否则它会覆写一次已成功的配置保存。
+
+    缺陷形态：``_apply_config_updates`` 的取消分支把 ``_restore_plugin_state``
+    ``ensure_future`` 成游离任务，只经 ``shield`` 等一次。第二次取消让
+    ``await asyncio.shield(restore)`` 立刻抛错、``pass`` 后 ``raise``——
+    ``_api_post_config`` 的 ``async with _config_lock`` 随之释放锁，而回滚任务
+    仍在跑且**不持锁**。此时一次新的 POST /config（或 /selfreply add|remove，同一把
+    锁）能拿到锁并完整落盘；回滚任务随后用它开服时取的旧快照再写一次盘，把那
+    次**成功**的保存静默撤销——重启后丢失，且全程无告警。
+
+    变异锚定：把回滚的 shield 等待改回「等一次就放弃」，本用例红。
+    """
+
+    async def scenario(plugin, main):
+        webapi = webapi_module(main)
+        # 构造期的启动落盘持 _config_lock 且是懒跑的：不等它放锁就发 POST-A，
+        # 请求会堵在锁上被取消，根本进不到 _apply_config_updates，回滚从未发生。
+        await until(lambda: not plugin._config_lock.locked(), timeout=10)
+        original_cooldown = plugin.settings.cooldown_sec
+
+        persist_entered = asyncio.Event()
+        rollback_entered = asyncio.Event()
+        original_persist = plugin._persist_config
+        real_restore = webapi._restore_plugin_state
+        calls = {"persist": 0}
+
+        async def slow_persist() -> bool:
+            calls["persist"] += 1
+            if calls["persist"] == 1:
+                # 只拖慢 POST-A 自己那次：取消必须落在 _apply_config_updates 内部
+                persist_entered.set()
+                await asyncio.sleep(0.3)
+            return await original_persist()
+
+        async def slow_restore(*args: Any, **kwargs: Any) -> None:
+            rollback_entered.set()
+            await asyncio.sleep(0.5)
+            await real_restore(*args, **kwargs)
+
+        plugin._persist_config = slow_persist
+        webapi._restore_plugin_state = slow_restore
+        web = sys.modules["astrbot.api.web"]
+
+        try:
+            web.request.payload = {"cooldown_sec": 777}
+            task_a = asyncio.ensure_future(webapi._api_post_config(plugin))
+            await until(lambda: persist_entered.is_set(), timeout=10)
+            # 第一次取消：进入回滚分支，回滚随即进入 slow_restore 的慢窗口
+            task_a.cancel()
+            await until(lambda: rollback_entered.is_set(), timeout=10)
+
+            # 第二次取消：旧实现在此放弃等待回滚、放掉 _config_lock
+            task_a.cancel()
+            await asyncio.sleep(0.05)
+            assert plugin._config_lock.locked(), (
+                "回滚还在跑而 _config_lock 已释放：后来的写操作会与它交叠，"
+                "回滚随后用旧快照覆写那次已成功的保存"
+            )
+        finally:
+            plugin._persist_config = original_persist
+            webapi._restore_plugin_state = real_restore
+
+        # 等回滚自行跑完（慢窗口 0.5s，有界）：它必须写完旧值
+        try:
+            await asyncio.wait_for(asyncio.shield(task_a), timeout=20)
+        except (asyncio.CancelledError, TimeoutError):
+            pass
+        for _ in range(600):
+            await asyncio.sleep(0.01)
+            pending = [
+                t for t in asyncio.all_tasks() if not t.done() and t is not asyncio.current_task()
+            ]
+            if not pending:
+                break
+
+        disk = json.loads(plugin._config_path.read_text(encoding="utf-8"))
+        memory = plugin.settings.to_config_dict()
+        assert disk == memory, (
+            f"磁盘与内存不一致：磁盘 cooldown_sec={disk.get('cooldown_sec')} "
+            f"内存={memory.get('cooldown_sec')}"
+        )
+        assert memory["cooldown_sec"] == original_cooldown, "回滚没把内存恢复成旧值"
+
+        # 之后一次成功的保存不得再被那个回滚改动
+        web.request.payload = {"cooldown_sec": 555}
+        result = await asyncio.wait_for(webapi._api_post_config(plugin), timeout=20)
+        assert result.get("ok") is True, result
+        disk = json.loads(plugin._config_path.read_text(encoding="utf-8"))
+        memory = plugin.settings.to_config_dict()
+        assert disk == memory and memory["cooldown_sec"] == 555, (
+            f"成功保存被回滚覆写：磁盘={disk.get('cooldown_sec')} 内存={memory.get('cooldown_sec')}"
+        )
 
     with_plugin(tmp_path, scenario)
 

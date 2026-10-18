@@ -108,7 +108,7 @@ export function validateWhitelistLines(text) {
         item,
         reason: "含非法字符（引号/反斜杠/控制字符）",
       });
-    } else if (item.length > WHITELIST_ITEM_MAX_LEN) {
+    } else if ([...item].length > WHITELIST_ITEM_MAX_LEN) {
       errors.push({
         line: i + 1,
         item,

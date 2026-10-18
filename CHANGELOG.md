@@ -4,6 +4,33 @@
 
 ## [1.5.0]
 
+- 修复被取消的 `POST /config` 把**已被驳回**的配置留在磁盘上：
+  `storage.apersist_settings_config` 把 `write_json_atomic` 丢进
+  `asyncio.to_thread` 后裸 await，取消立刻抛错而写盘线程照跑，`os.replace`
+  随后落地；回滚再写一次旧值，两次写盘的先后只由线程调度决定。同一 hazard
+  在 `plugin_state.save_storage` 早有显式防护，配置写盘这条路径没有。现在
+  取消后继续经 shield 等那次写完再重放。
+- 修复回滚任务在放弃等待后**不持锁**覆写一次已成功的配置保存：
+  `_apply_config_updates` 的取消分支把 `_restore_plugin_state`
+  `ensure_future` 成游离任务、只经 shield 等一次，第二次取消就放弃等待并
+  随 `async with _config_lock` 放锁；于是一次新的 POST /config（或
+  `/selfreply add|remove`，同一把锁）能完整落盘，随后回滚用它开服时取的旧
+  快照再写一次盘，把那次**成功**的保存静默撤销——重启后丢失且全程无告警。
+  现在回滚跑完才放锁。
+- 修复巡检/延迟检查两条最高频异常路径的脱敏被 `exc_info=True` 抵消：
+  `redact_exc_text` 只作用于 `record.getMessage()`，而 `exc_info=True` 会把
+  **未脱敏的完整 traceback** 挂到同一条 record 上，其末尾正是 `str(exc)`
+  原文。provider SDK 的异常串标准形态就带签名 URL，于是脱敏文案与泄漏原文
+  并列出现在同一行日志里。口径与 delivery/generation 的失败分支对齐。
+- 修复设置页压暗/粗体在偏好未同步时把服务端另一个开关静默抹掉：
+  `persistTheme` 用「用户动过没有」的总判据决定是否提交，而 `dim`/`bold`
+  两个值是**同时**从 DOM 读的——GET `/ui/theme` 在途期间点一下压暗，DOM
+  里的粗体还是本地默认，一并提交就会覆盖服务端已存的选择。改为逐个字段
+  判「动过没有」，未动的那个由 `restoreTheme` 用服务端值补齐。
+- `ui_prefs.json` 损坏时补上 WARNING：此前静默回退到 auto/关，而下一次
+  POST 会整块覆写三个字段，原偏好被永久抹掉且日志里一行都没有。
+- 白名单条目长度改按码点计数：前端原来数 UTF-16 码元、后端数码点，含 emoji
+  的合法条目会被前端误判超限，弹出后端本会接受的假拒绝。
 - 修复生成超时后的宽限窗口内，一条普通管理员写指令把插件**永久**打成 DEGRADED：
   agent 超过 `generation_timeout_sec`（默认 60s，即一次挂死的 LLM 调用）后进入
   3s 宽限等待，这期间任意写指令（add/remove/check/on/off）、在面板点一下禁用、

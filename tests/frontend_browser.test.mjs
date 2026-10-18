@@ -1330,6 +1330,40 @@ test("dim and bold clicks never submit the theme field", async ({ page }) => {
   expect(errors).toEqual([]);
 });
 
+test("a dim click during a pending theme GET keeps the untouched sibling from the server", async ({ page }) => {
+  // 回归守卫：restoreTheme 曾用一个「动过没有」的总判据同时决定 dim/bold 两个
+  // 字段是否落地服务端值。GET ui/theme 在途期间点一下压暗，DOM 里的粗体还是本地
+  // 默认（false），此时跳过 applyBold 会让随后任何一次提交把服务端已存的 bold
+  // 静默抹掉——用户没碰过的开关被改写，无 toast、无报错。分开判「各自动过没有」
+  // 之后，未动的那一个一定由服务端值补齐。
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await installBridge(page, { themePending: true, theme: "dark", dim: true, bold: true });
+  const errors = await openPage(page);
+  await expect.poll(() => page.evaluate(() => typeof window.__resolveTheme)).toBe("function");
+  await page.locator("#dimBtn").click();
+  await expect(page.locator("html")).toHaveClass(/dimmed/);
+  await page.evaluate(() => window.__resolveTheme());
+  await page.waitForTimeout(80);
+  // 服务端的 bold=true 必须落地：用户只动过压暗，粗体不是他的选择。
+  await expect(page.locator("html")).toHaveClass(/bold-text/);
+  await expect(page.locator("#boldBtn")).toHaveClass(/active/);
+
+  // 再点一次粗体触发提交：body 必须等于「服务端值 + 用户改过的那一个」。
+  await page.locator("#boldBtn").click();
+  const bodies = await page.evaluate(() =>
+    window.__bridgeCalls
+      .filter((call) => call.method === "POST" && call.endpoint === "ui/theme")
+      .map((call) => call.body),
+  );
+  // 每次提交都必须是「服务端值 + 用户改过的那一个」：点压暗那次与点粗体那次
+  // 的取值相同，因为粗体已由迟到的服务端值补齐，不在用户的改动集合里。
+  expect(bodies.length).toBeGreaterThan(0);
+  for (const body of bodies) {
+    expect(body).toEqual({ dim: true, bold: false });
+  }
+  expect(errors).toEqual([]);
+});
+
 test("the theme toggle announces the restored theme on a fresh load", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 });
   await installBridge(page, { theme: "auto" });

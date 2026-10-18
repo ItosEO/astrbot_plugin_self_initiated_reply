@@ -685,17 +685,31 @@ async def test_patrol_loop_session_error_continues(tmp_path: Path, caplog: objec
     )
 
 
-async def test_delayed_check_error_logs_traceback(tmp_path: Path, caplog: object) -> None:
-    """主触发链的 delayed_check 异常必须带 traceback。
+async def test_delayed_check_error_log_is_redacted_without_traceback(
+    tmp_path: Path, caplog: object
+) -> None:
+    """delayed_check 的异常 warning 必须脱敏，且**不得**带 traceback。
 
-    巡检路径（:557/:595）用 exc_info=True，而 delayed_check 此前只记一行
-    warning 无栈，主触发链反而比后台链更难排障。这条钉住两者对齐。
+    缺陷形态：``logger.warning(..., redact_exc_text(exc), exc_info=True)``。
+    ``redact_exc_text`` 只作用于 ``record.getMessage()``，而 ``exc_info=True``
+    会把**未脱敏的完整 traceback** 挂到同一条 record 上，traceback 末尾正是
+    ``str(exc)`` 原文。provider SDK 的异常串标准形态就带签名 URL
+    （``Client error '401' for url '...?api_key=...'``），于是脱敏文案与泄漏
+    原文并列出现在同一行日志里，脱敏契约在巡检/延迟检查这两条最高频异常路径上
+    实际不成立。口径同 delivery/generation 的失败分支（那边早就注明"不开
+    exc_info，traceback 帧常持有 request"）。
+
+    变异锚定：把该处 ``exc_info=True`` 加回来，本用例红。
     """
     scheduler_mod, _, scheduler, _, _ = _make_scheduler(tmp_path)
     umo = "s1"
+    signed_url = (
+        "https://api.example.com/v1/chat/completions"
+        "?api_key=sk-LIVE-SECRET-123&Signature=SECRET_SIGNATURE"
+    )
 
     async def boom(umo_, *, trigger, force, expected_generation):
-        raise RuntimeError("delayed check broken")
+        raise RuntimeError(f"Client error '401' for url '{signed_url}'")
 
     scheduler._check_session = boom
     with capture_logs(caplog, scheduler_mod.logger, logging.WARNING):
@@ -708,8 +722,17 @@ async def test_delayed_check_error_logs_traceback(tmp_path: Path, caplog: object
         )
     records = [r for r in caplog.records if "delayed check failed" in r.getMessage()]
     assert records, "delayed_check 异常未记 warning"
-    assert records[-1].exc_info is not None, "delayed_check 异常缺 traceback，无法定位栈"
-    assert "RuntimeError: delayed check broken" in records[-1].exc_text
+    # 脱敏必须落在**整条渲染后的日志**上，不只是 getMessage()
+    rendered = "\n".join(
+        caplog.handler.format(record) if hasattr(caplog, "handler") else record.getMessage()
+        for record in records
+    )
+    for secret in ("sk-LIVE-SECRET-123", "SECRET_SIGNATURE"):
+        assert secret not in rendered, f"异常日志泄漏凭证 {secret}：{rendered}"
+    assert "<redacted>" in rendered, f"未标记 query 已被剥离：{rendered}"
+    assert all(record.exc_info is None for record in records), (
+        "delayed_check 的 warning 带了 traceback：其末尾是未脱敏的 str(exc) 原文"
+    )
 
 
 async def test_patrol_loop_outer_backoff_on_cleanup_error(tmp_path: Path, monkeypatch: Any) -> None:
