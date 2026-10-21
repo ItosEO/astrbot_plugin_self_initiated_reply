@@ -94,6 +94,16 @@ class SessionPipeline:
         """一次判断：通过返回 decision dict，早退返回跳过原因（并登记裁决）。"""
         result = await self._decision.decide(umo, state, trigger=trigger, force=force)
         if isinstance(result, str):
+            # 与下方 dict 分支同级：§9 规定的「一次判断一行 INFO」必须覆盖两个
+            # 出口。只打 dict 分支时，模型明确说「不接话」这条最高频排障路径
+            # 在默认配置下完全不可见（result 串里已经带着理由）。
+            logger.info(
+                "[%s] decision session=%s trigger=%s should_reply=False reason=%s",
+                PLUGIN_ID,
+                umo,
+                trigger,
+                collapse_whitespace(result),
+            )
             record_decision(self._last_decisions, umo, trigger, should_reply=False, reason=result)
             return result
         # 决策 INFO 先于代次复核：模型的结论是 §9 留给 INFO 的唯一排障入口，而
@@ -169,9 +179,10 @@ class SessionPipeline:
         if guard is not None:
             return guard
         if expected_generation is None:
-            baseline = self._gate.current(umo)
-            if baseline:
-                expected_generation = baseline
+            # 必须无条件绑定基线：没有代次记录的会话 ``current()`` 返回 0，若把
+            # 这个 0 当作"未取到"而保持 None，本轮就没有代次防护——判断期间新
+            # 消息 advance 到 1 也不会让它失效，过期结论照发（契约 §5）。
+            expected_generation = self._gate.current(umo)
         state = self._state_for(umo)
         observed_active_at = state.last_active_at
 
@@ -349,12 +360,8 @@ class SessionPipeline:
                 ledger.mark_record_failed("state persistence task cancelled")
             raise
         except Exception as exc:
-            # 先脱敏再进 str()：mark_record_failed 的实参与日志都吃这个值。
-            # 原写法直接把 exc 传给 %s、并把 str(exc) 原样喂给 mark_record_failed——
-            # 一旦 exc.__str__ 抛异常（上游 SDK 的异常见过），RuntimeError 会从
-            # 这里逃出 _record_ledger → _finalize_ledger → check_session_locked 的
-            # finally，把已经算好的返回值整段丢掉，而账本停在 RECORDING、
-            # 落盘重试再也不会发生。
+            # 脱敏必须是唯一入口：本值既进 mark_record_failed 也进日志，
+            # 而 provider SDK 的异常串标准形态就带签名 URL。
             detail = redact_exc_text(exc)
             if ledger.phase == LedgerPhase.RECORDING:
                 ledger.mark_record_failed(detail)

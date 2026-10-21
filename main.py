@@ -84,6 +84,7 @@ from .scheduler import SessionScheduler
 from .session_coordinator import SessionCoordinator
 from .session_pipeline import SessionPipeline
 from .storage import (
+    apersist_settings_config,
     config_file_matches,
     load_config_data,
     load_sessions,
@@ -177,6 +178,10 @@ class SelfInitiatedReplyPlugin(Star):
         # 跨实例落盘闸门：本实例被判"最终落盘超时"后置位，仍在跑的写盘在
         # os.replace 前自我放弃，避免用陈旧快照覆盖新实例写出的 state.json。
         self._abandon_disk_writes = False
+        # terminate() 跑完后置位：此后本实例的任何落盘都是往已属于新实例的
+        # state.json 上写陈旧快照（check 的账本终态 Task 可以比关停窗口更晚
+        # 收尾）。已在 terminate 尾部、最终落盘之后，不影响本次关停本身。
+        self._terminated = False
         self._save_lock = asyncio.Lock()
         self._config_lock = asyncio.Lock()
         self._admin_file_mtime: float | None = None
@@ -425,14 +430,28 @@ class SelfInitiatedReplyPlugin(Star):
             )
 
     async def _normalize_config_off_loop(self) -> None:
-        """把规范化落盘移出事件循环线程（fsync 不得阻塞所有会话）。"""
+        """规范化落盘：只有磁盘写进线程，宿主配置对象留在事件循环上。
+
+        不能整段丢给 ``to_thread``：``persist_settings_config`` 还会对宿主
+        ``AstrBotConfig`` 做 ``clear()`` + ``update()`` 并调它的 ``save_config``。
+        宿主对象在循环线程上被其它协程读，工作线程里清空再逐键回填会让它们看到
+        空表或半填状态；``save_config`` 若触碰事件循环也会在线程里直接失败。
+        ``storage.apersist_settings_config`` 正是这个拆法，直接复用。
+        """
         try:
-            await asyncio.to_thread(self._normalize_config_sync)
+            written = await apersist_settings_config(self._config_path, self.config, self.settings)
         except Exception as exc:
             logger.warning(
                 "[%s] config normalization task error: %s",
                 PLUGIN_ID,
                 exc,
+            )
+            return
+        if not written:
+            logger.error(
+                "[%s] config normalization write failed, running with the loaded config: %s",
+                PLUGIN_ID,
+                self._config_path,
             )
 
     async def _save_storage(self) -> None:
@@ -599,9 +618,9 @@ class SelfInitiatedReplyPlugin(Star):
         try:
             text = await self._command_text(event, action, arg)
         except Exception as exc:
-            # 落盘失败必须让发指令的人看见。此前的形态是异常直接逃出 on_message：
-            # 管理员在聊天里什么都收不到，`stop_event()` 也没走到，别的插件还会
-            # 把 `/selfreply remove` 当普通消息再处理一遍。而内存回滚已经发生
+            # 落盘失败必须让发指令的人看见。异常不能逃出 on_message：那样管理员在
+            # 聊天里什么都收不到，`stop_event()` 也走不到，别的插件还会把
+            # `/selfreply remove` 当普通消息再处理一遍。而内存回滚已经发生
             # （白名单/会话状态/运行期 UMO 都已恢复），只差这一句告知。
             logger.warning(
                 "[%s] inline command %s failed: %s",
@@ -811,15 +830,20 @@ class SelfInitiatedReplyPlugin(Star):
             else PluginLifecycle.STOPPING
         )
         self._stopping = True
-        # 最终落盘必须与任务收敛同处 _config_lock 内：Dashboard 的 POST /config
-        # 在同一把锁下改 settings/whitelist，锁外快照会读到半更新的白名单。
-        # 锁序恒为 _config_lock → _save_lock，无反向持有。
+        # 取消收敛不持 _config_lock：构造期的 ``_startup_disk_writes`` 第一件事就是
+        # 拿这把锁做配置规范化，持锁等它们就是等自己（它的等待会耗满关停窗口、
+        # 被当成「吞掉取消」隔离登记，一次普通 reload 也会打出 lifecycle degraded
+        # ERROR）；且巡检停止最长 9s，持锁会把每一次 Dashboard 写请求一起阻塞。
+        self._cancel_delay_tasks()
+        await self._scheduler.stop_patrol()
+        self._cancel_background_tasks()
+        await self._wait_background_tasks()
+        self._coordinator.reset_all()
+        # 只把最终落盘包进 _config_lock：Dashboard 的 POST /config 在同一把锁下
+        # 改 settings/whitelist，锁外快照会读到半更新的白名单。锁序恒为
+        # _config_lock → _save_lock，无反向持有。
         async with self._config_lock:
-            self._cancel_delay_tasks()
-            await self._scheduler.stop_patrol()
-            self._cancel_background_tasks()
-            await self._wait_background_tasks()
-            self._coordinator.reset_all()
             # 记录点已逐次落盘，此处兜底覆盖「最后一次记录之后又有内存变更」。
             await self._save_final_state_with_deadline()
+        self._terminated = True
         logger.info("[%s] terminated", PLUGIN_ID)

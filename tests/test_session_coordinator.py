@@ -363,6 +363,31 @@ def test_deque_overflow_keeps_byte_counters_in_sync() -> None:
     assert coordinator._total_bytes == _bytes_for(module, ctx.images) == 4 * limit
 
 
+def test_overflow_keeps_the_index_sorted_and_counters_in_sync() -> None:
+    """队列满时乱序到达：索引仍按时间有序，字节账与实际内容一致。
+
+    缺陷形态：``_append_image_event`` 直接 ``append``。冻结是并发后台任务，
+    一条时间戳更小的旧消息可能最后完成，插入到队尾会破坏
+    ``drop_older_than`` 的 popleft 截断与 ``_evict_oldest_image_event`` 的
+    「队首即最旧」前提；deque 的自动淘汰又按插入序摘，丢掉的是稍新条目。
+
+    变异锚定：改回裸 ``append`` + 自动淘汰，本用例的有序性断言与字节账同时红。
+    """
+    module, coordinator, ctx = _make_coordinator()
+    limit = module.MAX_CACHED_IMAGE_EVENTS
+    for i in range(limit):
+        coordinator.capture_images("s1", float(i + 1), [_PreparedImage(bytes([i % 256]))])
+
+    # 时间戳比全队都小的旧消息最后完成冻结
+    coordinator.capture_images("s1", 0.5, [_PreparedImage(b"late")])
+
+    stamps = [timestamp for timestamp, _images in ctx.images["s1"]]
+    assert len(stamps) == limit, f"队列长度失控：{len(stamps)}"
+    assert stamps == sorted(stamps), f"索引未按时间有序：{stamps}"
+    assert stamps[0] == 0.5, "新到达的条目未落到队首"
+    assert coordinator._total_bytes == _bytes_for(module, ctx.images)
+
+
 def test_reset_all_zeroes_image_byte_counters() -> None:
     module, coordinator, ctx = _make_coordinator()
     coordinator.capture_images("s1", 1.0, [_PreparedImage(b"123")])
@@ -403,3 +428,27 @@ def test_drop_older_than_releases_image_byte_counters() -> None:
 
     # 4567 的 base64 驻留 8 字符，123 的 4：丢弃旧事件后剩 8。
     assert coordinator._total_bytes == _bytes_for(module, ctx.images) == 8
+
+
+def test_out_of_order_image_freeze_keeps_index_sorted() -> None:
+    """冻结完成序与消息序倒置时，索引必须仍然按时间有序。
+
+    缺陷形态：``_append_image_event`` 直接 append。图片冻结是并发后台任务
+    （``vision_runtime._freeze_images``），后到的旧消息可以先完成并入队，于是
+    ``drop_older_than`` 的 ``while events[0][0] < cutoff`` 在队首遇到较新条目就
+    整体停止——其后所有过期事件永不回收，``_evict_oldest_image_event`` 也会把
+    较新的事件当成"最旧"驱逐，``images_for`` 的 reversed 顺序失真。
+
+    变异锚定：去掉入队处的重排，本用例红。
+    """
+    module, coordinator, ctx = _make_coordinator()
+    coordinator.capture_images("s1", 100.0, [_PreparedImage(b"new")])
+    coordinator.capture_images("s1", 10.0, [_PreparedImage(b"old")])  # 完成序倒置
+
+    stamps = [timestamp for timestamp, _images in ctx.images["s1"]]
+    assert stamps == sorted(stamps), f"图片事件表未按时间有序：{stamps}"
+
+    coordinator.drop_older_than(50.0, umo="s1")
+
+    assert [timestamp for timestamp, _images in ctx.images["s1"]] == [100.0]
+    assert coordinator._total_bytes == _bytes_for(module, ctx.images)

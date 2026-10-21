@@ -123,17 +123,23 @@ def install_astrbot_stubs() -> None:
     if not hasattr(components, "At"):
 
         class _FakeAt:
-            """@ 组件桩：承载 ``qq`` / ``name``（production 只构造 @，不读其它字段）。
+            """@ 组件桩：承载 ``qq`` / ``name``，并如实复现宿主的序列化。
 
-            ``qq`` 收 ``int | str``：宿主签名是 ``At(qq: int | str)``，sender_id
-            是字符串。不接受参数的桩会让 ``At(qq=...)`` 直接 TypeError，从而把
+            ``qq`` 收 ``int | str``：宿主签名是 ``At(qq: int | str, name: str | None)``，
+            sender_id 是字符串。不接受参数的桩会让构造直接 TypeError，从而把
             "已插入 @" 的断言变成永远走 except 降级分支的假绿。
+
+            ``toDict`` 必须与宿主 4.10.6~4.29.1 一致，**只发 qq 丢掉 name**：
+            桩比宿主“更健康”的话，子类必须覆盖 ``toDict`` 这件事就测不出来了。
             """
 
             def __init__(self, qq: Any = "", name: Any = "", **_: Any) -> None:
                 self.qq = qq
                 self.name = name
                 self.type = "at"
+
+            def toDict(self) -> dict[str, Any]:
+                return {"type": "at", "data": {"qq": str(self.qq)}}
 
             def __str__(self) -> str:
                 # 同 _FakeReply：@ 不得进入 get_plain_text 正文，否则断言被污染。

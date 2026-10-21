@@ -204,12 +204,15 @@ async def save_storage(plugin: SelfInitiatedReplyPlugin) -> None:
     state.json），而随后执行的最终落盘是另一个任务、必须照常写——它在
     ``terminate()`` 返回之前完成，不暴露在那个跨实例竞态里。用全局标志会把
     最终落盘一起挡掉，静默丢掉「最后一次记录之后又有内存变更」。
+
+    ``_terminated`` 是本实例已经关停完毕的终态闸门：此后的写入者都只可能是
+    比关停窗口更晚收尾的任务（如 check 的账本终态），它们手里的快照必然陈旧。
     """
     async with plugin._save_lock:
         current = asyncio.current_task()
 
         def abandoned() -> bool:
-            if plugin._abandon_disk_writes:
+            if plugin._abandon_disk_writes or plugin._terminated:
                 return True
             return current is not None and current in plugin._spared_critical_tasks
 
@@ -294,10 +297,18 @@ async def persist_enabled(plugin: SelfInitiatedReplyPlugin, enabled: bool) -> No
         # 取消同样要回滚：CancelledError 不落 except Exception，而 enabled 已在
         # 内存翻面。少了这一步，§6.1 承诺的「重启后保持」反向变成「重启后回落」。
         restore = asyncio.ensure_future(rollback())
-        try:
-            await asyncio.shield(restore)
-        except asyncio.CancelledError:
-            pass
+        # 回滚必须**跑完**才算数：单次 shield 在取消瞬间就抛，rollback 成游离
+        # 任务在锁外继续，能拿到锁并完整落盘的一次后续写入随后被它用旧值撤销。
+        # 与 webapi._apply_config_updates 的回滚等待同形。
+        #
+        # ``restore.done()`` 是退出条件而不是 ``break``：我们已被取消过一次，
+        # 之后每次 await 都可能立刻再抛 CancelledError，包括回滚任务已经跑完
+        # 的那一刻——只靠 break 会永远等下去。
+        while not restore.done():
+            try:
+                await asyncio.shield(restore)
+            except asyncio.CancelledError:
+                continue
         raise
     except Exception:
         await rollback()

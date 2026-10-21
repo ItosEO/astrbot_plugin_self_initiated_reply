@@ -804,12 +804,14 @@ test("vision provider fields share the judge layout wrapper", async () => {
   assert.match(judge, /<div class="provider-control">/);
 });
 
-test("theme.mjs keeps the dim/bold submission behind the touched guard", async () => {
-  // 行为断言在浏览器用例（`theme clicks never submit untouched dim/bold
-  // preferences`）；这条是源码锚，防的是把守卫整段删掉的回退。
+test("theme.mjs submits dim and bold behind their own touched guards", async () => {
+  // 行为断言在浏览器用例（`a dim click during a pending theme GET keeps the
+  // untouched sibling from the server`）；这条是源码锚，防的是退回「任一被动过
+  // 就两个一起提交」的总判据——那会把 GET 在途期间的本地默认值写成服务端值。
   const theme = await readFile(join(pageDir, "theme.mjs"), "utf8");
-  assert.match(theme, /if \(dimBoldWasTouched\(\)\) \{/);
-  assert.match(theme, /import \{ dimBoldWasTouched \} from "\.\/chrome\.mjs"/);
+  assert.match(theme, /if \(dimWasTouched\(\)\) \{/);
+  assert.match(theme, /if \(boldWasTouched\(\)\) \{/);
+  assert.doesNotMatch(theme, /dimBoldWasTouched/);
 });
 
 test("topbar height writeback stays single-sourced and guarded", async () => {

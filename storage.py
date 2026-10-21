@@ -133,6 +133,27 @@ def _replace_with_retry(src: Path, dst: Path) -> None:
             time.sleep(_REPLACE_RETRY_DELAY_SEC)
 
 
+def fsync_dir(path: Path) -> None:
+    """replace 之后补一次目录 fsync（尽力而为）。
+
+    只 fsync 文件不够：掉电时数据块已落盘而 rename 丢失，
+    “原子发布”只对并发读成立、对持久化不成立。Windows 打不开目录
+    （CRT 需 FILE_FLAG_BACKUP_SEMANTICS），那里靠 NTFS 日志覆盖 rename；
+    打不开与 fsync 失败都按尽力而为处理——文件已经发布成功，让它退化成
+    少一层持久性保证，而不是把整次写入报成失败。
+    """
+    try:
+        dir_fd = os.open(path.parent, getattr(os, "O_DIRECTORY", os.O_RDONLY))
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
+
+
 def write_json_atomic(
     path: Path,
     data: dict[str, Any],
@@ -164,6 +185,7 @@ def write_json_atomic(
             logger.debug("[%s] abandoned write dropped path=%s", PLUGIN_ID, path)
             return False
         _replace_with_retry(tmp_path, path)
+        fsync_dir(path)
         return True
     except (OSError, UnicodeEncodeError, TypeError, ValueError) as exc:
         logger.warning("[%s] failed to write %s: %s", PLUGIN_ID, path, exc)

@@ -90,6 +90,15 @@ _PROVIDER_REQUEST_FIELDS = frozenset(
     }
 )
 
+# 可按宿主能力省略的 build config 键（仅存储层能力增强类）。
+# ``fallback_provider_ids`` 是 4.29 才有的字段；4.23.3 / 4.27.2 的
+# ``MainAgentBuildConfig`` 是 dataclass，多传一个未知关键字就是加载期
+# ``RuntimeError``，插件整个装不上。旧宿主上回退走另一条通道
+# ``provider_settings.fallback_chat_models``，而本插件本就透传整棵
+# ``provider_settings``，省略该键不会丢掉旧宿主的回退。
+# 其余键保持严格：省略它们等于放弃对宿主键名漂移的加载期告警。
+_OPTIONAL_BUILD_CONFIG_KWARGS = frozenset({"fallback_provider_ids"})
+
 
 class _HostEntry(NamedTuple):
     """一个宿主私有模块的符号契约条目（from_host 探测与 compat 清单单源）。"""
@@ -247,8 +256,10 @@ class AstrBotRuntimeAdapter:
                 # 缺这一探针时，宿主改一个键名就让插件加载成功、每次主动生成
                 # 在运行期 TypeError（一条回复产不出），而 compat_check 与测试
                 # 全绿——桩的 build config 都是 **kwargs。
+                # 必须与运行期走**同一个出口**（new_build_config），否则可选键
+                # 的门控只在一侧生效：探针仍硬传就会在旧宿主上误判为不兼容。
                 try:
-                    caps.build_config(**proactive_build_config_kwargs())
+                    self.new_build_config(**proactive_build_config_kwargs())
                 except TypeError as exc:
                     problems.append(
                         f"当前 AstrBot 的 MainAgentBuildConfig 不接受主动运行的配置参数：{exc}"
@@ -509,7 +520,7 @@ class AstrBotRuntimeAdapter:
             # 脱敏后进日志：tool_set 的实现可能把宿主配置路径、插件名或上游
             # SDK 原文带进异常文本，而这条是 fail-closed 的安全缝。顺带挡住
             # exc.__str__ 再抛——那会让日志调用本身在 except 块里炸掉，
-            # fail-closed 的归因随之丢失（同 outbound.safe_exc_text 的理由）。
+            # fail-closed 的归因随之丢失（同 utils.safe_exc_text 的理由）。
             detail = redact_exc_text(exc)
             logger.warning(
                 "[%s] tool boundary fail-closed: tool set read or removal failed (%s); "
@@ -559,11 +570,32 @@ class AstrBotRuntimeAdapter:
             return False
         return True
 
+    @staticmethod
+    def _accepts_build_config_kwarg(config_type: Any, name: str) -> bool:
+        """宿主 build config 是否接受该关键字。
+
+        判据看的是**宿主自己声明的形参**而不是版本号：4.27.2 有没有这个字段
+        无需预设，有则传、无则省，两种情况下都不会 TypeError。"""
+        try:
+            params = inspect.signature(config_type).parameters
+        except (TypeError, ValueError):
+            # 签名不可检查时按接受处理：省略一个存在的键会静默丢掉回退。
+            return True
+        return name in params or any(
+            param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values()
+        )
+
     def new_build_config(self, **kwargs: Any) -> Any:
         config_type = self.capabilities.build_config
         if config_type is None:
             raise RuntimeError("当前 AstrBot 缺少 MainAgentBuildConfig")
-        return config_type(**kwargs)
+        accepted = {
+            key: value
+            for key, value in kwargs.items()
+            if key not in _OPTIONAL_BUILD_CONFIG_KWARGS
+            or self._accepts_build_config_kwarg(config_type, key)
+        }
+        return config_type(**accepted)
 
     async def load_session_conversation(self, event: Any, context: Any) -> Any:
         return await self.get_session_conv(event, context)

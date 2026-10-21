@@ -343,8 +343,7 @@ code {
 	margin-top: var(--sp-6);
 }
 .master,
-.panel,
-details.panel {
+.panel {
 	scroll-margin-top: calc(var(--topbar-h) + 16px);
 }
 .sidenav {

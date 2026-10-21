@@ -107,7 +107,11 @@ export function createConfigIo(deps) {
 		saveStateKind = state;
 		const e = getEls();
 		if (!e.configSaveState) return;
-		e.configSaveState.textContent = message;
+		// #configSaveState / #mobileSaveState 都是 aria-live="polite"，而
+		// setDirty 挂在每个 input/change 上：逐字相同就不写，否则同样一句「有未
+		// 保存改动」会在每次按键时被重新排进播报队列（同 #whitelistSummary 口径）。
+		if (e.configSaveState.textContent !== message)
+			e.configSaveState.textContent = message;
 		e.configSaveState.classList.remove("is-pending", "is-ok", "is-error");
 		const cssKind = state === "dirty" ? "pending" : state;
 		if (cssKind) e.configSaveState.classList.add(`is-${cssKind}`);
@@ -117,7 +121,9 @@ export function createConfigIo(deps) {
 			else if (state === "saving") e.navSaveState.textContent = "保存中";
 		}
 		if (e.mobileSaveState) {
-			e.mobileSaveState.textContent = message || (state ? "" : "已同步");
+			const mobileText = message || (state ? "" : "已同步");
+			if (e.mobileSaveState.textContent !== mobileText)
+				e.mobileSaveState.textContent = mobileText;
 			e.mobileSaveState.classList.remove("is-pending", "is-ok", "is-error");
 			if (cssKind) e.mobileSaveState.classList.add(`is-${cssKind}`);
 		}
@@ -135,7 +141,10 @@ export function createConfigIo(deps) {
 			e.navSaveState.textContent = dirty ? "有未保存改动" : "已同步";
 		if (dirty && saveStateKind !== "saving")
 			setSaveState("有未保存改动", "dirty");
-		else if (!dirty && saveStateKind === "dirty") setSaveState("", "");
+		// error 一并清：一次成功的刷新/加载已经拿到服务端真值，此时保留
+		// 「保存失败」会让顶标说「已同步」、正文说「保存失败」，两句互相矛盾。
+		else if (!dirty && (saveStateKind === "dirty" || saveStateKind === "error"))
+			setSaveState("", "");
 	}
 	function attachDirtyListeners() {
 		const e = getEls();
@@ -300,8 +309,11 @@ export function createConfigIo(deps) {
 		const errors = validateWhitelistLines(e.whitelistInput.value);
 		if (errors.length > 0) {
 			const first = errors[0];
+			const msg = `第 ${first.line} 项${first.reason}：${first.item.slice(0, 24)}`;
 			e.whitelistInput.setAttribute("aria-invalid", "true");
-			e.whitelistError.textContent = `第 ${first.line} 项${first.reason}：${first.item.slice(0, 24)}`;
+			// #whitelistError 是 role="alert"：同样的道理见 updateWhitelistFeedback，
+			// 逐字相同就不写，否则继续输入时同一句被反复排进播报队列打断读屏。
+			if (e.whitelistError.textContent !== msg) e.whitelistError.textContent = msg;
 			e.whitelistError.classList.add("show");
 			// 只在保存路径抢焦点：input/blur 上抢会把用户困在该字段
 			// （点其他字段被拽回、Tab 逃不出），可达性缺陷。
@@ -351,6 +363,12 @@ export function createConfigIo(deps) {
 			runtimeEnabled: runtimeOn,
 			requiresConfigRefresh: false,
 		});
+		// 强制刷新会整块重填控件值，旧校验痕迹必须一并抹掉：不重验就是
+		// 控件已被服务端值覆盖、错误文案却还说「不能小于 5」（aria-invalid
+		// 也停在 true），用户被指向一个并不存在的问题。validateField /
+		// validateWhitelist 在无 focus 入参时不抢焦点，适合此处。
+		for (const field of numberFields) validateField(field);
+		validateWhitelist();
 		setDirty(false);
 		if (e.configForm) e.configForm.inert = false;
 		setSaving(false);

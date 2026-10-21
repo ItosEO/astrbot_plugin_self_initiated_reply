@@ -66,7 +66,17 @@ export function createProviderControl(refs, deps) {
     const before = value();
     if (manual) {
       sync(refs.input.value.trim());
-      if (manual) showToast("当前 Provider 不在列表中，继续保留手动输入");
+      // 「不在列表中」是关于列表的断言，只有列表真的加载成功时才作得出来；
+      // 不可用时 sync 必然落回手动分支，此时提示等于凭空断言（config-io
+      // 保存路径对同一判据已有同样的 listAvailable 守卫）。但静默不置一词也
+      // 不对：两个识图控件没有常驻的列表状态位，点了按钮屏幕毫无变化。
+      if (manual) {
+        showToast(
+          isListAvailable()
+            ? "当前 Provider 不在列表中，继续保留手动输入"
+            : "Provider 列表不可用，无法切回列表",
+        );
+      }
     } else {
       refs.input.value = refs.select.value;
       setManual(true, true);

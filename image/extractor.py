@@ -29,10 +29,8 @@ _CQ_COMPONENT_RE = re.compile(
 def _parse_raw_cq_components(raw: Any) -> list[dict[str, Any]]:
     """Recover image segments when an adapter exposes only raw CQ text."""
     if isinstance(raw, bytes):
-        try:
-            raw = raw.decode("utf-8", errors="replace")
-        except Exception:
-            return []
+        # errors="replace" 下 bytes.decode 不会抛。
+        raw = raw.decode("utf-8", errors="replace")
     if not isinstance(raw, str):
         return []
     components: list[dict[str, Any]] = []

@@ -42,6 +42,7 @@ from .utils import (
     event_message_id,
     event_self_id,
     event_sender_id,
+    event_sender_name,
     redact_exc_text,
 )
 
@@ -57,6 +58,27 @@ ContextSendCallback = Callable[[str, Any], Awaitable[Any]]
 RuntimeCallback = Callable[[], Any]
 # DEBUG 日志里回复正文的预览长度上限（只在 log_reply_content 开启时输出）。
 _LOG_REPLY_PREVIEW_CHARS = 80
+
+
+class _NamedAt(At):
+    """把 ``name`` 带进 OneBot ``at`` 段的 ``At``。
+
+    宿主 ``At.toDict()`` 只序列化 ``qq``（4.10.6~4.29.1 均如此），昵称被丢掉。
+    而 OneBot 的 ``at.name`` 是显示名：读它的实现（LLOneBot 用它拼 ``@name``，
+    为空就只发出一个裸 ``@``）与 Line/Misskey/WeCom/WeixinOC/Telegram 都靠这个
+    字段出显示文本。NapCat 不读它（按群成员记录自己解析），Lark 与 QQ 官方号
+    只用 ``qq``——这三家上本类无副作用。
+
+    在宿主输出上增量而不是重建整段，宿主给 ``at`` 加字段时不会静默丢掉。
+    构造失败由 ``_attach_chain_prefix`` 静默降级。
+    """
+
+    def toDict(self) -> dict[str, Any]:
+        data = super().toDict()
+        name = getattr(self, "name", "")
+        if name:
+            data["data"]["name"] = str(name)
+        return data
 
 
 class DeliveryRunner:
@@ -349,6 +371,8 @@ class DeliveryRunner:
         # @ 与引用同源取目标且无条件解析：短路掉会让「mention_mode=always 但
         # 事件已被回收」静默失效且无迹可查（契约 §14：context 兜底路径不 @）。
         mention_id = self._resolve_mention_id(umo)
+        # 显示名与目标同源，都取本次依据消息的发送者；理由见 _NamedAt。
+        mention_name = event_sender_name(last_event) if mention_id and last_event else ""
         if last_event:
             return await self._send_via_event(
                 umo,
@@ -358,6 +382,7 @@ class DeliveryRunner:
                 expected_generation=expected_generation,
                 quote_id=quote_id,
                 mention_id=mention_id,
+                mention_name=mention_name,
             )
         return await self._send_via_context(
             umo,
@@ -376,6 +401,7 @@ class DeliveryRunner:
         expected_generation: int | None,
         quote_id: str = "",
         mention_id: str = "",
+        mention_name: str = "",
     ) -> SendOutcome:
         """事件路径投递：装饰钩子 → 代次复核 → 事件 send → 发送后钩子。
 
@@ -437,7 +463,11 @@ class DeliveryRunner:
                 # @ 组件同样插在装饰钩子之后，且必须插在 quote 之后：
                 # ``insert(0)`` 让后插者位于更前，先 Reply 后 At 才能得到
                 # [At, Reply, ...正文]。两步同步，不新增 await 点。
-                self._attach_chain_prefix(result, lambda: At(qq=mention_id), kind="mention")
+                self._attach_chain_prefix(
+                    result,
+                    lambda: _NamedAt(qq=mention_id, name=mention_name),
+                    kind="mention",
+                )
             logger.debug(
                 "[%s] event send begin ledger_id=%s session=%s chars=%d chain_items=%d",
                 PLUGIN_ID,

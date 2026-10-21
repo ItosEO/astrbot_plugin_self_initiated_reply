@@ -728,9 +728,9 @@ async def _apply_config_updates(
             "adjusted_fields": adjusted_fields,
         }
     except (asyncio.CancelledError, Exception):
-        # 取消也要回滚：CancelledError 不落 except Exception，而此前的应用
-        # 步骤可能已完成，留下"磁盘已写新值、内存未回滚"的半应用态。普通异常
-        # 同理。两个分支形状完全相同，合并只为不养两份逐字重复的实现。
+        # 取消也要回滚：CancelledError 不落 except Exception，而异常抛出前已执行
+        # 的那些步骤可能已完成，留下"磁盘已写新值、内存未回滚"的半应用态。普通
+        # 异常同理。两个分支形状完全相同，合并只为不养两份逐字重复的实现。
         #
         # 回滚必须**跑完**才能放锁：它经 ensure_future 成游离任务后不持
         # _config_lock（_api_post_config 的 async with 随本异常释放锁），于是一
@@ -744,10 +744,12 @@ async def _apply_config_updates(
                 plugin, snapshot, pruned=pruned, extra_delay_umos=window_delay_umos
             )
         )
-        while True:
+        # 退出条件必须是 ``restore.done()``：已取消过一次之后每次 await 都可能
+        # 立刻再抛 CancelledError（回滚任务自身被取消时 shield 每次都同步抛），
+        # 以“await 正常返回”作退出条件会紧空转并挂死关停。
+        while not restore.done():
             try:
                 await asyncio.shield(restore)
-                break
             except asyncio.CancelledError:
                 continue
         raise

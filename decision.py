@@ -16,8 +16,8 @@ from typing import Any
 from astrbot.api import logger
 
 from .models import (
-    CONFIG_SPEC_BY_KEY,
     CONTEXT_CAP_MARKER,
+    DECISION_HISTORY_FLOOR,
     DECISION_JSON_CONTRACT,
     PLUGIN_ID,
     CheckTrigger,
@@ -56,10 +56,6 @@ QUOTE_DECISION_HINT = (
     "（例如在回应某个人的具体问题、对话已往下走了几句、或需要点明在接谁的话时），"
     "false 表示不必引用。"
 )
-# 判断路径读宿主历史的下限：默认提示词明示「优先参考最近至少 8 条」，读少于
-# 8 条会让模型反复回宿主补历史。与生成路径的 MIN_RECENT_TEXT_RECORDS 刻意
-# 不同源：8 条是提示词契约，生成阈值跟着用户的缓存上限走。
-DECISION_HISTORY_FLOOR = 8
 
 
 def _localtime_minutes() -> int:
@@ -285,7 +281,21 @@ class DecisionMaker:
                 "reason": "未找到可用判断模型",
                 "elapsed_sec": self._clock() - started,
             }
-        prompt = await self.build_decision_prompt(umo, state, trigger)
+        try:
+            prompt = await self.build_decision_prompt(umo, state, trigger)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # 提示词构建读宿主历史与 Vision 描述，两处都可能抛。这段必须有自己的
+            # fail-closed 出口：让它穿出去就成了「delayed check failed」，而
+            # last_decisions 里没有任何记录——排障者看不到这次判断发生过。
+            detail = redact_exc_text(exc)
+            logger.warning("[%s] decision prompt build failed: %s", PLUGIN_ID, detail)
+            return {
+                "should_reply": False,
+                "reason": f"判断提示词构建失败：{detail}",
+                "elapsed_sec": self._clock() - started,
+            }
         response: Any = None
         # 超时用 asyncio.wait 而非 wait_for：wait_for 会取消内层并**等它真正
         # 结束**，宿主 provider 若吞掉 CancelledError，判断任务永不返回 →
@@ -301,6 +311,16 @@ class DecisionMaker:
                 return {
                     "should_reply": False,
                     "reason": "判断模型超时",
+                    "elapsed_sec": self._clock() - started,
+                }
+            if task.cancelled():
+                # provider 任务**自己**被取消（宿主把内层任务砍掉），不是调用方
+                # 取消。task.result() 会抛 CancelledError 并被下方分支误判成
+                # 「调用方取消」原样上抛，最终由 scheduler 的 except 静默吞掉：
+                # 无日志、无裁决，/status 停在上一条过期结论。归成普通失败。
+                return {
+                    "should_reply": False,
+                    "reason": "判断模型调用被取消",
                     "elapsed_sec": self._clock() - started,
                 }
             response = task.result()
@@ -388,11 +408,9 @@ class DecisionMaker:
                 allow_newlines=True,
             ),
         }
-        # 回落取 ``ConfigSpec.reset_value``：与读侧落盘、面板「恢复默认」同一表达式。
-        raw = (
-            str(self.settings.decision_prompt_template or "").strip()
-            or CONFIG_SPEC_BY_KEY["decision_prompt_template"].reset_value
-        )
+        # 不在此重复判空：``coerce_config_value`` 的 text 分支已把空串回落到
+        # ``reset_value``（唯一实现点在读侧），这里再兜一次就是第二份口径。
+        raw = str(self.settings.decision_prompt_template or "").strip()
         rendered = re.sub(
             r"\{([a-zA-Z0-9_]+)\}",
             lambda match: str(values.get(match.group(1), match.group(0))),

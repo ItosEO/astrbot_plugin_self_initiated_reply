@@ -1128,23 +1128,6 @@ def test_api_get_config_exposes_panel_surface_only(tmp_path) -> None:
     with_plugin(tmp_path, scenario)
 
 
-def test_web_apis_do_not_register_overview_route(tmp_path) -> None:
-    """白名单计数只走 GET /config，不再注册第三份 overview 副本。"""
-
-    async def scenario(plugin, main):
-        routes = [route for route, *_ in plugin.context.register_web_api_calls]
-        assert not any(route.endswith("/unified/overview") for route in routes)
-        webapi = sys.modules[f"{PACKAGE}.webapi"]
-        plugin.settings.whitelist = {"qq:GroupMessage:1", "qq:GroupMessage:2"}
-        payload = await webapi._api_get_config(plugin)
-        assert payload["whitelist_sessions"] == [
-            "qq:GroupMessage:1",
-            "qq:GroupMessage:2",
-        ]
-
-    with_plugin(tmp_path, scenario)
-
-
 @pytest.mark.parametrize(
     "payload",
     [

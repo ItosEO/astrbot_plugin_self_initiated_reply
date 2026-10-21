@@ -76,13 +76,14 @@ def test_message_path_runs_event_cleanup(tmp_path) -> None:
 def test_ignored_message_invalidates_stale_reply(tmp_path) -> None:
     """被忽略的消息（忽略名单发送者）必须作废未发出的旧回复。
 
-    缺陷形态：``_accepted_content`` 里对 ignored/empty 的 ``invalidate`` 是它们
+    缺陷形态：``_accepted_content`` 里对 ignored/empty 的代次推进是它们
     唯一的代次推进路径——这两类消息都在 ``_record_message`` 之前返回。删掉它，
     群里被拉黑的人发言或有人刷贴纸时，上一轮已经排好的主动回复不作废，机器人
     拿着过期上下文接话，甚至回复到已经翻篇的话题上（契约 §6.3）。
 
     变异锚定：把 ``if plugin.settings.abandon_stale_on_new_message:`` 的条件
-    改成恒假，本用例红。
+    改成恒假，本用例红；把它改回 ``_coordinator.invalidate(umo)``，
+    最近事件断言红（契约 §8）。
     """
 
     async def scenario(plugin, main):
@@ -97,6 +98,10 @@ def test_ignored_message_invalidates_stale_reply(tmp_path) -> None:
         assert after > before, (
             f"被忽略的消息没有推进代次（{before} -> {after}）：旧的主动回复不会作废"
         )
+        # 只推进代次，不走 ``invalidate`` 的级联清理：最近事件与保护窗口内的
+        # 图片索引必须留着（契约 §8），否则一次 @Bot 或一条表情包就让巡检
+        # 因「没有可用的最近消息事件」静默跳过该会话。
+        assert plugin._last_events.get(UMO) is not None, "被忽略的消息抹掉了最近事件"
         # 被忽略的消息不进观察窗口
         assert plugin._state_for(UMO).recent[-1].text != "被我忽略的人说话"
 

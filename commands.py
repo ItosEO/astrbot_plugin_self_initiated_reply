@@ -345,6 +345,15 @@ async def dispatch_command_action(
         if not plugin._can_start_tasks():
             return _lifecycle_reject_text(plugin, "启用")
         async with plugin._config_lock:
+            # 锁内必须复查：等锁期间 terminate/DEGRADED 都可能已经发生（它们不经
+            # 这把锁或先改状态再抢锁），而本分支随后要写的是整份配置——用本实例
+            # 的陈旧快照覆盖新实例。与 webapi._apply_config_updates 同一道判据。
+            # 拒绝要走回显而不是上抛：本函数契约是「文本进、文本出」，装饰器
+            # 路径的 async generator 没人接异常，管理员在聊天里什么都收不到。
+            try:
+                plugin._reject_if_not_running("启用")
+            except RuntimeError:
+                return _lifecycle_reject_text(plugin, "启用")
             await plugin._persist_enabled(True)
             await apply_enabled_topology(plugin, enabled=True)
         return "主动回复插件已启用（重启后保持）。"
@@ -354,6 +363,10 @@ async def dispatch_command_action(
         if not plugin._can_start_tasks():
             return _lifecycle_reject_text(plugin, "暂停")
         async with plugin._config_lock:
+            try:
+                plugin._reject_if_not_running("暂停")
+            except RuntimeError:
+                return _lifecycle_reject_text(plugin, "暂停")
             await plugin._persist_enabled(False)
             await apply_enabled_topology(plugin, enabled=False)
         return "主动回复插件已暂停（重启后保持）。"

@@ -425,6 +425,33 @@ def test_cleanup_events_reaps_stale_last_decisions(tmp_path: Path) -> None:
     assert live_umo in scheduler._last_decisions, "运行中会话的裁决不得回收"
 
 
+def test_cleanup_events_respects_a_patrol_window_wider_than_the_default(tmp_path: Path) -> None:
+    """巡检不活跃窗口配得比 EVENT_CLEANUP_INTERVAL_SEC 宽时，事件不得先被回收。
+
+    缺陷形态：陈旧阈值恒为 ``EVENT_CLEANUP_INTERVAL_SEC``（1h）。事件一旦被回收，
+    ``_patrol_one_session`` 的「没有可用的最近消息事件」判据会让该会话永久跳过，
+    于是 ``patrol_inactive_after_sec`` 上限 604800 中超过 1h 的部分完全无效——
+    用户把窗口调到 7 天，实际行为仍是 1 小时。
+
+    变异锚定：把阈值改回常量，本用例红。
+    """
+    _, _, scheduler, _, _ = _make_scheduler(tmp_path, {"patrol_inactive_after_sec": 604800})
+    scheduler._last_cleanup = 0.0
+    now = scheduler_mod_now()
+    within_window = "g1:user:a"
+    beyond_window = "g2:user:b"
+    for umo, age in ((within_window, 7200.0), (beyond_window, 700000.0)):
+        scheduler._last_events[umo] = object()
+        scheduler._last_event_at[umo] = now - age
+
+    scheduler.cleanup_events_if_needed()
+
+    assert within_window in scheduler._last_events, (
+        "事件在巡检不活跃窗口内就被回收：该会话将永久跳过巡检"
+    )
+    assert beyond_window not in scheduler._last_events, "超出巡检不活跃窗口的事件仍未回收"
+
+
 def test_cleanup_events_overflow_reaps_last_decisions(tmp_path: Path) -> None:
     """溢出通道同样要回收裁决：被它摘掉的会话此后不再进陈旧通道。
 
@@ -477,7 +504,7 @@ async def test_stop_patrol_quarantines_noncooperative_task(tmp_path: Path, monke
     task = asyncio.create_task(stubborn())
     scheduler._patrol_task = task
     # 超时单源：patch 模块常量（原为注入私有回调，参数已删）。
-    monkeypatch.setattr(_scheduler_module(), "TERMINATE_TASK_TIMEOUT_SEC", 0.01)
+    monkeypatch.setattr(_scheduler_module(), "PATROL_STOP_TIMEOUT_SEC", 0.01)
     scheduler._quarantine_task = quarantine
     stopping = asyncio.create_task(scheduler.stop_patrol())
     await asyncio.sleep(0.05)
@@ -488,6 +515,46 @@ async def test_stop_patrol_quarantines_noncooperative_task(tmp_path: Path, monke
 
     release.set()
     await asyncio.wait_for(task, timeout=1)
+
+
+async def test_stop_patrol_does_not_recancel_an_already_cancelled_task(
+    tmp_path: Path,
+) -> None:
+    """已在取消路径上的巡检不得补第二次取消，否则合作任务被误隔离。
+
+    缺陷形态：``stop_patrol`` 无条件 ``task.cancel()``。真实禁用路径是
+    ``apply_enabled_topology`` → ``_cancel_delay_tasks()``（巡检任务在
+    ``_background_tasks`` 里，已被取消一次）→ ``stop_patrol()``。第二次取消落进
+    巡检内联检查自己的有界收敛窗口，被 ``_graceful_stop`` 判成"吞掉取消"，
+    隔离登记 → ``_mark_degraded`` 把插件永久打成 DEGRADED，只能重载。
+
+    变异锚定：去掉 ``if not task.cancelling()`` 守卫，本用例红。
+    """
+    _, _, scheduler, _, _ = _make_scheduler(tmp_path)
+    cancelled_once = asyncio.Event()
+    release = asyncio.Event()
+
+    async def cooperative() -> None:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            # 模拟被取消方自己的宽限收敛：让出事件循环后才收尾。
+            cancelled_once.set()
+            await release.wait()
+            raise
+
+    task = asyncio.create_task(cooperative())
+    scheduler._patrol_task = task
+    await asyncio.sleep(0)
+    task.cancel()  # 第一段: _cancel_delay_tasks 已取消
+    await asyncio.wait_for(cancelled_once.wait(), timeout=1)
+
+    stopping = asyncio.create_task(scheduler.stop_patrol())
+    await asyncio.sleep(0.05)
+    assert task.cancelling() == 1, f"巡检被补了第二次取消：cancelling={task.cancelling()}"
+    release.set()
+    await asyncio.wait_for(stopping, timeout=1)
+    await _cancel_and_await(task)
 
 
 async def test_patrol_enabled_spawns_and_stop_cancels(tmp_path: Path) -> None:

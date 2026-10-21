@@ -131,16 +131,31 @@ class SessionCoordinator:
         # 空图片列表也入队占位：事件的时间戳参与「该会话最近有无图片」的
         # 判定与保护窗口，丢掉空事件会让时序断档；字节数为 0，预算无影响。
         image_events = self._images.setdefault(umo, deque(maxlen=MAX_CACHED_IMAGE_EVENTS))
-        dropped = None
+        # 冻结是并发后台任务（vision_runtime._freeze_images），完成序可与消息序
+        # 倒置；本表的有序性是 drop_older_than 的 popleft 截断、
+        # _evict_oldest_image_event 的「队首即最旧」、images_for 的 reversed 时序
+        # 三处共同的前提，所以按时间戳找插入位置，而不是直接 append。
+        before = sum(_event_bytes(item[1]) for item in image_events)
+        inserted = len(image_events)
+        while inserted > 0 and image_events[inserted - 1][0] > timestamp:
+            inserted -= 1
+        # deque 在满员时既不接受 insert 也不替你选该丢谁：先按**时间戳**
+        # 摘掉最旧那条（有序后即队首），再插入新条目。用 append 让 deque 自动
+        # 淘汰则按插入序摘，乱序到达下丢的是稍新条目、留下更旧的。
         if image_events.maxlen and len(image_events) == image_events.maxlen:
-            dropped = image_events[0]
-        image_events.append((timestamp, images))
-        if dropped is not None:
-            self._debit(umo, _event_bytes(dropped[1]))
-        nbytes = _event_bytes(images)
-        if nbytes:
-            self._session_bytes[umo] = self._session_bytes.get(umo, 0) + nbytes
-            self._total_bytes += nbytes
+            image_events.popleft()
+            inserted = max(0, inserted - 1)
+        image_events.insert(inserted, (timestamp, images))
+        # 记账取入队前后的差值：手写增减在"插在中间 + 同时溢出"时容易漏减。
+        # n ≤ MAX_CACHED_IMAGE_EVENTS，重算成本可忽略。
+        delta = sum(_event_bytes(item[1]) for item in image_events) - before
+        if delta:
+            remaining = self._session_bytes.get(umo, 0) + delta
+            if remaining > 0:
+                self._session_bytes[umo] = remaining
+            else:
+                self._session_bytes.pop(umo, None)
+            self._total_bytes += delta
 
     def capture_images(self, umo: str, timestamp: float, cached_images: list[Any]) -> list[Any]:
         """Write frozen images while enforcing global and per-session byte budgets.

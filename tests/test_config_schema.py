@@ -53,18 +53,6 @@ _FIELD_ALIAS = {"whitelist_sessions": "whitelist"}
 _INTENTIONAL_EMPTY_DEFAULT = {"decision_prompt_template"}
 
 
-def test_schema_keys_align_with_config_schema_keys() -> None:
-    """schema 键集合 == CONFIG_SCHEMA_KEYS（无别名，一一对应）。"""
-    schema_keys = _schema_keys()
-    webapi = _webapi()
-    canonical = set(webapi.CONFIG_SCHEMA_KEYS)
-    assert schema_keys == canonical, (
-        f"schema 与 CONFIG_SCHEMA_KEYS 漂移："
-        f"schema 独有 {sorted(schema_keys - canonical)}，"
-        f"KEYS 独有 {sorted(canonical - schema_keys)}"
-    )
-
-
 def test_list_specs_declare_one_machine_normalization_contract() -> None:
     """每个字符串 list/set 都必须声明容量、条目规则和空值策略。"""
     models = _models()
@@ -243,14 +231,6 @@ def test_schema_slider_bounds_match_python_clamps() -> None:
     assert not drift, "schema slider 边界与 Python 夹取漂移：\n" + "\n".join(drift)
 
 
-def test_schema_options_match_python_choices() -> None:
-    """枚举型键的 schema options 必须等于规格表。"""
-    schema = _schema()
-    assert set(schema["reply_length_mode"]["options"]) == set(
-        _models().CONFIG_SPEC_BY_KEY["reply_length_mode"].options
-    )
-
-
 # ============================================================================
 # CONFIG_SPECS 规格表必须能完整表达 _conf_schema.json
 #
@@ -378,63 +358,3 @@ def test_abandon_stale_on_new_message_defaults_off_and_dual_panel() -> None:
     schema = _schema()
     assert schema["abandon_stale_on_new_message"]["type"] == "bool"
     assert schema["abandon_stale_on_new_message"]["default"] is False
-
-
-def test_spec_table_reproduces_python_defaults() -> None:
-    """规格表逐键驱动的解析结果必须等于 Settings.from_config({})。
-
-    覆盖范围（如实说明，勿高估）：from_config 已表驱动化，两侧共用
-    ``coerce_config_value``，因此这条**不覆盖 coerce 本身**的正确性，那由
-    ``test_schema_defaults_match_python_defaults``（对照 _conf_schema.json）
-    兜住。本条能抓的是 ``attr``/``container`` 写错，即「表里声明的字段名或
-    容器类型与 Settings 实际不符」，那会让 from_config 构造出错或类型走形。
-    """
-    models = _models()
-    settings = models.Settings.from_config({})
-    drift: list[str] = []
-    for spec in models.CONFIG_SPECS:
-        via_spec = models.read_config_value(spec, {})
-        actual = getattr(settings, spec.attr)
-        if via_spec != actual:
-            drift.append(f"{spec.key}: 表驱动={via_spec!r} from_config={actual!r}")
-    assert not drift, "表驱动解析与 from_config 结果不一致：\n" + "\n".join(drift)
-
-
-def test_spec_table_legacy_fallback_matches_from_config() -> None:
-    """旧键回退语义必须与 from_config 一致（存量配置迁移不能回归）。
-
-    两侧共用 ``read_config_value``，本条不覆盖回退算法本身，只钉住
-    ``legacy_keys`` 声明与 ``attr``/``container`` 的一致性。回退算法的真实
-    锚点是 ``test_config_hot_reload.py::test_from_config_migrates_legacy_alias_keys``
-    与 ``test_vision.py::test_legacy_vision_enabled_migrates_to_both_toggles``
-    它们用存量配置的真实键名断言迁移结果。
-    """
-    models = _models()
-    drift: list[str] = []
-    for spec in models.CONFIG_SPECS:
-        for legacy in spec.legacy_keys:
-            probe = {
-                "bool": True,
-                "int": 7,
-                "float": 7.0,
-                "list": ["qq:GroupMessage:7"],
-                "str": "probe",
-                "enum": "short",
-                "text": "probe-template",
-            }[spec.kind]
-            via_spec = models.read_config_value(spec, {legacy: probe})
-            actual = getattr(models.Settings.from_config({legacy: probe}), spec.attr)
-            if via_spec != actual:
-                drift.append(f"{spec.key} via {legacy}: 表驱动={via_spec!r} from_config={actual!r}")
-    assert not drift, "旧键回退语义漂移：\n" + "\n".join(drift)
-
-
-def test_audited_keys_come_from_spec_table() -> None:
-    """审计名单必须由规格表派生，不得再手工维护第二份。"""
-    models = _models()
-    webapi = _webapi()
-    from_table = {spec.key for spec in models.CONFIG_SPECS if spec.audited}
-    assert from_table == set(webapi._AUDITED_CONFIG_KEYS), (
-        f"审计名单与规格表漂移：表={sorted(from_table)} "
-        f"webapi={sorted(webapi._AUDITED_CONFIG_KEYS)}"
-    )

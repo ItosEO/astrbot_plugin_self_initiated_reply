@@ -15,7 +15,6 @@ import {
 	bindDimBoldButtons,
 	boldWasTouched,
 	createScrollHandler,
-	dimBoldWasTouched,
 	dimWasTouched,
 	hideBoot,
 	markThemeTouched,
@@ -31,9 +30,6 @@ import {
 import { createConfigIo } from "./config-io.mjs";
 
 const PLUGIN_ID = "astrbot_plugin_self_initiated_reply";
-window.__selfreplyAppStarted = true;
-if (window.__selfreplyBootFailTimer)
-	window.clearTimeout(window.__selfreplyBootFailTimer);
 
 let els = null;
 const $ = (id) => document.getElementById(id);
@@ -482,6 +478,14 @@ window.addEventListener("beforeunload", (e) => {
 });
 
 configIo.setSaving(false);
+
+// 模块装配已全部完成，从这里开始的失败才该由 loadAll 收尾。标志与定时器必须
+// 留到这里再置：上面任何一个控件绑定抛错（元素被改名/缺失）都会中断模块求值，
+// 提前置位会连带关掉 8s 的「脚本加载失败」遮罩，页面永久停在「正在加载配置…」
+// 且没有任何提示。
+window.__selfreplyAppStarted = true;
+if (window.__selfreplyBootFailTimer)
+	window.clearTimeout(window.__selfreplyBootFailTimer);
 
 // 看门狗只兜底：加载成功/失败均由 loadAll 收尾反馈；仅当加载已收尾且未成功、
 // 或首屏串行请求总预算（2 × FETCH_TIMEOUT_MS）已被 12s 定时器追平时才报失败。

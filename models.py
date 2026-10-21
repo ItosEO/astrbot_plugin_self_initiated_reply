@@ -26,7 +26,7 @@ from typing import Any, Protocol
 from astrbot.api import logger
 
 PLUGIN_ID = "astrbot_plugin_self_initiated_reply"
-PLUGIN_VERSION = "1.5.0"
+PLUGIN_VERSION = "1.5.1"
 COMMAND_HANDLED_KEY = f"{PLUGIN_ID}:command_handled"
 STATE_VERSION = 4
 
@@ -99,9 +99,10 @@ STOPPING_REPLY_TEXT = "插件正在停止，放弃回复。"
 LEAK_WARN_TASK_THRESHOLD = 100
 LEAK_WARN_SESSION_THRESHOLD = 1500
 # 生成上下文文本记录预算下限：本地文本记录不足此数时才回宿主补历史。
-# 判断路径另有 decision.DECISION_HISTORY_FLOOR = 8，那是提示词契约（"优先参考
-# 最近至少 8 条"），两者刻意不同源，不得顺手统一。
+# 判断路径另有 DECISION_HISTORY_FLOOR，那是提示词契约（"优先参考最近至少 8 条"），
+# 两者刻意不同源，不得顺手统一。
 MIN_RECENT_TEXT_RECORDS = 5
+DECISION_HISTORY_FLOOR = 8
 
 # 插件运行常量
 MAX_AGENT_STEPS = 15  # 为主 Agent 生成预留步数
@@ -110,6 +111,12 @@ MAX_DIRECT_TOOL_SENDS = 2
 # fallback 必须引用 TERMINATE_TASK_TIMEOUT_SEC，禁止再写字面量。
 GRACEFUL_STOP_GRACE_SEC = 3.0
 TERMINATE_TASK_TIMEOUT_SEC = 3.0
+# 巡检停止窗口。被取消的巡检内联跑着一次会话检查，而后者自带两段
+# GRACEFUL_STOP_GRACE_SEC 的收敛等待（generation._graceful_stop 先等优雅停止、
+# 再等兜底取消）。套用 3s 的 terminate 窗口会把**合作**任务判成"吞掉取消"并
+# 隔离登记，_mark_degraded 随即永久停摆——一次例行 /selfreply off 就够。
+# 取三段：两段收敛 + 一段余量（覆盖 decision 收敛与落盘重试）。
+PATROL_STOP_TIMEOUT_SEC = GRACEFUL_STOP_GRACE_SEC * 3
 # 内联指令入口做管理员校验的动作集合（help 任何成员可取）。
 ADMIN_COMMAND_ACTIONS = {"status", "list", "add", "remove", "check", "on", "off", "debug"}
 # 写操作在权限校验通过后取消在途回复；只读动作不打断进行中的检查。
@@ -178,13 +185,15 @@ Bot昵称: {bot_aliases}
 判断 Bot 现在是否适合温和地接一句。目标是自然融入群聊，不是抢答 @Bot、命令或私人对话。
 
 判断规则:
-- 默认保守克制。只在接话自然、有信息量时 should_reply=true。
-- 可以回复的情况（满足其一即可，但必须不打扰当前对话节奏）:
-  1. 群友明确点名 Bot 昵称，并要求接话、回复、发表情包、找图、发图。
-  2. 群友在讨论技术/知识/工具类问题，Bot 能补充一个简短有用的信息、提醒或判断。
-  3. 群聊明显冷场，最后一条是开放式提问、评价或吐槽，轻短接一句能自然续上话题。
+- 默认保守克制：只在接话自然、有信息量时 should_reply=true。
+- 群友明确点名 Bot 昵称并要求接话、回复、发表情包、找图、发图时，优先判 true。
+  这是群友的直接邀请，除非最后一条消息本身带明显的排斥意味（明确说不要 Bot 接话、
+  辱骂、驱赶），否则不该因为"Bot 刚回复过"就拒绝。点名本身就是还要再回一次的理由。
+- 其余可以回复的情况（满足其一即可，但必须不打扰当前对话节奏）:
+  1. 群友在讨论技术/知识/工具类问题，Bot 能补充一个简短有用的信息、提醒或判断。
+  2. 群聊明显冷场，最后一条是开放式提问、评价或吐槽，轻短接一句能自然续上话题。
 
-- 以下情况必须 should_reply=false：
+- 判断时还需考虑以下倾向 should_reply=false 的信号，但它们都是权衡项，不是硬性禁止：
   - 群友间正在密集互动、互问互答、热烈讨论中，插话会显得突兀。
   - 对话明显是针对某个具体人的提问，或群友间的私人话题。
   - 最近消息只是简单附和、表情包刷屏、哈哈哈/嗯/好/草/确实/6 等无实质内容的闲聊。
@@ -194,6 +203,7 @@ Bot昵称: {bot_aliases}
 - 特别注意：
   - “不好说吧”“怎么说呢”“我说真的”“别说了”等普通句子不算要求 Bot 接话。
   - 只有明确出现 Bot 昵称并要求 Bot 说话/回复/发图/发表情包，才算“点名 Bot 接话”。
+  - 对方点名要求回复时，"Bot 刚回复过""对方可能在测试"都不构成拒绝理由。
   - 如果只是可以接但价值很低，倾向 false
 - 只适合自然的接一句，像群友随口搭话，不要强行刷存在感。
 
@@ -280,6 +290,8 @@ def as_int(value: Any, default: int, minimum: int = 0, maximum: int = 100000) ->
 
 def proactive_build_config_kwargs(
     provider_settings: dict[str, Any] | None = None,
+    *,
+    fallback_provider_ids: Any = None,
 ) -> dict[str, Any]:
     """主动运行传给宿主 ``MainAgentBuildConfig`` 的键集合（唯一来源）。
 
@@ -313,6 +325,12 @@ def proactive_build_config_kwargs(
         "computer_use_runtime": "none",
         "add_cron_tools": False,
         "provider_settings": settings,
+        # 回退链必须透传：宿主 runner 的候选集是 ``[provider, *fallback_providers]``，
+        # 该键缺省为空列表时只剩单个候选，任何异常或错误响应直接终止而不换模型。
+        # 非 list 交给宿主的既有校验（它会记 warning 并跳过）。
+        "fallback_provider_ids": (
+            fallback_provider_ids if isinstance(fallback_provider_ids, list) else []
+        ),
     }
 
 
@@ -873,6 +891,9 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
         # 消费方只有 decision 的判断提示词，生成上下文另由 recent_message_limit
         # 与 MIN_RECENT_TEXT_RECORDS 决定，两者刻意不同源。
         MIN_RECENT_TEXT_RECORDS,
+        # 下限 0 是合法语义：min_text_records=0 表示「本地有多少用多少、
+        # 不回宿主补历史」。提示词读取条数另由 DECISION_HISTORY_FLOOR 兜底，
+        # 两者是不同维度，不要把下限抬到 FLOOR。
         0,
         30,
         step=1,
@@ -1198,8 +1219,8 @@ def coerce_config_value(spec: ConfigSpec, raw: Any, fallback: Any) -> Any:
             return normalize_string_list(spec, fallback, mode="disk")
     if spec.kind == "str":
         # 单行标识（三个 provider id）剔除控制字符：它们经 %s 进日志，带换行就能
-        # 伪造出一行假日志。列表条目早有同一条规则（STRING_LIST_ILLEGAL_RE 排除
-        # C0 控制字符），str 类此前是缺口。
+        # 伪造出一行假日志。与列表条目同一条规则（STRING_LIST_ILLEGAL_RE 排除
+        # C0 控制字符）。
         text = "".join(char for char in str(raw or "").strip() if ord(char) >= _PRINTABLE_CHAR_MIN)
         return _truncate_text(spec, text)
     # 规格表写错 kind 不得静默降级：那会让 int/bool 键带着非法值落盘并显示成

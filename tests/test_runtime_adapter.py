@@ -472,6 +472,75 @@ def test_validate_probes_build_config_kwargs() -> None:
     )
 
 
+def test_optional_build_config_key_is_omitted_on_legacy_host() -> None:
+    """``fallback_provider_ids`` 是 4.29 才有的字段：旧宿主没声明就不得硬传。
+
+    4.23.3 / 4.27.2 的 ``MainAgentBuildConfig`` 是 ``@dataclass``，多传一个未知
+    关键字就是加载期 RuntimeError——插件在 metadata 声明的最低版本上直接装不上。
+    旧宿主的回退走 ``provider_settings.fallback_chat_models``（已随整棵
+    provider_settings 透传），所以省略该键不会丢掉回退能力。
+
+    桩必须是**显式形参**：``**kwargs`` 的桩会让这条完全测不出来，正是上面
+    ``test_validate_probes_build_config_kwargs`` docstring 说的那个盲区。
+    """
+    runtime = _load_adapter()
+
+    class LegacyBuildConfig:
+        """4.23.3 / 4.27.2 形状：12 个显式形参，没有 ``fallback_provider_ids``。"""
+
+        def __init__(
+            self,
+            *,
+            tool_call_timeout: int,
+            tool_schema_mode: str,
+            provider_wake_prefix: str,
+            streaming_response: bool,
+            sanitize_context_by_modalities: bool,
+            kb_agentic_mode: bool,
+            file_extract_enabled: bool,
+            llm_safety_mode: bool,
+            safety_mode_strategy: str,
+            computer_use_runtime: str,
+            add_cron_tools: bool,
+            provider_settings: dict,
+        ) -> None:
+            self.provider_settings = provider_settings
+
+    adapter = _adapter(runtime, build_config=LegacyBuildConfig)
+
+    assert adapter.validate(soft=True) == [], "旧宿主形状不得被可选键误判为不兼容"
+    config = adapter.new_build_config(
+        tool_call_timeout=60,
+        tool_schema_mode="full",
+        provider_wake_prefix="",
+        streaming_response=False,
+        sanitize_context_by_modalities=False,
+        kb_agentic_mode=False,
+        file_extract_enabled=False,
+        llm_safety_mode=True,
+        safety_mode_strategy="system_prompt",
+        computer_use_runtime="none",
+        add_cron_tools=False,
+        provider_settings={"fallback_chat_models": ["fb-a"]},
+        fallback_provider_ids=["fb-a"],
+    )
+    # 旧宿主只能靠 provider_settings 那条通道拿到回退名单
+    assert config.provider_settings == {"fallback_chat_models": ["fb-a"]}
+
+
+def test_optional_build_config_key_is_passed_on_new_host() -> None:
+    """新宿主声明了该字段就必须真的传进去，否则回退链静默失效。"""
+    runtime = _load_adapter()
+
+    class NewBuildConfig:
+        def __init__(self, *, tool_call_timeout, fallback_provider_ids):
+            self.fallback_provider_ids = fallback_provider_ids
+
+    adapter = _adapter(runtime, build_config=NewBuildConfig)
+    config = adapter.new_build_config(tool_call_timeout=60, fallback_provider_ids=["fb-a", "fb-b"])
+    assert config.fallback_provider_ids == ["fb-a", "fb-b"]
+
+
 # ============================================================================
 # _tool_list / filter_final_tools：fail-closed 边界
 # ============================================================================

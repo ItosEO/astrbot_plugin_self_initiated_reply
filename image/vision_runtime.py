@@ -113,9 +113,15 @@ class VisionService:
             # 并发跑，N 张图需要 ceil(N/并发) 波，每波至多一个单图超时。固定
             # 「单图超时 ×2」在 vision_max_images>2 时会整批误杀（已落盘的图
             # 一并丢弃），且 min(30, ...) 的上限让调大单图超时也救不回来。
+            #
+            # 每波按 2 个超时算：``_resolve_image_url`` 对同一张图可能串行下载
+            # 两次（``file_path`` 与 ``url`` 都可能是 http 值，参见
+            # ``extractor.extract_images`` 的归一化分支），每次各有独立的
+            # ``_timeout_sec``。按 1 个超时推导会让「本来还能成功」的批次被
+            # wait_for 掐断，只能退回 except TimeoutError 的部分救回路径。
             concurrency = max(1, VISION_MAX_CONCURRENT)
             waves = max(1, -(-len(images) // concurrency))
-            per_image = float(self._settings.vision_timeout_sec)
+            per_image = float(self._settings.vision_timeout_sec) * 2.0
             budget = max(5.0, min(MAX_FREEZE_BUDGET_SEC, waves * per_image + 5.0))
             prepared = await asyncio.wait_for(parser.prepare_batch(images), timeout=budget)
             if self._is_stopping() or not self._gate.is_current(umo, generation):

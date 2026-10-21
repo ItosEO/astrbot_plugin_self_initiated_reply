@@ -617,11 +617,6 @@ def test_max_reply_chars_zero_means_unlimited() -> None:
     assert result_unlimited == result_huge_limit, "max_chars=0 应该等同于无限制"
 
 
-if __name__ == "__main__":
-    import pytest
-
-    pytest.main([__file__, "-v"])
-
 # ============================================================================
 # 单源守卫（收敛成果锁定）
 # ============================================================================

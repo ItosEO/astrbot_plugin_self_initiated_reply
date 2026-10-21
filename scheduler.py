@@ -25,9 +25,9 @@ from .models import (
     MAX_RELEASE_WAIT_ROUNDS,
     MIN_VISION_IMAGE_AGE_SEC,
     PATROL_BACKOFF_DELAY_SEC,
+    PATROL_STOP_TIMEOUT_SEC,
     PLUGIN_ID,
     RELEASE_WAIT_TIMEOUT_SEC,
-    TERMINATE_TASK_TIMEOUT_SEC,
     CheckTrigger,
     SessionState,
     Settings,
@@ -446,7 +446,12 @@ class SessionScheduler:
             for umo in self._last_events
             if umo not in live_sessions
         )
-        stale = [item for item in removable if now - item[0] >= EVENT_CLEANUP_INTERVAL_SEC]
+        # 陈旧阈值必须覆盖巡检的不活跃窗口：事件被回收后 _patrol_one_session 的
+        # 「没有可用的最近消息事件」判据会让该会话永久跳过，patrol_inactive_after_sec
+        # 配到 1h 以上的部分随之完全失效（上限 604800）。条数仍由
+        # MAX_CACHED_EVENTS 兜底，放宽时间窗不会无界增长。
+        stale_cutoff = max(EVENT_CLEANUP_INTERVAL_SEC, self.settings.patrol_inactive_after_sec)
+        stale = [item for item in removable if now - item[0] >= stale_cutoff]
         for active_at, umo in stale:
             self._clear_event(umo, active_at)
             # 裁决条目与事件缓存同生命周期：不同步回收，静默会话的条目只增不减
@@ -485,9 +490,12 @@ class SessionScheduler:
         # 回收长期无活动的运行时 UMO 映射，避免对白名单内会话只增不减。
         # 起点复用 live_sessions：本方法是同步的（无 await），中间只调
         # _clear_event 与 _expire_image_index，都不碰运行中会话与延迟任务表。
+        # 活跃窗口用与事件回收同一条 stale_cutoff：裸群号条目唯一的 UMO 来源就是
+        # 本表，按 1h 摘掉而事件还在（patrol_inactive_after_sec 可到 7 天）会让
+        # 该群在巡检里"没有可用的最近消息事件"式地静默消失。
         active_umos = set(live_sessions)
         active_umos.update(
-            umo for umo, at in self._last_event_at.items() if now - at < EVENT_CLEANUP_INTERVAL_SEC
+            umo for umo, at in self._last_event_at.items() if now - at < stale_cutoff
         )
         for key, values in list(self._whitelist_runtime_umos.items()):
             kept = values & active_umos
@@ -590,7 +598,11 @@ class SessionScheduler:
         while self._should_run() and self.settings.enabled_patrol_trigger:
             try:
                 await asyncio.sleep(self.settings.check_interval_sec)
-                now = now_ts()
+                # 醒来后必须复核开关：关掉巡检不会取消在途睡眠（ensure_patrol
+                # 在关闭方向直接 return），不复核就会在最长 check_interval_sec
+                # 之后仍跑完整一轮主动回复。同 _image_cleanup_loop 的醒来复核。
+                if not self._should_run() or not self.settings.enabled_patrol_trigger:
+                    return
                 self.cleanup_events_if_needed()
                 seen_patrol_umos: set[str] = set()
                 for item in list(self.settings.whitelist):
@@ -598,7 +610,9 @@ class SessionScheduler:
                         if umo in seen_patrol_umos:
                             continue
                         seen_patrol_umos.add(umo)
-                        await self._patrol_one_session(umo, now)
+                        # now 逐会话取：单个会话可能阻塞近一个 generation_timeout_sec，
+                        # 复用轮次起点会让后续会话的活跃窗口判定停在数小时前。
+                        await self._patrol_one_session(umo, now_ts())
             except Exception as exc:
                 # 不开 exc_info：理由同 delayed_check（traceback 原文带回凭证）
                 logger.warning(
@@ -650,8 +664,13 @@ class SessionScheduler:
         task = self._patrol_task
         self._patrol_task = None
         if task and not task.done():
-            task.cancel()
-            done, _ = await asyncio.wait({task}, timeout=max(0.0, TERMINATE_TASK_TIMEOUT_SEC))
+            # 同 cancel_delay/_cancel_once：调用方（apply_enabled_topology）已经先
+            # 经 _cancel_delay_tasks 取消过一次，这里再取消一次会把第二次取消送进
+            # 被取消方的有界收敛窗口，被误判成"吞掉取消"而隔离登记 →
+            # _mark_degraded 永久 DEGRADED，只能重载插件。
+            if not task.cancelling():
+                task.cancel()
+            done, _ = await asyncio.wait({task}, timeout=max(0.0, PATROL_STOP_TIMEOUT_SEC))
             if not done:
                 if self._quarantine_task:
                     self._quarantine_task(task, "patrol stop deadline exceeded")

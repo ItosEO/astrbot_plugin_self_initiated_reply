@@ -30,7 +30,7 @@ GET `/config` 是 panel 视图：只回 panel 键加 `runtime_enabled` / `decisi
 
 ## 设置页 chrome
 
-浅/深/跟随系统与压暗/粗体均经 `GET/POST ui/theme` 写入 `ui_prefs.json`（页面在 Dashboard iframe 内，localStorage 不可靠）。POST 只提交**用户真的动过**的键，后端对未提交的键保持原值：GET 返回前的渲染态是本地默认（主题恒为 `auto`、压暗/粗体恒为关），把它一并提交会把服务端已存的选项静默改掉。守卫是 `theme.mjs keeps the dim/bold submission behind the touched guard` 与浏览器用例对请求体的反向断言。落盘与状态文件共用 `storage` 原子写。服务端 prefs 覆盖 localStorage，但 `GET ui/theme` 返回前用户已点过主题、压暗或粗体则那次点击优先，迟到的 GET 不得抹掉；本地缓存也只能经守卫后的 `applyTheme` 落盘（`restoreTheme` 不自行写缓存）。
+浅/深/跟随系统与压暗/粗体均经 `GET/POST ui/theme` 写入 `ui_prefs.json`（页面在 Dashboard iframe 内，localStorage 不可靠）。POST 只提交**用户真的动过**的键，后端对未提交的键保持原值：GET 返回前的渲染态是本地默认（主题恒为 `auto`、压暗/粗体恒为关），把它一并提交会把服务端已存的选项静默改掉。守卫是 `theme.mjs submits dim and bold behind their own touched guards` 与浏览器用例对请求体的反向断言。落盘与状态文件共用 `storage` 原子写。服务端 prefs 覆盖 localStorage，但 `GET ui/theme` 返回前用户已点过主题、压暗或粗体则那次点击优先，迟到的 GET 不得抹掉；本地缓存也只能经守卫后的 `applyTheme` 落盘（`restoreTheme` 不自行写缓存）。
 
 ## 默认值
 
@@ -215,6 +215,11 @@ teardown 之后落盘的偏好会在下次启动被读回，用户看到「已�
 - **不改双指令路径架构**：删内联路径会丢 `_is_command_entry` 的裸词保护与
   `COMMAND_HANDLED_KEY` 去重；删装饰器路径会让宿主失去指令组注册与权限声明。两条路径的
   等价由别名契约 + 装饰器委托契约共同钉住。
+- **`_NamedAt` 子类化宿主 `At`，而不是传 `name=` 了事**：宿主 `At.toDict()`
+  只输出 `qq`（4.10.6~4.29.1 一致），昵称字段在出站序列化时被丢掉。无法用函数替换
+  序列化（覆盖面是类），所以只能子类化；它只有 `delivery` 一个调用点，是「新抽象须有
+  第二实现」的例外。NapCat 不读该字段（自己按群成员记录解析），Lark 与 QQ 官方号只用
+  `qq`，这三家上该类无副作用。
 
 ## `webapi.py` 不拆
 

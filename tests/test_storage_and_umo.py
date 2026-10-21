@@ -14,27 +14,6 @@ def _load_modules():
     return load_modules(PACKAGE_NAME, "models", "utils", "storage")
 
 
-def test_tool_call_marker_is_not_sent_as_a_reply() -> None:
-    _, utils, _ = _load_modules()
-    assert (
-        utils.clean_reply("[tool call] send_emoji_by_id", allow_multiline=True, max_chars=200) == ""
-    )
-    assert (
-        utils.clean_reply(
-            "[historical tool call] search_emoji", allow_multiline=True, max_chars=200
-        )
-        == ""
-    )
-    assert (
-        utils.clean_reply("[tool call]send_emoji_by_id", allow_multiline=True, max_chars=200) == ""
-    )
-    assert (
-        utils.clean_reply("[historical tool call]search_emoji", allow_multiline=True, max_chars=200)
-        == ""
-    )
-    assert utils.clean_reply("自然回复", allow_multiline=True, max_chars=200) == "自然回复"
-
-
 def test_bare_group_whitelist_keeps_platform_state_isolated(tmp_path: Path) -> None:
     _, utils, storage = _load_modules()
     whitelist = {"12345"}

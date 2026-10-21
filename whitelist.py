@@ -162,10 +162,17 @@ class WhitelistManager:
             # 内存白名单与会话配额永久偏离磁盘（契约 §11 B2）。
             # 回滚自带 await，用 shield 防二次取消打断它。
             restore = asyncio.ensure_future(rollback())
-            try:
-                await asyncio.shield(restore)
-            except asyncio.CancelledError:
-                pass
+            # 回滚必须**跑完**才算数：单次 shield 在取消瞬间就抛，rollback 成
+            # 游离任务在 _config_lock 之外继续，能拿到锁并完整落盘的一次后续
+            # add/remove 或 POST /config 随后被它用旧值撤销。
+            #
+            # ``restore.done()`` 是退出条件而不是 ``break``：已被取消过一次之后
+            # 每次 await 都可能立刻再抛 CancelledError，包括回滚已跑完的那一刻。
+            while not restore.done():
+                try:
+                    await asyncio.shield(restore)
+                except asyncio.CancelledError:
+                    continue
             raise
         except Exception:
             await rollback()

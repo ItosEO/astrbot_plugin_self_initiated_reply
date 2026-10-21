@@ -1,4 +1,4 @@
-import { dimBoldWasTouched } from "./chrome.mjs";
+import { boldWasTouched, dimWasTouched } from "./chrome.mjs";
 
 export const THEME_KEY = "selfreply-theme";
 const THEME_CYCLE = ["auto", "light", "dark"];
@@ -48,13 +48,17 @@ export async function persistTheme(theme, apiPost, onPersistFailure) {
   // 三个字段各自只在「用户真的动过它」时才提交：后端对未提交的键保持原值，
   // 而渲染态在 GET ui/theme 返回前是本地默认（theme 恒为 "auto"、
   // dim/bold 恒为 false），把它一并提交会把服务端已存的选择静默改掉。
+  // 总判据（任一被动过就两个都提交）不够：GET 在途时点一下压暗，DOM 里的
+  // 粗体还是本地默认 false，一并提交就把服务端已存的 bold 抹成 false。
   const body = {};
   if (theme) {
     cacheThemeLocally(theme);
     body.theme = theme;
   }
-  if (dimBoldWasTouched()) {
+  if (dimWasTouched()) {
     body.dim = document.documentElement.classList.contains("dimmed");
+  }
+  if (boldWasTouched()) {
     body.bold = document.documentElement.classList.contains("bold-text");
   }
   if (Object.keys(body).length === 0) return;

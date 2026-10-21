@@ -36,6 +36,7 @@ from ..models import (
     MAX_IMAGE_DESCRIPTION_CACHE_BYTES,
     PLUGIN_ID,
 )
+from ..storage import fsync_dir
 from ..utils import redact_exc_text, redact_url, response_text
 from ._support import (
     ALLOWED_IMAGE_PORTS,
@@ -219,11 +220,23 @@ def _atomic_write(path: Path, content: bytes) -> None:
     temporary_path: Path | None = None
     descriptor: int | None = None
     try:
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-        )
+        try:
+            descriptor, temporary_name = tempfile.mkstemp(
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+            )
+        except FileNotFoundError:
+            # 清理线程在 mkdir 之后、mkstemp 之前把这个空 shard 目录 rmdir 了
+            # （_remove_empty_cache_directories 的 iterdir→rmdir 与这里分处两个
+            # to_thread 线程）。重建一次即可，不是内容层面的失败。
+            path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_name = tempfile.mkstemp(
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+            )
+
         temporary_path = Path(temporary_name)
         # 写已持有的描述符，不按名字重开：重开是经典的 reopen-after-close
         # TOCTOU，期间在该随机名上植一个 symlink 就能把内容改道。
@@ -237,21 +250,8 @@ def _atomic_write(path: Path, content: bytes) -> None:
         descriptor = None
         os.replace(temporary_path, path)
         temporary_path = None
-        # replace 之后补一次目录 fsync：否则掉电时数据块已落盘而 rename 丢失，
-        # "原子发布"只对并发读成立、对持久化不成立（契约 §8）。
-        # Windows 打不开目录（CRT 需要 FILE_FLAG_BACKUP_SEMANTICS），那里只能
-        # 依赖 NTFS 日志覆盖 rename 的持久性；打不开与 fsync 失败都按尽力而为
-        # 处理——文件已经发布成功，让它退化成"少一层持久性保证"而不是整张图被丢。
-        try:
-            dir_fd = os.open(path.parent, getattr(os, "O_DIRECTORY", os.O_RDONLY))
-        except OSError:
-            return
-        try:
-            os.fsync(dir_fd)
-        except OSError:
-            pass
-        finally:
-            os.close(dir_fd)
+        # 目录 fsync 的理由见 storage.fsync_dir（失败降级不抛）。
+        fsync_dir(path)
     finally:
         if descriptor is not None:
             try:
@@ -728,7 +728,13 @@ class ImageParser:
         # 清理起点同时是两道闸的共同边界：晚于它写入的文件既不算过期，也不算
         # 可驱逐（见 _remove_over_quota_cache_files 的 not_before）。
         snapshot_now = time.time() if now is None else now
-        cutoff = snapshot_now - max_age_sec
+        # 过期阶段同样要让出在途冻结窗口：文件在冻结时落盘、到 capture_images
+        # 提交之间既不在受保护集合里（还没进索引），mtime 又已早于保留窗口
+        # （vision_image_age_sec 下限 60 < MAX_FREEZE_BUDGET_SEC），直接按 cutoff
+        # 删会留下指向已删文件的 prepared_source——parse 的本地分支全部失败，
+        # 图片在保留期内静默消失。_remove_over_quota_cache_files 的 not_before
+        # 处理的正是同一窗口，两道闸必须同口径。
+        cutoff = min(snapshot_now - max_age_sec, snapshot_now - MAX_FREEZE_BUDGET_SEC)
 
         resolved_root = cache_root.resolve()
         protected = _resolve_protected_cache_sources(resolved_root, protected_sources)
@@ -877,7 +883,16 @@ class ImageParser:
                 _atomic_write(target, content)
             # 内容寻址只决定文件身份；mtime 表示最近一次被使用的生命周期。
             # 重复图片复用旧文件时刷新它，避免清理任务按旧时间提前回收。
-            os.utime(target, None)
+            #
+            # EXISTS 与 utime 之间有一个真实窗口：并发的过期/配额清理可以在这
+            # 一刻 unlink（此时该文件还没进索引，不在受保护集合里），utime 于是
+            # 抛 FileNotFoundError。这里不能当作写失败返回 None——那张图会退回
+            # 内存 data URL，或在 _snapshot_local_source 里直接丢失。补写一次即可。
+            try:
+                os.utime(target, None)
+            except FileNotFoundError:
+                _atomic_write(target, content)
+                os.utime(target, None)
             return target
         except OSError as exc:
             logger.debug("[%s] image cache write failed: %s", PLUGIN_ID, exc)
@@ -936,9 +951,8 @@ class ImageParser:
 
         日志分级（契约 §9）：**地址策略**拒绝记 WARNING——它说明有对端在敲被拦的
         门（私网、非白名单端口、逐跳重解析后落回内网），运维必须看得见；网络故障
-        记 INFO。此前这三处预检是裸 ``return None``，一条日志都没有，而唯一那条
-        WARNING 在传输层、被预检挡在前面根本走不到，于是策略拒绝与网络故障在日志里
-        完全同形，§9 想保住的那个信号实际是丢的。
+        记 INFO。三处预检必须自己留痕：只靠传输层那条 WARNING 时，策略拒绝在预检
+        处就被挡回去、走不到传输层，§9 想保住的那个信号实际是丢的。
         """
         try:
             parsed = urlparse(url)

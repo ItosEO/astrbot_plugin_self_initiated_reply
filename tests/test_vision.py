@@ -2956,6 +2956,32 @@ def test_cleanup_quota_never_removes_files_written_after_the_snapshot(tmp_path: 
     assert fresh.exists(), "刚冻结的图被清理删掉了"
 
 
+def test_cleanup_expiry_never_removes_files_inside_the_freeze_window(tmp_path: Path) -> None:
+    """过期阶段必须与配额阶段同一在途宽限：冻结中、尚未入索引的文件不得删。
+
+    缺陷形态：``cleanup_source_cache`` 只把 ``not_before`` 交给
+    ``_remove_over_quota_cache_files``，过期阶段直接用 ``cutoff = now - max_age``。
+    ``vision_image_age_sec`` 滑块下限是 60，而整批冻结预算上界是
+    ``MAX_FREEZE_BUDGET_SEC``：一张图在 t=0 落盘、整批到 t=61 才
+    ``capture_images``，此刻清理起跑就把它当过期删掉，索引里留下指向已删文件的
+    ``prepared_source``——``parse`` 的本地分支全部失败，图片在保留期内静默消失。
+
+    变异锚定：把 cutoff 改回 ``snapshot_now - max_age_sec``，本用例红。
+    """
+    _, image, _ = _load_modules()
+    root = tmp_path / "cache"
+    root.mkdir()
+    inflight = root / "inflight.png"
+    inflight.write_bytes(b"1234")
+    # 冻结起点写入（t=0），清理在 t=61 起跑，保留窗口取滑块下限 60s
+    os.utime(inflight, (0.0, 0.0))
+
+    removed = image.ImageParser.cleanup_source_cache(root, max_age_sec=60.0, now=61.0)
+
+    assert removed == 0, "在途冻结的文件被过期阶段删掉了"
+    assert inflight.exists(), "索引将指向一个已删除的 prepared_source"
+
+
 def test_cleanup_quota_skips_protected_when_nothing_else_left(tmp_path: Path) -> None:
     _, image, _ = _load_modules()
     root = tmp_path / "cache"

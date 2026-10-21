@@ -136,7 +136,7 @@ class OutboundGateway:
             outcome = SendOutcome(SendStatus.UNKNOWN, "sender cancelled after start")
         except Exception as exc:
             # adapter 异常串常带带凭证的请求 URL（provider 与平台适配器都有），
-            # 与其余异常路径同一脱敏口径；safe_exc_text 只防 __str__ 再抛，不脱敏。
+            # 与其余异常路径同一脱敏口径；redact_exc_text 一并挡住 __str__ 再抛。
             outcome = SendOutcome(SendStatus.UNKNOWN, redact_exc_text(exc))
         else:
             if raw_result is False:

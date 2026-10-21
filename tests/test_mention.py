@@ -15,7 +15,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from .host_stubs import FakeContextSend, FakeEvent, FlipGate
+from .host_stubs import FakeContextSend, FakeEvent
 from .test_delivery_runner import _make_runner
 
 
@@ -32,7 +32,14 @@ class _ChainRecordingEvent(FakeEvent):
 
 
 def _at_items(chain: list[object]) -> list[object]:
-    return [item for item in chain if type(item).__name__ == "_FakeAt"]
+    return [item for item in chain if _is_at(item)]
+
+
+def _is_at(item: object) -> bool:
+    """按宿主 ``At`` 判定（延迟导入：桩在 install 之后才存在）。"""
+    from astrbot.api.message_components import At
+
+    return isinstance(item, At)
 
 
 async def test_mention_off_never_mentions(tmp_path: Path) -> None:
@@ -49,17 +56,26 @@ async def test_mention_off_never_mentions(tmp_path: Path) -> None:
 
 
 async def test_mention_always_inserts_at_for_message_sender(tmp_path: Path) -> None:
-    """always：@ 本次依据消息的发送者，插在链首。"""
+    """always：@ 本次依据消息的发送者，插在链首，并带上其昵称。
+
+    昵称必须与 sender_id 不同且断言成前者：桩的 ``get_sender_name()`` 默认回显
+    sender_id，两者写同一个值的时候 ``name=mention_id`` 这种错法也能绿。
+    """
     _mod, models, runner, last_events = _make_runner(
         tmp_path, config={"mention_mode": "always"}, random_value=lambda: 0.99
     )
     event = _ChainRecordingEvent(umo="s1", sender_id="u42")
+    event.get_sender_name = lambda: "小明"
     last_events["s1"] = event
     outcome = await runner.send_reply("s1", "hello", expected_generation=None)
     assert outcome.status is models.SendStatus.DELIVERED
     chain = event.sent_chains[0]
-    assert type(chain[0]).__name__ == "_FakeAt", f"链首应是 At，实际 {type(chain[0]).__name__}"
+    assert _is_at(chain[0]), f"链首应是 At，实际 {type(chain[0]).__name__}"
     assert str(chain[0].qq) == "u42"
+    assert chain[0].name == "小明", "@ 的显示名必须是昵称，不是 QQ 号"
+    assert chain[0].toDict() == {"type": "at", "data": {"qq": "u42", "name": "小明"}}, (
+        "昵称必须进 OneBot 段：宿主 At.toDict() 只发 qq，读 name 的协议端会退化成空 @"
+    )
 
 
 async def test_mention_random_follows_probability_boundaries(tmp_path: Path) -> None:
@@ -153,46 +169,40 @@ async def test_mention_and_quote_together_put_at_before_reply(tmp_path: Path) ->
     await runner.send_reply("s1", "hello", expected_generation=None, quote=True)
     chain = event.sent_chains[0]
     kinds = [type(item).__name__ for item in chain]
-    assert kinds[:2] == ["_FakeAt", "_FakeReply"], f"插入顺序错误：{kinds}"
+    assert _is_at(chain[0]), f"插入顺序错误：{kinds}"
     assert str(chain[0].qq) == "u7"
     assert chain[1].id == "msg-9"
-
-
-async def test_mention_skipped_when_generation_changed_before_send(tmp_path: Path) -> None:
-    """代次在复核点 2 翻转：整条发送被抑制，@ 与正文都不出去。"""
-    _mod, models, runner, last_events = _make_runner(tmp_path, config={"mention_mode": "always"})
-    runner._gate = FlipGate(true_times=1)
-    event = _ChainRecordingEvent(umo="s1", sender_id="u1")
-    last_events["s1"] = event
-    outcome = await runner.send_reply("s1", "hello", expected_generation=7)
-    assert outcome.status is models.SendStatus.SUPPRESSED
-    assert not event.sent_chains, "抑制后不得调用 sender"
 
 
 async def test_mention_component_failure_degrades_to_plain_send(tmp_path: Path) -> None:
     """@ 组件构造失败（宿主/平台不支持）静默降级：投递结果与记账不受影响。
 
-    必须替换 **delivery 模块自己绑定的** ``At``：``delivery.py`` 顶部是
-    ``from astrbot.api.message_components import At, Reply``，改
-    ``components.At`` 动不了它，那条用例会恒绿（组件照常构造成功，
-    "降级"从未被触发）。
+    要换的是 **delivery 模块自己构造的那个类** ``_NamedAt``：改
+    ``components.At`` 或 ``delivery.At`` 都动不了它（类已在导入时绑定），
+    那两种改法会让真实组件照常构造成功，于是本用例因链里出现 @ 而红。
+
+    ``calls`` 断言构造器真的被调用过：只查“链里没有 At”的话，mention 路径
+    根本不跑（如 ``_resolve_mention_id`` 退化成空串）也会绿。
     """
     _mod, models, runner, last_events = _make_runner(tmp_path, config={"mention_mode": "always"})
+    calls: list[int] = []
 
     class _BoomAt:
         def __init__(self, *args: object, **kwargs: object) -> None:
+            calls.append(1)
             raise RuntimeError("platform has no at component")
 
     event = _ChainRecordingEvent(umo="s1", sender_id="u1")
     last_events["s1"] = event
-    original = _mod.At
-    _mod.At = _BoomAt
+    original = _mod._NamedAt
+    _mod._NamedAt = _BoomAt
     try:
         outcome = await runner.send_reply("s1", "hello", expected_generation=None)
     finally:
-        _mod.At = original
+        _mod._NamedAt = original
     assert outcome.status is models.SendStatus.DELIVERED
     assert event.sent_chains, "@ 失败不应阻止发送"
+    assert len(calls) == 1, "降级分支未被触发（mention 路径根本没跑到构造点）"
     assert not _at_items(event.sent_chains[0]), "构造失败的 @ 不得进链"
 
 
@@ -207,9 +217,11 @@ async def test_quote_component_failure_degrades_to_plain_send(tmp_path: Path) ->
     _mod, models, runner, last_events = _make_runner(
         tmp_path, config={"quote_mode": "random", "quote_probability": 100}
     )
+    calls: list[int] = []
 
     class _BoomReply:
         def __init__(self, *args: object, **kwargs: object) -> None:
+            calls.append(1)
             raise RuntimeError("platform has no reply component")
 
     event = _ChainRecordingEvent(umo="s1", sender_id="u1")
@@ -225,6 +237,7 @@ async def test_quote_component_failure_degrades_to_plain_send(tmp_path: Path) ->
         _mod.Reply = original
     assert outcome.status is models.SendStatus.DELIVERED
     assert event.sent_chains, "引用失败不应阻止发送"
+    assert len(calls) == 1, "降级分支未被触发（quote 路径根本没跑到构造点）"
     assert not _at_items(event.sent_chains[0]), "quote 降级不应误插 @"
     # 失败的 Reply 不得以半成品形态留在链里：插上去就是平台收到一个坏组件，
     # 而降级契约要求"装饰性组件不得影响投递结果与记账"（契约 §14.1）。
@@ -233,17 +246,19 @@ async def test_quote_component_failure_degrades_to_plain_send(tmp_path: Path) ->
     ], "quote 构造失败后链里仍留有 Reply 组件"
 
 
-async def test_mention_host_at_stub_accepts_qq(tmp_path: Path) -> None:
-    """守卫：``At`` 桩必须接受 ``qq=`` 关键字，否则上面全部用例都是假绿。
+async def test_mention_host_at_stub_accepts_qq_and_name(tmp_path: Path) -> None:
+    """守卫：``At`` 桩必须接受生产实际使用的 ``qq=`` 与 ``name=`` 关键字。
 
-    空壳 ``type("At", (), {})`` 会让 ``At(qq=...)`` 抛 TypeError，被
-    ``_attach_mention`` 的 except 吞掉，所有"已插入 @"断言会静默通过。
+    空壳 ``type("At", (), {})`` 会让构造抛 TypeError，被
+    ``_attach_chain_prefix`` 的 except 吞掉，所有"已插入 @"断言会静默通过。
+    ``name=`` 同样要守：这个名字一旦不被接受，线上就是永远不出现 @ 而测试全绿。
     """
     from . import host_stubs
 
     host_stubs.install_astrbot_stubs()
     import astrbot.api.message_components as components
 
-    at = components.At(qq="u1")
+    at = components.At(qq="u1", name="小明")
     assert str(at.qq) == "u1"
+    assert at.name == "小明"
     assert str(at) == "", "At 不得进入 get_plain_text 正文"

@@ -576,8 +576,9 @@ test("theme clicks never submit untouched dim/bold preferences", async ({ page }
   expect("dim" in themeOnly[0]).toBe(false);
   expect("bold" in themeOnly[0]).toBe(false);
 
-  // 对照：用户真的点过压暗后，该次请求必须带上 dim / bold 两个键，否则本地状态
-  // 与服务端 prefs 分叉（刷新后用户的点击丢失）。
+  // 对照：用户真的点过压暗后，该次请求必须带上 dim，否则本地状态与服务端
+  // prefs 分叉（刷新后用户的点击丢失）。未动过的 bold 仍不得出现：服务端的
+  // bold=true 已经落地，提交它等于替用户表态，取值一错就抹掉他的选择。
   await page.evaluate(() => window.__resolveTheme());
   await expect(page.locator("html")).toHaveClass(/dimmed/); // 服务端 dim=true 已落地
   await page.locator("#dimBtn").click();
@@ -587,12 +588,8 @@ test("theme clicks never submit untouched dim/bold preferences", async ({ page }
       .filter((call) => call.method === "POST" && call.endpoint === "ui/theme")
       .map((call) => call.body)
       .at(-1),
-    dimmed: document.documentElement.classList.contains("dimmed"),
-    bold: document.documentElement.classList.contains("bold-text"),
   }));
-  // 点过之后两个键都要提交，且取值必须等于当前渲染态（服务端 bold=true 已落地）。
-  expect(afterDim.body).toEqual({ dim: afterDim.dimmed, bold: afterDim.bold });
-  expect(afterDim.body.dim).toBe(false);
+  expect(afterDim.body).toEqual({ dim: false });
   expect(errors).toEqual([]);
 });
 
@@ -1332,35 +1329,39 @@ test("dim and bold clicks never submit the theme field", async ({ page }) => {
 
 test("a dim click during a pending theme GET keeps the untouched sibling from the server", async ({ page }) => {
   // 回归守卫：restoreTheme 曾用一个「动过没有」的总判据同时决定 dim/bold 两个
-  // 字段是否落地服务端值。GET ui/theme 在途期间点一下压暗，DOM 里的粗体还是本地
-  // 默认（false），此时跳过 applyBold 会让随后任何一次提交把服务端已存的 bold
-  // 静默抹掉——用户没碰过的开关被改写，无 toast、无报错。分开判「各自动过没有」
-  // 之后，未动的那一个一定由服务端值补齐。
+  // 字段是否落地服务端值，而 persistTheme 又用同一个总判据决定提交哪些字段。
+  // GET ui/theme 在途期间点一下压暗，DOM 里的粗体还是本地默认（false），
+  // 提交时把 bold:false 一并写上去，服务端已存的 bold=true 被静默抹掉。
   await page.setViewportSize({ width: 1440, height: 1000 });
   await installBridge(page, { themePending: true, theme: "dark", dim: true, bold: true });
   const errors = await openPage(page);
   await expect.poll(() => page.evaluate(() => typeof window.__resolveTheme)).toBe("function");
   await page.locator("#dimBtn").click();
   await expect(page.locator("html")).toHaveClass(/dimmed/);
+  // 点压暗只提交 dim：未动过的 bold 不得出现在请求体里（服务端保持原值）。
+  const afterDim = await page.evaluate(() =>
+    window.__bridgeCalls
+      .filter((call) => call.method === "POST" && call.endpoint === "ui/theme")
+      .map((call) => call.body),
+  );
+  expect(afterDim.length).toBeGreaterThan(0);
+  for (const body of afterDim) expect(body).toEqual({ dim: true });
+
   await page.evaluate(() => window.__resolveTheme());
   await page.waitForTimeout(80);
   // 服务端的 bold=true 必须落地：用户只动过压暗，粗体不是他的选择。
   await expect(page.locator("html")).toHaveClass(/bold-text/);
   await expect(page.locator("#boldBtn")).toHaveClass(/active/);
 
-  // 再点一次粗体触发提交：body 必须等于「服务端值 + 用户改过的那一个」。
+  // 再点一次粗体：dim 与 bold 现在都被用户动过，两个键都要提交，取值等于
+  // 当前渲染态（dim 被那一下点亮为 true，服务端的 bold=true 已落地后点成 false）。
   await page.locator("#boldBtn").click();
   const bodies = await page.evaluate(() =>
     window.__bridgeCalls
       .filter((call) => call.method === "POST" && call.endpoint === "ui/theme")
       .map((call) => call.body),
   );
-  // 每次提交都必须是「服务端值 + 用户改过的那一个」：点压暗那次与点粗体那次
-  // 的取值相同，因为粗体已由迟到的服务端值补齐，不在用户的改动集合里。
-  expect(bodies.length).toBeGreaterThan(0);
-  for (const body of bodies) {
-    expect(body).toEqual({ dim: true, bold: false });
-  }
+  expect(bodies[bodies.length - 1]).toEqual({ dim: true, bold: false });
   expect(errors).toEqual([]);
 });
 
@@ -1971,5 +1972,65 @@ test("the whitelist live region is written only when its text changes", async ({
     await new Promise((resolve) => setTimeout(resolve, 0));
   });
   expect(await writes()).toEqual(["已识别 1 条（1 个完整 UMO）"]);
+  expect(errors).toEqual([]);
+});
+
+test("save-state live regions are not rewritten with identical text", async ({
+  page,
+}) => {
+  // #configSaveState / #mobileSaveState 也是 aria-live="polite"，而 setDirty
+  // 挂在每个 input 上：逐字相同也写就是逐键重排同一句播报。
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await installBridge(page);
+  const errors = await openPage(page);
+
+  await page.evaluate(() => {
+    const target = document.getElementById("configSaveState");
+    window.__saveWrites = [];
+    const observer = new MutationObserver(() => {
+      window.__saveWrites.push(target.textContent);
+    });
+    observer.observe(target, { childList: true, characterData: true, subtree: true });
+    window.__stopSaveWatch = () => observer.disconnect();
+  });
+  await page.locator("#messageDelayInput").pressSequentially("123", { delay: 0 });
+  await page.waitForTimeout(100);
+  const seen = await page.evaluate(() => {
+    window.__stopSaveWatch();
+    return window.__saveWrites.slice();
+  });
+  expect(new Set(seen).size, `保存状态被重复写入：${seen.join(" | ")}`).toBe(seen.length);
+  await expect(page.locator("#configSaveState")).toHaveText("有未保存改动");
+  expect(errors).toEqual([]);
+});
+
+test("a successful refresh clears stale field errors and the failed-save state", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await installBridge(page, { saveMode: "fail-once" });
+  const errors = await openPage(page);
+  const refresh = async () => {
+    // 两次点击是刷新入口的确认手势（首次仅待确认）。
+    await page.locator("#refreshBtn").click();
+    await page.locator("#refreshBtn").click();
+  };
+
+  // 越界输入先画出错误；刷新拿到服务端真值后红字与 aria-invalid 必须一并抹掉。
+  await page.locator("#messageDelayInput").fill("1");
+  await expect(page.locator("#messageDelayInputError")).toBeVisible();
+  await refresh();
+  await expect(page.locator("#messageDelayInputError")).toBeHidden();
+  await expect(page.locator("#messageDelayInput")).not.toHaveAttribute("aria-invalid", "true");
+  await expect(page.locator("#messageDelayInput")).not.toHaveValue("1");
+
+  // 失败的保存留下「保存失败」：此后不再编辑（否则状态会先变成脏），
+  // 只靠一次成功刷新把它清掉——顶标说「已同步」而正文还写「保存失败」会自相矛盾。
+  await page.locator("#messageDelayInput").fill("75");
+  await page.locator("#saveTopBtn").click();
+  await expect(page.locator("#configSaveState")).toHaveText("保存失败");
+  await refresh();
+  await expect(page.locator("#configSaveState")).toHaveText("");
+  await expect(page.locator("#navSaveState")).toHaveText("已同步");
   expect(errors).toEqual([]);
 });

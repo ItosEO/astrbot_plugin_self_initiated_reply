@@ -241,6 +241,12 @@ class GenerationRunner:
                 # 结果可能可等待（宿主改成协程时）：不 await 会留下一个从未运行的
                 # 协程对象，优雅停止请求静默失效，此后每次超时都退化到取消+隔离。
                 await maybe_await(request_stop())
+            except asyncio.CancelledError:
+                # 这一次等待自己被打断：调用方的取消意图优先于宽限窗口，但
+                # 必须先注入取消再让取消继续上抛——否则 run_task 既没被取消、
+                # 也没进入下方的宽限/隔离判定，成为继续运行且绕过闸门的孤儿。
+                run_task.cancel()
+                raise
             except Exception:
                 # 优雅停止是尽力而为：失败不能阻断下方的宽限等待与兜底 cancel()。
                 pass
@@ -462,7 +468,7 @@ class GenerationRunner:
                 PLUGIN_ID,
                 run.ledger.ledger_id,
                 run.umo,
-                exc,
+                redact_exc_text(exc),
             )
             return run.partial_reply()
         return None
@@ -566,7 +572,16 @@ class GenerationRunner:
                 on_quarantine=mark_quarantined,
             )
             raise
-        except TimeoutError:
+        except TimeoutError as exc:
+            if run_task.done():
+                # run_task 已结束却抛 TimeoutError：那是内层 provider/工具超时，
+                # 不是本次预算到期。原样上抛会被 ``generate`` 的
+                # ``except TimeoutError`` 记成"生成超时 timeout=<N>s"，而实际
+                # 只跑了很短时间——运营者会去查一个根本没停滞的 agent。转成
+                # 普通失败，日志里留的是真实原因。
+                raise RuntimeError(
+                    f"agent run ended with inner timeout: {redact_exc_text(exc)}"
+                ) from exc
             await self._graceful_stop(
                 run_task,
                 build_result.agent_runner,
@@ -670,11 +685,14 @@ class GenerationRunner:
                 "[%s] conversation history corrupted, replying without context session=%s error=%s",
                 PLUGIN_ID,
                 umo,
-                exc,
+                redact_exc_text(exc),
             )
         except Exception as exc:
             logger.warning(
-                "[%s] conversation history unreadable session=%s error=%s", PLUGIN_ID, umo, exc
+                "[%s] conversation history unreadable session=%s error=%s",
+                PLUGIN_ID,
+                umo,
+                redact_exc_text(exc),
             )
 
     async def _drain(self, agent_runner: Any) -> None:
@@ -765,18 +783,38 @@ class GenerationRunner:
 
     def main_agent_build_config(self, umo: str) -> Any:
         provider_settings = {}
+        fallback_provider_ids: Any = None
         try:
             config_obj = getattr(self._context, "astrbot_config", {})
             get_config = getattr(self._context, "get_config", None)
             if umo and callable(get_config):
                 config_obj = get_config(umo)
             provider_settings = dict(config_obj.get("provider_settings", {}) or {})
-        except Exception:
+            # 宿主三处自己的 MainAgentBuildConfig 构造点都取这个路径
+            # （``agent_runner.config.model.fallback_provider_ids``），主动回复
+            # 漏传就只剩单个候选，模型报错时不回退。
+            fallback_provider_ids = (
+                config_obj.get("agent_runner", {})
+                .get("config", {})
+                .get("model", {})
+                .get("fallback_provider_ids", [])
+            )
+        except Exception as exc:
             # 会话级配置是可选能力：get_config(umo) 在旧宿主不存在或返回对象
-            # 不是 Mapping 时降级为宿主默认行为。
-            pass
+            # 不是 Mapping 时降级为宿主默认行为。必须是 DEBUG 而非静默——降级后
+            # 该会话配的模型不生效，回复改用宿主默认 provider，无痕迹就无从排查。
+            logger.debug(
+                "[%s] session build config fallback session=%s error=%s",
+                PLUGIN_ID,
+                umo,
+                redact_exc_text(exc),
+            )
         # 键集合与加载期探针单源（models.proactive_build_config_kwargs）。
-        return self._runtime().new_build_config(**proactive_build_config_kwargs(provider_settings))
+        return self._runtime().new_build_config(
+            **proactive_build_config_kwargs(
+                provider_settings, fallback_provider_ids=fallback_provider_ids
+            )
+        )
 
     async def build_context_text(self, umo: str, state: SessionState) -> str:
         context_text = await build_history_text(

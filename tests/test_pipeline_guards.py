@@ -316,3 +316,72 @@ async def test_empty_generation_short_circuits_before_delivery(tmp_path) -> None
         umo, trigger="message_delay", force=False, expected_generation=baseline
     )
     assert result == "管线未生成内容。", f"空生成没有短路：{result}"
+
+
+async def test_absent_generation_baseline_still_guards_against_advance(tmp_path) -> None:
+    """没有代次记录的会话也必须绑到一个具体基线，不能不设防。
+
+    缺陷形态：``if baseline: expected_generation = baseline``。``current()`` 对
+    从未 advance 过的会话返回 0，真值判断把它当"未取到"而保持 ``None``——而
+    ``is_current(umo, None)`` 恒真，于是判断期间到达的新消息（advance 到 1）
+    不再让本轮失效，过期结论照发。这正是首次巡检（会话刚进白名单、还没收到
+    消息推进代次）的默认形态。
+
+    变异锚定：把基线恢复成真值判断，本用例红。
+    """
+    _install()
+    umo = "qq:GroupMessage:12345"
+
+    class AdvancingDecision:
+        def local_gate(self, _state, *, force):
+            return ""
+
+        async def decide(self, _umo, _state, *, trigger, force):
+            pipeline._gate.advance(umo)
+            return {"should_reply": True, "reason": "模型说该接话", "elapsed_sec": 0.1}
+
+    pipeline, models = _wire_pipeline(
+        f"{PACKAGE_NAME}_absent_baseline", umo=umo, decision=AdvancingDecision()
+    )
+
+    result = await pipeline.check_session_locked(umo, trigger="patrol", force=False)
+
+    assert result == models.STALE_TASK_MESSAGE, f"无代次基线的会话没有被代次防护：{result}"
+
+
+async def test_decision_rejection_is_logged_at_info(tmp_path, caplog: object) -> None:
+    """模型明确说「不接话」必须在默认日志级别可见（契约 §9）。
+
+    缺陷形态：``_decide_session_reply`` 里 ``isinstance(result, str)`` 的早退
+    分支只登记裁决、不打日志，INFO 只挂在下面的 dict 分支上。而 ``decide()``
+    把 ``should_reply=False`` 转成字符串返回，所以「机器人为什么不接话」这个
+    最高频问题在默认配置下完全不可见——正是 §9 点名要保住的那一行。
+
+    变异锚定：删掉该分支的 logger.info，本用例红。
+    """
+    _install()
+    umo = "qq:GroupMessage:12345"
+
+    class RefusingDecision:
+        def local_gate(self, _state, *, force):
+            return ""
+
+        async def decide(self, _umo, _state, *, trigger, force):
+            return "判断不回复：用户正在连续测试"
+
+    package = f"{PACKAGE_NAME}_refusal_info"
+    pipeline, _models = _wire_pipeline(package, umo=umo, decision=RefusingDecision())
+    pipeline_mod = load_package(package, "session_pipeline")
+
+    with capture_logs(caplog, pipeline_mod.logger, logging.INFO):
+        result = await pipeline.check_session_locked(umo, trigger="message_delay", force=False)
+
+    assert result == "判断不回复：用户正在连续测试", f"拒绝没有原样返回：{result}"
+    infos = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.INFO and "decision" in record.getMessage()
+    ]
+    assert infos, "判断不回复在 INFO 级别不可见（契约 §9 要求默认可见）"
+    assert "should_reply=False" in infos[0], f"INFO 行缺少结论字段：{infos[0]}"
+    assert "用户正在连续测试" in infos[0], f"INFO 行缺少理由：{infos[0]}"

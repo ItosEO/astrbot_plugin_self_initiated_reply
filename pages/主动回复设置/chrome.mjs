@@ -231,27 +231,23 @@ function setPressed(button, on) {
   button.classList.toggle("active", on);
   button.setAttribute("aria-pressed", String(Boolean(on)));
 }
-let dimTouched = false;
-let boldTouched = false;
+const touched = { dim: false, bold: false };
 function markDimTouched() {
-  dimTouched = true;
+  touched.dim = true;
 }
 function markBoldTouched() {
-  boldTouched = true;
+  touched.bold = true;
 }
 export function dimWasTouched() {
-  return dimTouched;
+  return touched.dim;
 }
 export function boldWasTouched() {
-  return boldTouched;
+  return touched.bold;
 }
-// 动过任一个就要把这一对一起提交。安全性来自 app.js：未动的那一个已由
-// restoreTheme 用服务端值补齐，所以 DOM 里的这一对始终等于
-// 「服务端值 + 用户改过的那一个」。只记一个总标记时，GET /ui/theme 在途期间
-// 点一下 dim 会把本地默认的 bold 一并提交，静默抹掉服务端上没动过的开关。
-export function dimBoldWasTouched() {
-  return dimTouched || boldTouched;
-}
+// 两个「动过没有」的判据各自独立：提交侧逐个字段用它自己的判据（见
+// theme.mjs persistTheme）。不要退回「任一被动过就两个一起提交」的总判据：
+// GET /ui/theme 在途期间点一下 dim，DOM 里的 bold 还是本地默认 false，
+// 一并提交就把服务端上没动过的开关静默抹掉了。
 /* 主题与压暗/粗体同属"用户即时选择优先于迟到服务端值"：GET ui/theme 在途最长
    FETCH_TIMEOUT_MS，期间点过主题就不得被旧响应覆盖（DECISIONS「设置页 chrome」）。 */
 let themeTouched = false;

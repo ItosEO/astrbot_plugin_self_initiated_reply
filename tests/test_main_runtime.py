@@ -1176,6 +1176,31 @@ def test_terminate_clears_tasks_and_saves(tmp_path: Path) -> None:
     with_plugin(tmp_path, scenario)
 
 
+def test_save_after_terminate_does_not_touch_state_file(tmp_path: Path) -> None:
+    """关停完成后的迟到写盘不得再发布 state.json。
+
+    缺陷形态：check 的账本终态任务可以比关停窗口更晚收尾（``outbound`` 故意吞掉
+    在途发送的取消，``_track_critical_task`` 也刻意绕开停止闸门）。它手里的快照
+    停在投递之前，落地会用陈旧值覆盖新实例刚写出的文件：日配额与冷却倒流。
+    """
+
+    async def scenario(plugin, main):
+        plugin.settings.whitelist = {UMO}
+        # 先等构造期的后台写盘收敛，否则它的线程可能在下面的 unlink 之后才发布
+        # 文件，用例会在“后台刚写完”与“用例刚删”之间摇摆。
+        for _ in range(100):
+            if plugin._storage_path.exists():
+                break
+            await asyncio.sleep(0.01)
+        await plugin.terminate()
+        assert plugin._storage_path.exists(), "最终落盘未发布"
+        plugin._storage_path.unlink()
+        await plugin._save_storage()
+        assert not plugin._storage_path.exists(), "关停完成后的迟到写盘又发布了陈旧快照"
+
+    with_plugin(tmp_path, scenario)
+
+
 def test_abandoned_final_save_does_not_overwrite_newer_state(tmp_path: Path) -> None:
     """被隔离的最终落盘不得覆盖新实例写出的 state.json。
 
@@ -2077,7 +2102,10 @@ def test_startup_persist_failure_is_logged(tmp_path: Path, monkeypatch: Any, cap
         calls.append("persist")
         return False
 
-    monkeypatch.setattr(main, "persist_settings_config", failing_persist)
+    async def failing_apersist(*args: Any, **kwargs: Any) -> bool:
+        return failing_persist()
+
+    monkeypatch.setattr(main, "apersist_settings_config", failing_apersist)
 
     async def scenario(plugin, _main):
         # 规范化落盘已后台化（含 fsync，不得阻塞事件循环，见
@@ -2088,7 +2116,7 @@ def test_startup_persist_failure_is_logged(tmp_path: Path, monkeypatch: Any, cap
     with capture_logs(caplog, main.logger):
         with_plugin(tmp_path, scenario)
 
-    assert calls == ["persist"], "启动路径没有调用 persist_settings_config"
+    assert calls == ["persist"], "启动路径没有调用 apersist_settings_config"
     errors = messages_at_least(caplog, logging.ERROR)
     assert any("config normalization write failed" in message for message in errors), (
         f"落盘失败没有记 ERROR，实际日志：{errors}"
@@ -2125,10 +2153,10 @@ def test_startup_writes_skipped_when_disk_already_current(tmp_path: Path) -> Non
     plugin_state = sys.modules[f"{MAIN_PACKAGE_NAME}.plugin_state"]
     config_writes: list[int] = []
     state_writes: list[int] = []
-    original_persist = main.persist_settings_config
+    original_persist = main.apersist_settings_config
     original_write_sessions = plugin_state.write_json_atomic
 
-    def counting_persist(*args: Any, **kwargs: Any) -> bool:
+    async def counting_persist(*args: Any, **kwargs: Any) -> bool:
         config_writes.append(1)
         return True
 

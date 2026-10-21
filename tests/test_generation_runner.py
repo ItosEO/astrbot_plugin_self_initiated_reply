@@ -613,6 +613,41 @@ async def test_generate_timeout_requests_graceful_stop_keeps_directs(tmp_path: P
     assert returned_ledger.direct_texts == ("超时前直发",)
 
 
+async def test_inner_timeout_is_not_reported_as_budget_timeout(
+    tmp_path: Path, caplog: object
+) -> None:
+    """agent 内部的 provider 超时不得冒名顶替"生成预算耗尽"。
+
+    缺陷形态：``_run_agent_with_grace`` 只有一个 ``except TimeoutError``，把
+    ``wait_for`` 到期与内层抛出的 TimeoutError 混成一条。后者会让 WARNING 打
+    出 ``timeout=<generation_timeout_sec>s``，而 agent 其实秒级就失败了——运营
+    者据此去查一个根本没停滞的 provider。
+
+    变异锚定：去掉 ``if run_task.done()`` 分支，本用例红。
+    """
+    _, models, runner, runtime, _, _ = _make_runner(tmp_path, {"generation_timeout_sec": 30})
+    event = FakeEvent()
+    runner._last_events["s1"] = event
+    state = _state(models)
+
+    def timing_out_run(_runner, **_kwargs):
+        async def gen():
+            raise TimeoutError("provider request timed out")
+            yield None
+
+        return gen()
+
+    runtime.run = timing_out_run
+    logger = logging.getLogger(_generation_module().__name__)
+    with capture_logs(caplog, logger, logging.WARNING):
+        text, _ledger = await runner.generate("s1", state, force=True)
+
+    assert text == ""
+    joined = "\n".join(record.getMessage() for record in caplog.records)
+    assert "timeout=30.0s" not in joined, f"内层超时被记成预算到期：{joined}"
+    assert "main-agent generation failed" in joined, f"内层超时未走失败分支：{joined}"
+
+
 async def test_graceful_stop_ignores_request_stop_failure(tmp_path: Path) -> None:
     _, _, runner, _, _, _ = _make_runner(tmp_path, grace_sec=0.01)
 
@@ -1238,6 +1273,9 @@ async def test_main_agent_build_config_defaults(tmp_path: Path) -> None:
     assert config.kwargs["file_extract_enabled"] is False
     assert config.kwargs["computer_use_runtime"] == "none"
     assert config.kwargs["add_cron_tools"] is False
+    # 未配置回退链时必须是空列表而不是缺键：宿主 runner 的候选集是
+    # ``[provider, *fallback_providers]``，缺这个键就只剩单个候选。
+    assert config.kwargs["fallback_provider_ids"] == []
 
 
 async def test_main_agent_build_config_prefers_session_provider_settings(tmp_path: Path) -> None:
@@ -1271,6 +1309,19 @@ async def test_main_agent_build_config_prefers_session_provider_settings(tmp_pat
     assert session.kwargs["provider_settings"] == session_level["provider_settings"]
     assert session.kwargs["llm_safety_mode"] is False
     assert session.kwargs["safety_mode_strategy"] == "tool_call"
+
+    # 回退链必须透传：宿主三处 `MainAgentBuildConfig` 构造点都读这个路径，
+    # 主动回复漏传后 model 报错就直接终止，不会换下一个候选。
+    runner._context = SimpleNamespace(
+        astrbot_config=host_level,
+        get_config=lambda _umo: {
+            "agent_runner": {"config": {"model": {"fallback_provider_ids": ["fb-a", "fb-b"]}}}
+        },
+    )
+    assert runner.main_agent_build_config("s1").kwargs["fallback_provider_ids"] == [
+        "fb-a",
+        "fb-b",
+    ]
 
     # 空 umo：无会话可查，只读宿主全局
     blank = runner.main_agent_build_config("")
